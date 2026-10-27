@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use feiyu_core::{Limits, Mood, Motion};
 use feiyu_platform::{pump, quit, Event, LayeredWindow, SingleInstance};
 
-use crate::pet::Pet;
+use crate::pet::{Pet, LANDING_HOLD};
 
 const W: u32 = 200;
 const H: u32 = 240;
@@ -451,8 +451,8 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     );
     pet.on_event(Event::MouseUp { x: 10, y: 10 })?;
     r.check(
-        &format!("松手回到待机（{:?}）", pet.mood()),
-        pet.mood() == Some(Mood::Idle),
+        &format!("松手后仍在空中保持拖拽姿态（{:?}）", pet.mood()),
+        pet.mood() == Some(Mood::Dragged),
     );
 
     // 已贴地且零速度：一拍内必须停稳，窗口不能再溜。
@@ -461,6 +461,120 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     r.check(
         &format!("贴地松手后一拍内停稳（{:?} → {:?}）", before, pet.rect()),
         pet.rect() == before,
+    );
+
+    // 停稳不等于立刻站起来：要再保持 `LANDING_HOLD` 秒才回待机。
+    // 这一等必须真的等：`tick` 吃的是墙钟 dt，不能造假。
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    pet.tick()?;
+    r.check(
+        &format!("落地 {LANDING_HOLD} 秒后才回到待机（{:?}）", pet.mood()),
+        pet.mood() == Some(Mood::Idle),
+    );
+
+    // ---- 提起来跟不跟手：量「首次切到 drag」到底花多久 ----
+    // 这一步包含打开文件 + 解一帧 + 换窗口尺寸（drag 是 221×264，idle 是 384×266），
+    // 是用户感知里「提起了却还没开始飘」的全部成本。再切一次则只剩解一帧，
+    // 两条数字放在一起才能分出「IO 慢」还是「解码慢」。
+    let t0 = std::time::Instant::now();
+    pet.play("drag")?;
+    let first_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t1 = std::time::Instant::now();
+    pet.play("idle")?;
+    pet.play("drag")?;
+    let again_ms = t1.elapsed().as_secs_f64() * 1e3;
+    r.check(
+        &format!("首次切到拖拽姿态 {first_ms:.1}ms（已加载后 {again_ms:.1}ms）"),
+        first_ms < 50.0,
+    );
+    pet.play("idle")?;
+
+    drop(pet);
+
+    // ---- 睡觉：睡着后不许自己演到「醒来」----
+    // 素材 `sleep.fishanim` 是 10 秒闭环，末尾会把眼睛睁开。
+    // 直接整段循环就会「睡十秒、醒一下、又睡」，像个睡不安稳的人。
+    let mut pet = Pet::open(dir, None).context("打开桌宠失败（睡眠段）")?;
+    // 入睡时间本来是 18~38 秒随机的，测试里缩到瞬间。
+    pet.set_sleep_after(0.01);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    pet.tick()?;
+    r.check(
+        &format!("安静 30ms 就睡着（{:?}）", pet.mood()),
+        pet.mood() == Some(Mood::Sleep),
+    );
+
+    let span_falling = pet.loop_span();
+    // 入睡段 0~165：推 200 帧足够演完并跨进打呼段。
+    pet.advance_frames(200)?;
+    let span_asleep = pet.loop_span();
+    r.check(
+        &format!("入睡段 {span_falling:?} 演完转入打呼段 {span_asleep:?}"),
+        span_falling == Some((0, 165)) && span_asleep == Some((75, 165)),
+    );
+
+    // 关键一条：睡着后无论过多久，都不能演到帧 210+ 那段「睁眼醒来」。
+    let (lo, hi) = span_asleep.unwrap_or((0, 0));
+    let mut escaped = 0u32;
+    for _ in 0..1000 {
+        pet.advance_frames(7)?;
+        let f = pet.frame();
+        if f < lo || f > hi {
+            escaped += 1;
+        }
+    }
+    r.check(
+        &format!("睡着后 7000 帧都留在打呼段 {lo}~{hi}（越界 {escaped} 次）"),
+        escaped == 0,
+    );
+
+    // 鼠标划过只推迟入睡，不许叫醒。
+    pet.on_event(Event::MouseMove { x: 10, y: 10 })?;
+    r.check(
+        &format!("鼠标划过不叫醒（{:?}）", pet.mood()),
+        pet.mood() == Some(Mood::Sleep),
+    );
+
+    // 但点一下必须醒，而且醒来后不能还抱着睡眠区间。
+    pet.on_event(Event::MouseDown { x: 10, y: 10 })?;
+    pet.on_event(Event::MouseUp { x: 10, y: 10 })?;
+    r.check(
+        &format!("点一下就醒（{:?}）", pet.mood()),
+        pet.mood() == Some(Mood::Happy),
+    );
+    r.check(
+        &format!("醒来后睡眠区间已清空（{:?}）", pet.loop_span()),
+        pet.loop_span().is_none(),
+    );
+
+    drop(pet);
+
+    // ---- 待机自娱自乐：抽得到、播得完、播完回 idle ----
+    let mut pet = Pet::open(dir, None).context("打开桌宠失败（小动作段）")?;
+    // 入睡时间拉到一小时：这一段只关心“会不会玩”，不关心“会不会睡”。
+    pet.set_sleep_after(3600.0);
+    let pool: Vec<&str> = pet.action_pool().iter().map(|(id, _)| *id).collect();
+    r.check(
+        &format!("小动作池按素材过滤后非空（{pool:?}）"),
+        !pool.is_empty(),
+    );
+
+    pet.trigger_next_action();
+    pet.tick()?;
+    let picked = pet.current().to_owned();
+    r.check(
+        &format!("够无聊了会抽个小动作（{picked}）"),
+        pool.contains(&picked.as_str()),
+    );
+
+    // 推完整一圈：必须自己回 idle，不能卡在小动作上永远演。
+    let went_idle = pet.advance_frames(300)?;
+    r.check(
+        &format!(
+            "小动作播完一圈就回待机（{}，回待机 = {went_idle}）",
+            pet.current()
+        ),
+        went_idle && pet.current() == "idle",
     );
 
     drop(pet);

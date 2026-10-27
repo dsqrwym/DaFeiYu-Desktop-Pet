@@ -63,6 +63,9 @@ fn run() -> Result<()> {
     if args.list {
         return list_anims(&dir);
     }
+    if let Some((id, out_dir, step)) = &args.dump {
+        return dump_frames(&dir, id, out_dir, *step);
+    }
     run_pet(args, dir)
 }
 
@@ -82,8 +85,12 @@ struct Args {
     tray: bool,
     /// 一开始就藏进托盘，挂 n 秒后退出（量隐藏时的 CPU）。
     hide: Option<u32>,
+    /// 正常跑 n 秒就优雅退出。观察随机动作、入睡这类「要等才会发生」的行为时用。
+    run: Option<u32>,
     /// 启动时给一个初速度（像素/秒），用来验证滑行与下落。
     fling: Option<(f32, f32)>,
+    /// 把某段动画按步长导出成 BMP（判读素材内容用）。
+    dump: Option<(String, PathBuf, u32)>,
     list: bool,
     selftest: bool,
     /// 打印动画切换日志。
@@ -101,7 +108,9 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         menu: false,
         tray: false,
         hide: None,
+        run: None,
         fling: None,
+        dump: None,
         list: false,
         selftest: false,
         verbose: false,
@@ -145,7 +154,25 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                     .context("--fling 的 vy 需要数字")?;
                 out.fling = Some((vx, vy));
             }
+            "--dump" => {
+                let id = it.next().context("--dump 缺少动画 id")?.clone();
+                let out_dir = PathBuf::from(it.next().context("--dump 缺少输出目录")?);
+                let step = it
+                    .next()
+                    .context("--dump 缺少帧步长")?
+                    .parse()
+                    .context("--dump 步长需要整数")?;
+                out.dump = Some((id, out_dir, step));
+            }
             "--list" => out.list = true,
+            "--run" => {
+                out.run = Some(
+                    it.next()
+                        .context("--run 缺少数秒")?
+                        .parse()
+                        .context("--run 需要整数秒")?,
+                )
+            }
             "--selftest" => out.selftest = true,
             "--verbose" | "-v" => out.verbose = true,
             "--help" | "-h" => {
@@ -164,11 +191,13 @@ fn print_help() {
          \x20 --dir <目录>      素材目录（含 manifest.json，默认 {DEFAULT_DIR}）\n\
          \x20 --anim <id>       强制只播这一段，忽略状态机\n\
          \x20 --list           打印素材清单\n\
+         \x20 --dump <id> <目录> <步长>  把该段动画每步长帧导一张白底 BMP（判读素材内容用）\n\
          \x20 --shot <文件>     跑 0.5 秒后截屏存 BMP 并退出\n\
          \x20 --shots <目录>    每段动画各截一张 BMP 后退出\n\
          \x20 --menu           弹一次右键菜单后退出（验证菜单用）\n\
          \x20 --tray           挂上托盘图标跑 5 秒后退出（验证通知区用）\n\
          \x20 --hide <秒>      先跑 2 秒让动画推进，再藏进托盘挂 n 秒（量隐藏时的 CPU）\n\
+         \x20 --run <秒>       正常跑 n 秒后优雅退出（观察随机动作、入睡这类慢行为）\n\
          \x20 --fling <vx> <vy> 启动时给一个初速度（像素/秒，验证滑行与下落）\n\
          \x20 --static         画一帧后不再推进（测静止底噪）\n\
          \x20 --bench <n>      连续提交 n 帧，报告单帧耗时\n\
@@ -204,6 +233,61 @@ fn list_anims(dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `--dump`：把某段动画按步长导出成 BMP。
+///
+/// 存在的理由很具体：**素材里到底有什么，只能看帧才知道**。
+/// 判断「睡觉动画哪一段是 Z」「拖拽开头是不是静止」，靠读代码或读时长
+/// 都只能猜；导成图以后一眼就能定。
+fn dump_frames(dir: &Path, id: &str, out_dir: &Path, step: u32) -> Result<()> {
+    let manifest = Manifest::load(dir.join("manifest.json"))
+        .with_context(|| format!("读不了素材清单 {}", dir.join("manifest.json").display()))?;
+    let entry = manifest.require(id)?.clone();
+    let (w, h) = (entry.width() as u32, entry.height() as u32);
+    let src = dir.join(&entry.file);
+    let mut anim = feiyu_core::anim::AnimReader::open(&src)
+        .with_context(|| format!("打不开 {}", src.display()))?;
+    let count = anim.frame_count();
+    std::fs::create_dir_all(out_dir)?;
+    let step = step.max(1);
+    let started = std::time::Instant::now();
+    let mut written = 0u32;
+    let mut idx = 0u32;
+    while idx < count {
+        let pixels = anim.frame(idx)?;
+        let flat = flatten_on_white(pixels);
+        // 文件名用**连续序号**而不是帧号：ffmpeg 的 `%04d` 序列号模式靠连续编号找图，
+        // 而步长导出出来的帧号是 0/6/12…，不连续就拼不了图。
+        let path = out_dir.join(format!("{id}_{written:04}.bmp"));
+        feiyu_platform::shot::write_bmp(&path, w, h, &flat)?;
+        written += 1;
+        idx += step;
+    }
+    let ms = started.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "{id}：{w}×{h}，共 {count} 帧（{:.2} 秒 @{}fps），按步长 {step} 导出 {written} 张到 {}（第 n 张 = 第 n×{step} 帧），耗时 {ms:.0}ms",
+        f64::from(count) / f64::from(manifest.fps),
+        manifest.fps,
+        out_dir.display()
+    );
+    Ok(())
+}
+
+/// 预乘 BGRA → 不透明 BGRA（合成到白底）。
+///
+/// 直接写预乘像素的话，透明处的值是 0，看图软件又忽略 alpha，
+/// 得到的就是「一张全黑、只有轮廓略亮」的图——正好把要看的东西藏了。
+fn flatten_on_white(src: &[u8]) -> Vec<u8> {
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let a = u32::from(px[3]);
+        for c in &mut px[..3] {
+            *c = (*c as u32 + 255 - a).min(255) as u8;
+        }
+        px[3] = 255;
+    }
+    out
 }
 
 fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
@@ -280,12 +364,23 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     pet.set_tick(TICK_MS);
     let shot = args.shot.clone();
     let verbose = args.verbose;
+    // `--run` 用墙钟截止，只能在泵里判：`SetTimer` 粒度 15.6ms，数拍子不准。
+    let deadline = args
+        .run
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(u64::from(s)));
     let mut ticks = 0u32;
     let mut captured = false;
     let mut last = pet.current().to_owned();
     let mut failure: Option<anyhow::Error> = None;
 
     pump(|ev| {
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                println!("到时间了，退出（共提交 {} 帧）", pet.drawn());
+                quit();
+                return;
+            }
+        }
         // 右键（桌宠身上或托盘图标上）弹同一张原生菜单。
         // 菜单是模态的：它内部会跑自己的消息循环，期间窗口定时器照常触发，
         // 所以动画不会卡在选中前那一帧。

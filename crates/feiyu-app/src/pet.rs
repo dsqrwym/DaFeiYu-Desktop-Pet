@@ -22,6 +22,9 @@ use anyhow::{ensure, Context, Result};
 use feiyu_core::anim::{AnimEntry, AnimReader, Manifest};
 use feiyu_core::brain::{Brain, Mood, Stimulus};
 use feiyu_core::motion::{fling_velocity, Limits, Motion};
+use feiyu_core::pool::Pool;
+use feiyu_core::rng::Rng;
+use feiyu_core::sleep::{span_to_frames, SleepCycle};
 use feiyu_platform::{CommandId, Event, Icon, LayeredWindow, Menu, TrayIcon};
 
 /// 脚底距工作区底边的空隙（像素）。
@@ -34,7 +37,17 @@ const MAX_ANIM_DT: f32 = 0.1;
 ///
 /// 没有这个阈值时，点击鼠标时手抖一两个像素就会把「点一下」吞成拖拽，
 /// 表现是「点它没反应」。
-const DRAG_THRESHOLD: i32 = 4;
+///
+/// 取 2 而不是 4：自检实测切换 drag 姿态只要 0.4ms，用户感知到的
+/// 「提起了却还没飘」全部来自这段死区。阈值只该挡住真实的手抖
+/// （1~2 像素），不该挡住「提起」这个动作本身。
+const DRAG_THRESHOLD: i32 = 2;
+
+/// 松手落地后，先保持被拖拽姿态这么久再回待机。
+///
+/// 直接切回 idle 会显得「一到手就站好」，像被剪掉了一帧；
+/// 0.1 秒刚够眼睛确认「落地了」，再长就开始拖沓。
+pub(crate) const LANDING_HOLD: f32 = 0.1;
 
 /// 拖拽采样只保留最近这么久（秒）。
 ///
@@ -50,6 +63,27 @@ const CMD_HIDE: CommandId = 4;
 
 /// 托盘图标的悬停提示。
 const TRAY_TIP: &str = "飞鱼";
+
+/// 入睡前要安静的时长范围（秒）。
+///
+/// 给一个区间而不是固定值：固定 25 秒会让「它什么时候睡」变成可预测的定时器。
+/// 每次回到待机都重新抽一次，于是每次入睡的等待都不一样。
+const SLEEP_AFTER_MIN: f32 = 18.0;
+const SLEEP_AFTER_MAX: f32 = 38.0;
+
+/// 两次自娱自乐之间的间隔（秒）。
+///
+/// 比入睡阈值短，清醒期间才看得到一会儿；又不至于太频繁——
+/// 一直在扭的桌宠会显得焦躁。
+const ACTION_GAP_MIN: f32 = 8.0;
+const ACTION_GAP_MAX: f32 = 15.0;
+
+/// 待机时会随机播的小动作。
+///
+/// 只列**确实打包进来了**的段：原版 `categories.小动作` 有 18 段，
+/// 我们只打包了 3 段，其中 `sleep` 已归睡觉姿态，剩 `stretch` 和 `mirror`。
+/// 权重照原版的 categories=20；二期补 `turn`/`move` 时按原比例追加即可。
+const ACTION_POOL: &[(&str, u32)] = &[("stretch", 20), ("mirror", 20)];
 
 type Anim = AnimReader<BufReader<File>>;
 
@@ -104,6 +138,23 @@ pub struct Pet {
     trail: VecDeque<(Instant, i32, i32)>,
     /// 左键按下时的窗口左上角，用来区分「点击」与「拖拽」。
     grab_origin: Option<(i32, i32)>,
+    /// 左键按下的时刻。只在 `FEIYU_DRAG_TRACE` 置位时用来报「按到进拖拽」的实际耗时。
+    down_at: Option<Instant>,
+    /// 落地时刻。置位表示「已落地但还没回待机」，0.1 秒后清。
+    landed_at: Option<Instant>,
+    /// 当前动画只在这个帧区间内循环（闭区间）。`None` = 整段循环。
+    /// 目前只有睡觉用它：睡着后只在打呼那一段里转，不会自己演到「醒来」。
+    loop_span: Option<(u32, u32)>,
+    /// 睡眠编排。`Some` 表示当前正在按「入睡 → 睡着」分两段播 `sleep`。
+    sleep_cycle: Option<SleepCycle>,
+    /// 随机源：入睡抖动、待机小动作都从这里取。
+    rng: Rng,
+    /// 待机小动作池。素材缺段时会被过滤瘦身，空了就不播。
+    pool: Pool,
+    /// 下一个小动作最早在「待机计时」走到多少秒时播（绝对值，不是间隔）。
+    next_action_at: f32,
+    /// 当前播的是不是待机小动作：是的话播完一圈就得回 idle。
+    action_playing: bool,
     /// 是否被藏进托盘。
     hidden: bool,
     /// 调用方要求的定时器周期，隐藏时用来原样恢复。
@@ -138,6 +189,11 @@ impl Pet {
         let win = LayeredWindow::create(entry.width() as u32, entry.height() as u32, x, y, "飞鱼")
             .context("创建分层窗口失败")?;
 
+        // 池子要在 `manifest` 被 move 进 `pet` 之前建：字段按声明顺序求值，
+        // 写到 `manifest` 之后就拿不到它了。
+        let available: Vec<&str> = manifest.ids().collect();
+        let pool = Pool::new(ACTION_POOL.iter().copied()).retained(&available);
+
         let mut pet = Self {
             win,
             dir,
@@ -157,11 +213,23 @@ impl Pet {
             motion: None,
             trail: VecDeque::new(),
             grab_origin: None,
+            down_at: None,
+            landed_at: None,
+            loop_span: None,
+            sleep_cycle: None,
+            rng: Rng::from_time(),
+            pool,
+            next_action_at: 0.0,
+            action_playing: false,
             hidden: false,
             tick_ms: 0,
             tray: None,
             icon: None,
         };
+        // 开局就抽一个入睡时间，别让第一天也是「满 25 秒就睡」。
+        let delay = pet.next_sleep_delay();
+        pet.brain.set_sleep_after(delay);
+        pet.schedule_next_action();
         pet.ensure_loaded(&pet.current.clone())?;
         pet.draw_frame()?;
         Ok(pet)
@@ -315,6 +383,40 @@ impl Pet {
         self.frame
     }
 
+    /// 当前动画被限定的循环区间（闭区间）。`None` = 整段循环。
+    pub fn loop_span(&self) -> Option<(u32, u32)> {
+        self.loop_span
+    }
+
+    /// 重设「多久不互动就睡」。给自检和将来的设置项用。
+    pub fn set_sleep_after(&mut self, secs: f32) {
+        self.brain.set_sleep_after(secs);
+    }
+
+    /// 直接推进 `n` 帧，不碰墙钟。**只给自检用**：
+    /// 真按 24fps 演完入睡段要等 7 秒，自检等不起。
+    ///
+    /// 返回是否因为「小动作播完一圈」而切回了 idle。
+    pub(crate) fn advance_frames(&mut self, n: u32) -> Result<bool> {
+        let mut went_idle = false;
+        for _ in 0..n {
+            if self.step_frames(1)? {
+                went_idle = true;
+            }
+        }
+        Ok(went_idle)
+    }
+
+    /// 待机小动作池当前的 `(id, 权重)`。自检用。
+    pub fn action_pool(&self) -> &[(&'static str, u32)] {
+        self.pool.items()
+    }
+
+    /// 把下一个小动作提前到现在。**只给自检用**（真实间隔 8~15 秒，测不起）。
+    pub(crate) fn trigger_next_action(&mut self) {
+        self.next_action_at = 0.0;
+    }
+
     /// 清单原始 fps。
     pub fn fps(&self) -> f32 {
         self.manifest.fps
@@ -331,6 +433,10 @@ impl Pet {
         self.current = id.to_owned();
         self.frame = 0;
         self.acc = 0.0;
+        // 换段就丢掉上一段的区间限制：否则从「睡着」切到「开心」时，
+        // 新动画会莫名其妙只播前 70%。
+        self.loop_span = None;
+        self.sleep_cycle = None;
         // 先摆位置再画：`UpdateLayeredWindow` 带尺寸时**保留左上角**，
         // 所以新尺寸的帧若是宽高变大的，必须先落位，否则会从旧左上角长出去。
         self.place_window(&entry);
@@ -348,6 +454,24 @@ impl Pet {
         if self.forced.is_none() && self.brain.advance(dt) {
             let id = self.brain.anim_id();
             self.play(id)?;
+            self.after_switch(id)?;
+        }
+
+        // 待机自娱自乐：够无聊了就抽个小动作。
+        // 条件里特意看 `elapsed`（而不是另起一个计时器）：小动作不重置它，
+        // 所以自己能玩几下，但该睡的时候照样会困。
+        if self.forced.is_none()
+            && self.brain.mood() == Mood::Idle
+            && !self.action_playing
+            && self.brain.elapsed() >= self.next_action_at
+        {
+            if let Some(id) = self.pool.pick(&mut self.rng) {
+                self.action_playing = true;
+                self.play(id)?;
+            } else {
+                // 池子空（素材缺段）：往后顺延，别每帧都重试。
+                self.schedule_next_action();
+            }
         }
 
         // 松手后的滑行/下落。先算运动再推进帧：位置是这一帧的最终结果，
@@ -362,6 +486,19 @@ impl Pet {
             self.place_window(&entry);
             if !rest {
                 self.motion = Some(motion);
+            } else if self.brain.mood() == Mood::Dragged {
+                // 落地了，但先别急着站起来：记下时刻，由下面那段等 0.1 秒。
+                self.landed_at = Some(now);
+            }
+        }
+
+        // 落地后再保持被拖拽姿态 `LANDING_HOLD` 秒才回待机。
+        // 从高处松手时鱼一直在掉，`motion` 要落地才 `rest`，
+        // 所以这段等待不会把「还在空中」误判成「已经停好」。
+        if let Some(t) = self.landed_at {
+            if now.duration_since(t).as_secs_f32() >= LANDING_HOLD {
+                self.landed_at = None;
+                self.stimulate(Stimulus::DragEnd)?;
             }
         }
 
@@ -372,8 +509,10 @@ impl Pet {
         }
         let step = self.acc.floor();
         self.acc -= step;
-        let count = self.current_count();
-        self.frame = (self.frame + step as u32) % count;
+        // 推进帧 + 处理「小动作播完」。返回 `true` 时 `play` 已经重画过画面。
+        if self.step_frames(step as u32)? {
+            return Ok(());
+        }
         self.draw_frame()
     }
 
@@ -386,12 +525,19 @@ impl Pet {
                 let (left, top, _, _) = self.win.rect();
                 self.grab_origin = Some((left, top));
                 self.dragging = false;
+                self.landed_at = None;
                 self.trail.clear();
+                self.down_at = Some(Instant::now());
+                // 预热：按住就是想拖。把文件先打开，等阈值一到就只剩解一帧。
+                // 失败不管——真拖起来时 `play()` 会再报一次，没必要在按下时就报错。
+                let _ = self.ensure_loaded("drag");
                 Ok(())
             }
             Event::Moved { x, y } => self.on_moved(x, y),
             Event::MouseUp { .. } => self.on_button_up(),
-            Event::MouseMove { .. } | Event::RightClick { .. } | Event::Quit => Ok(()),
+            // 鼠标在它身上划过：不叫醒，只推迟下一次入睡。
+            Event::MouseMove { .. } => self.stimulate(Stimulus::Attention),
+            Event::RightClick { .. } | Event::Quit => Ok(()),
             // 托盘点击与唤醒由 app 层处理（它们要改可见性、开菜单），
             // 这里只保证穷举匹配不被绕过去。
             Event::TrayLeftClick | Event::TrayRightClick { .. } | Event::Woken => Ok(()),
@@ -413,6 +559,16 @@ impl Pet {
                 return Ok(());
             }
             self.dragging = true;
+            // 取证开关：`FEIYU_DRAG_TRACE=1` 时把「按下 → 进入拖拽姿态」的真实耗时
+            // 打到 stderr。体感延迟是用户报的，软件拿不出数字就只能猜。
+            if std::env::var_os("FEIYU_DRAG_TRACE").is_some() {
+                if let Some(t) = self.down_at {
+                    eprintln!(
+                        "拖拽：按下 → 进入 drag 姿态 {:.1}ms",
+                        t.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
             self.stimulate(Stimulus::DragStart)?;
         }
         Ok(())
@@ -422,6 +578,7 @@ impl Pet {
     fn on_button_up(&mut self) -> Result<()> {
         let was_dragging = std::mem::replace(&mut self.dragging, false);
         self.grab_origin = None;
+        self.down_at = None;
         if !was_dragging {
             self.trail.clear();
             return self.stimulate(Stimulus::Click);
@@ -430,7 +587,9 @@ impl Pet {
         self.capture_anchor()?;
         let (vx, vy) = self.take_fling();
         self.motion = Some(Motion::fling(vx, vy));
-        self.stimulate(Stimulus::DragEnd)
+        // 这里**不**切回待机：鱼还在空中，保持被拖拽的姿态直到落地
+        // （见 `tick` 里的 `landed_at`）。松手瞬间就站好会显得像被剪了一帧。
+        Ok(())
     }
 
     /// 用最近的拖拽采样估一个松手速度，并清空采样。
@@ -674,6 +833,110 @@ impl Pet {
             .max(1)
     }
 
+    /// 下一次入睡前要安静多久（秒）。
+    ///
+    /// 每次回到待机都重新抽：固定值会让「它什么时候睡」变成可预测的定时器。
+    fn next_sleep_delay(&mut self) -> f32 {
+        self.rng.range(SLEEP_AFTER_MIN, SLEEP_AFTER_MAX)
+    }
+
+    /// 安排下一次自娱自乐。
+    ///
+    /// 存的是**绝对时刻**而不是间隔：`elapsed` 会被鼠标划过清零，
+    /// 存绝对值就自然跟着顺延，不用在清零处到处补一行。
+    fn schedule_next_action(&mut self) {
+        let now = self.brain.elapsed();
+        self.next_action_at = now + self.rng.range(ACTION_GAP_MIN, ACTION_GAP_MAX);
+    }
+
+    /// 换段之后的收尾。
+    ///
+    /// 两件事只有这里知道：
+    /// * 落到 `sleep` 上要起睡眠编排（它从帧 0 演，但只演到冒出 Z）；
+    /// * 回到 `idle` 要换一个新的入睡时间。
+    fn after_switch(&mut self, id: &str) -> Result<()> {
+        // 任何真正的姿态切换都结束「待机小动作」这场戏。
+        self.action_playing = false;
+        if id == "sleep" {
+            self.sleep_cycle = Some(SleepCycle::new());
+            self.apply_sleep_span();
+            self.frame = self.loop_span.map_or(0, |(lo, _)| lo);
+            return self.draw_frame();
+        }
+        if id == "idle" {
+            let delay = self.next_sleep_delay();
+            self.brain.set_sleep_after(delay);
+            self.schedule_next_action();
+        }
+        Ok(())
+    }
+
+    /// 按睡眠编排的当前阶段重算循环区间。
+    fn apply_sleep_span(&mut self) {
+        let Some(cycle) = self.sleep_cycle.as_ref() else {
+            return;
+        };
+        let count = self.current_count();
+        self.loop_span = Some(span_to_frames(cycle.span(), count));
+    }
+
+    /// 推进 `step` 帧，并处理「待机小动作播完一圈」。
+    ///
+    /// `tick` 与自检共用这一段：回绕判断只写一份，两边不会慢慢长歪。
+    /// 返回 `true` 表示刚因为小动作演完而切回了 idle（此时画面已经重画过）。
+    fn step_frames(&mut self, step: u32) -> Result<bool> {
+        let count = self.current_count();
+        let before = self.frame;
+        self.advance_frame(step, count);
+        // `step` 最多两三帧（`MAX_ANIM_DT` 卡着），所以帧号变小只可能是回绕，
+        // 不会漏跳一整圈。
+        if !self.action_playing || self.frame >= before {
+            return Ok(false);
+        }
+        self.action_playing = false;
+        self.schedule_next_action();
+        self.play("idle")?;
+        Ok(true)
+    }
+
+    /// 推进 `step` 帧。
+    ///
+    /// 没有被限定区间时就是普通的整段循环；被限定（睡觉）时只在段内转，
+    /// 段播完再问一次睡眠编排要不要换段——这是「睡着后不再自己醒来」的实现点。
+    fn advance_frame(&mut self, step: u32, count: u32) {
+        let Some((lo, hi)) = self.loop_span else {
+            self.frame = (self.frame + step) % count;
+            return;
+        };
+        if lo > hi || hi >= count {
+            // 区间坏了（换了素材、帧数变了）：退回整段循环，
+            // 不要卡在第 0 帧不动——那比多播几帧难查得多。
+            self.loop_span = None;
+            self.frame = (self.frame + step) % count;
+            return;
+        }
+        let span = hi - lo + 1;
+        if self.frame < lo || self.frame > hi {
+            self.frame = lo;
+        }
+        let next = self.frame.saturating_add(step);
+        if next <= hi {
+            self.frame = next;
+            return;
+        }
+        // 越过段尾：入睡段演完就进打呼段，打呼段就一直原地循环。
+        if self
+            .sleep_cycle
+            .as_mut()
+            .is_some_and(|c| c.on_segment_end())
+        {
+            self.apply_sleep_span();
+            self.frame = self.loop_span.map_or(lo, |(a, _)| a);
+        } else {
+            self.frame = lo + (next - hi - 1) % span;
+        }
+    }
+
     /// 把刺激交给状态机；姿态真的变了才换动画。
     fn stimulate(&mut self, s: Stimulus) -> Result<()> {
         if self.forced.is_some() {
@@ -682,6 +945,7 @@ impl Pet {
         if self.brain.stimulus(s) {
             let id = self.brain.anim_id();
             self.play(id)?;
+            self.after_switch(id)?;
         }
         Ok(())
     }

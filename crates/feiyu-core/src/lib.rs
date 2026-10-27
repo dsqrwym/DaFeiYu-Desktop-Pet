@@ -8,7 +8,13 @@
 pub mod anim;
 pub mod brain;
 pub mod motion;
+pub mod pool;
+pub mod rng;
+pub mod sleep;
 
 pub use anim::{AnimEntry, AnimError, AnimHeader, AnimReader, Codec, FrameEntry, Manifest};
 pub use brain::{Brain, Mood, Stimulus};
 pub use motion::{fling_velocity, Limits, Motion};
+pub use pool::Pool;
+pub use rng::Rng;
+pub use sleep::{span_to_frames, SleepCycle, SleepStage};

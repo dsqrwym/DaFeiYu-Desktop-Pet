@@ -88,7 +88,11 @@ pub fn capture_to_bmp(hwnd: HWND, path: impl AsRef<Path>) -> Result<(u32, u32)> 
 }
 
 /// BMP 头 + 像素。`pixels` 为自上而下的 BGRA。
-fn write_bmp(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
+///
+/// 公开是为了让 `--dump` 能把**解出来的动画帧**也写成同一格式：
+/// 判读素材内容（哪一帧出现了 Z、哪一段是静止）只能靠眼睛，
+/// 而给眼睛看的东西必须能脱离程序独立打开。
+pub fn write_bmp(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
     let header_size = 54u32;
     let image_size = width * height * 4;
     let mut out = BufWriter::new(File::create(path)?);

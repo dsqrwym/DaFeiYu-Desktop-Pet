@@ -52,6 +52,12 @@ pub enum Stimulus {
     DragStart,
     /// 松手结束拖拽。
     DragEnd,
+    /// 鼠标擦过角色（没按下去）。
+    ///
+    /// 含义是「有人经过」，而不是「有人要叫醒我」：睡着时**不唤醒**，
+    /// 只是把计时清零 —— 于是下一次入睡被推后。用户把鼠标在它身上划来划去，
+    /// 它就多撑一会儿才睡；真想要它醒得点击或拖拽。
+    Attention,
 }
 
 /// 连续点击的统计窗口（秒）：窗口内的点击才算“连点”。
@@ -105,6 +111,26 @@ impl Brain {
         self.mood.anim_id()
     }
 
+    /// 当前姿态已经持续了多久（秒）。
+    ///
+    /// 待机时它就是「多久没被搭理」：调用方拿它决定要不要播个小动作，
+    /// 睡不睡也看同一个数。两者共用不会互相干扰——播小动作**不重置**它，
+    /// 所以自娱自乐几次之后照样会困。
+    pub fn elapsed(&self) -> f32 {
+        self.elapsed
+    }
+
+    /// 重设「多久不互动就睡」（秒）。
+    ///
+    /// 调用方据此给入睡时间加抖动：每天在同一秒睡着，
+    /// 看起来像定时器而不像活物。非法值（NaN/无穷）直接忽略；
+    /// 负数夹到 0（0 是合法值：自检里要靠它立刻入睡）。
+    pub fn set_sleep_after(&mut self, secs: f32) {
+        if secs.is_finite() {
+            self.sleep_after = secs.max(0.0);
+        }
+    }
+
     /// 时间前进 `dt` 秒。返回姿态是否发生变化。
     ///
     /// 只拦非法值（NaN / 负数 / 无穷），**不设上限**：上限会把「电脑休眠两小时后唤醒」
@@ -151,6 +177,11 @@ impl Brain {
                 self.switch_to(Mood::Dragged)
             }
             Stimulus::DragEnd => self.switch_to(Mood::Idle),
+            Stimulus::Attention => {
+                // 只重置计时，不改姿态：睡着时被鼠标划过也要接着睡。
+                self.elapsed = 0.0;
+                false
+            }
         }
     }
 
@@ -294,5 +325,55 @@ mod tests {
         assert!(!b.advance(-5.0));
         assert!(!b.advance(f32::INFINITY), "无穷大按 0 处理，不应瞬间睡着");
         assert_eq!(b.mood(), Mood::Idle);
+    }
+
+    #[test]
+    fn attention_postpones_sleep() {
+        let mut b = Brain::new(1.0);
+        // 每 0.8 秒被“路过”一次，永远凑不够 1 秒的安静期。
+        for _ in 0..20 {
+            assert!(!b.advance(0.8));
+            assert!(!b.stimulus(Stimulus::Attention));
+            assert_eq!(b.mood(), Mood::Idle);
+        }
+        // 一旦真的安静下来，就会睡。
+        assert!(b.advance(1.1));
+        assert_eq!(b.mood(), Mood::Sleep);
+    }
+
+    #[test]
+    fn attention_never_wakes_a_sleeper() {
+        let mut b = Brain::new(1.0);
+        assert!(b.advance(1.5));
+        assert_eq!(b.mood(), Mood::Sleep);
+        for _ in 0..10 {
+            assert!(!b.stimulus(Stimulus::Attention), "划过不该唤醒");
+            assert_eq!(b.mood(), Mood::Sleep);
+            assert!(!b.advance(0.5), "睡着后一直睡，不会自己醒");
+            assert_eq!(b.mood(), Mood::Sleep);
+        }
+    }
+
+    #[test]
+    fn sleep_after_can_be_retuned() {
+        let mut b = Brain::new(25.0);
+        b.set_sleep_after(40.0);
+        assert!(!b.advance(30.0), "改到 40 秒后，30 秒还不该睡");
+        assert_eq!(b.mood(), Mood::Idle);
+        assert!(b.advance(11.0));
+        assert_eq!(b.mood(), Mood::Sleep);
+
+        // 非法值必须被忽略，而不是把桌宠变成永不入睡。
+        b.set_sleep_after(f32::NAN);
+        b.set_sleep_after(f32::INFINITY.abs());
+        assert!(b.sleep_after >= 1.0, "非法值不能把 sleep_after 改坏");
+
+        // 负数夹到 0：阈值 0 应当立刻入睡。
+        // 必须用新实例：上面那个 `b` 已经睡着了，再喂 dt 不会有任何变化。
+        let mut fresh = Brain::new(25.0);
+        fresh.set_sleep_after(-3.0);
+        assert_eq!(fresh.sleep_after, 0.0);
+        assert!(fresh.advance(0.1), "阈值 0 时应立即睡着");
+        assert_eq!(fresh.mood(), Mood::Sleep);
     }
 }
