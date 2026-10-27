@@ -1,0 +1,10 @@
+# 换行统一：仓库内一律 LF，检出也不转换。
+# Rust/TOML/JSON 都无 CRLF 需求，统一后可避免跨机器整文件「假修改」。
+* text=auto eol=lf
+
+# 二进制资产禁止任何文本处理（换行、diff 都会毁掉它们）
+*.fishanim binary
+*.bmp binary
+*.png binary
+*.webm binary
+*.exe binary

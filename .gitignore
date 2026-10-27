@@ -1,0 +1,19 @@
+# 构建产物
+/target/
+/dist/
+
+# IDE 工程配置（每个人的 RustRover 布局不同，不入库）
+.idea/
+*.iml
+
+# 上游素材（体积大，不入库；用 tools/fetch-assets 或手工 clone 获取）
+/_upstream/
+/assets-src/
+
+# 生成物：.fishanim / manifest.json 由 pack-anim 产出，随 release 分发
+/assets/
+
+# 本地运行态
+/config.json
+/config.toml
+/*.log

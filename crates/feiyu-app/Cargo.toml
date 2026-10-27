@@ -1,0 +1,15 @@
+[package]
+name = "feiyu-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feiyu-core = { path = "../feiyu-core" }
+feiyu-platform = { path = "../feiyu-platform" }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "feiyu"
+path = "src/main.rs"

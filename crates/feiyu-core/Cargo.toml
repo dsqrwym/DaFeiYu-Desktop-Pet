@@ -1,0 +1,10 @@
+[package]
+name = "feiyu-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FeiYu 桌宠的平台无关核心：素材容器、动画清单、状态机与物理（本阶段仅素材容器）"
+
+[dependencies]
+zstd.workspace = true
+thiserror.workspace = true

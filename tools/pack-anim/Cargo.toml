@@ -1,0 +1,14 @@
+[package]
+name = "pack-anim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "素材管线：webm → 黑底泛洪抠像 → 预乘 BGRA → .fishanim"
+
+[dependencies]
+feiyu-core = { path = "../../crates/feiyu-core" }
+anyhow.workspace = true
+# 仅用于 --dump 导出中间 PNG 做肉眼抽检，不进入运行时依赖。
+image = { version = "0.25", default-features = false, features = ["png"] }
+# bench-decode 要直接量解压耗时，所以显式依赖，而不是只经 feiyu-core 间接用。
+zstd.workspace = true
