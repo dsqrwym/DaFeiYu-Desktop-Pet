@@ -131,6 +131,29 @@ fn check_window(r: &mut Report) -> Result<()> {
         !(tb > 150 && tr < 100 && tg < 100),
     );
 
+    // 托盘图标：从一帧像素真的造出一个 HICON。
+    // 「像素拼得对」由 `icon.rs` 的纯函数单测钉住，这里只验 Win32 这层能通。
+    let mut icon_px = vec![0u8; (32 * 32 * 4) as usize];
+    for y in 8..24usize {
+        for x in 8..24usize {
+            let o = (y * 32 + x) * 4;
+            icon_px[o] = 200; // B
+            icon_px[o + 1] = 80; // G
+            icon_px[o + 2] = 40; // R
+            icon_px[o + 3] = 255; // A
+        }
+    }
+    let icon = feiyu_platform::Icon::from_bgra_sized(&icon_px, 32, 32, 16);
+    let icon_desc = match &icon {
+        Ok(i) => format!("句柄空 = {}", i.handle().0.is_null()),
+        Err(e) => format!("失败：{e:#}"),
+    };
+    r.check(
+        &format!("从帧像素能造出托盘图标（{icon_desc}）"),
+        icon.as_ref().is_ok_and(|i| !i.handle().0.is_null()),
+    );
+    drop(icon);
+
     drop(win);
     Ok(())
 }
@@ -270,26 +293,46 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     }
     let manifest = feiyu_core::anim::Manifest::load(&manifest_path)?;
 
-    // 菜单：真建一次（不弹出）。弹出来是模态的，自检里没法自动关掉，
-    // 所以只能验到「Win32 那层没被写坏」为止；外观请用 `--menu` 看。
-    let built = feiyu_platform::Menu::new().and_then(|mut m| {
-        m.command(1, "回到屏幕底部")
-            .check(2, "总在最前", true)
-            .separator()
-            .command(3, "退出");
-        Ok(m.items())
-    });
-    let menu_desc = match &built {
+    // ---- 几何：锚点范围必须与工作区、窗口尺寸自洽 ----
+    let mut pet = Pet::open(dir, Some("idle")).context("打开桌宠失败")?;
+
+    // 菜单：只核对内容没被写坏，不真的弹出来（模态菜单没法自动关），
+    // 外观请用 `--menu` 看。
+    let items = pet.menu_items();
+    let items_desc = match &items {
         Ok(n) => format!("{n} 项"),
         Err(e) => format!("失败：{e:#}"),
     };
     r.check(
-        &format!("右键菜单能构造（{menu_desc}）"),
-        built.as_ref().is_ok_and(|n| *n == 4),
+        &format!(
+            "右键菜单能构造（{items_desc}，首项「{}」）",
+            pet.hide_label()
+        ),
+        items.as_ref().is_ok_and(|n| *n == 5),
     );
 
-    // ---- 几何：锚点范围必须与工作区、窗口尺寸自洽 ----
-    let mut pet = Pet::open(dir, Some("idle")).context("打开桌宠失败")?;
+    // ---- 隐藏 / 唤出：窗口真的会不可见，菜单文案跟着换 ----
+    pet.show();
+    let shown = pet.is_visible();
+    pet.hide();
+    let after_hide = pet.is_visible();
+    let label_hidden = pet.hide_label().to_owned();
+    let hidden_flag = pet.hidden();
+    pet.unhide();
+    let after_unhide = pet.is_visible();
+    r.check(
+        &format!("隐藏 → 不可见（{shown} → {after_hide}），唤出 → 又可见（{after_unhide}）"),
+        shown && !after_hide && after_unhide && hidden_flag,
+    );
+    r.check(
+        &format!("藏着时菜单首项变「{label_hidden}」"),
+        label_hidden == "唤出桌宠",
+    );
+    r.check(
+        &format!("唤出后首项变回「{}」", pet.hide_label()),
+        pet.hide_label() == "隐藏到托盘",
+    );
+
     let area = pet.area();
     let ground = (area.3 - BOTTOM_GAP) as f32;
     let limits = pet.limits();

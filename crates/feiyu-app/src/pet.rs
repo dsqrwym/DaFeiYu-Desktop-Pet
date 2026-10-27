@@ -22,7 +22,7 @@ use anyhow::{ensure, Context, Result};
 use feiyu_core::anim::{AnimEntry, AnimReader, Manifest};
 use feiyu_core::brain::{Brain, Mood, Stimulus};
 use feiyu_core::motion::{fling_velocity, Limits, Motion};
-use feiyu_platform::{CommandId, Event, LayeredWindow, Menu};
+use feiyu_platform::{CommandId, Event, Icon, LayeredWindow, Menu, TrayIcon};
 
 /// 脚底距工作区底边的空隙（像素）。
 const BOTTOM_GAP: i32 = 4;
@@ -46,6 +46,10 @@ const TRAIL_WINDOW: f32 = 0.12;
 const CMD_HOME: CommandId = 1;
 const CMD_TOPMOST: CommandId = 2;
 const CMD_QUIT: CommandId = 3;
+const CMD_HIDE: CommandId = 4;
+
+/// 托盘图标的悬停提示。
+const TRAY_TIP: &str = "飞鱼";
 
 type Anim = AnimReader<BufReader<File>>;
 
@@ -61,6 +65,8 @@ pub enum Action {
     Home,
     /// 「总在最前」切换后的新状态。
     Topmost(bool),
+    /// 隐藏状态切换后的新状态（`true` = 已藏进托盘）。
+    Hidden(bool),
     /// 用户要退出。
     Quit,
 }
@@ -98,6 +104,15 @@ pub struct Pet {
     trail: VecDeque<(Instant, i32, i32)>,
     /// 左键按下时的窗口左上角，用来区分「点击」与「拖拽」。
     grab_origin: Option<(i32, i32)>,
+    /// 是否被藏进托盘。
+    hidden: bool,
+    /// 调用方要求的定时器周期，隐藏时用来原样恢复。
+    tick_ms: u32,
+    /// 托盘图标。**必须声明在 `icon` 之前**：字段按声明顺序析构，
+    /// 这样 `NIM_DELETE` 一定先于 `DestroyIcon`，托盘上不会留幽灵图标。
+    tray: Option<TrayIcon>,
+    /// 托盘图标本体（`TrayIcon` 只引用不持有）。
+    icon: Option<Icon>,
 }
 
 impl Pet {
@@ -142,6 +157,10 @@ impl Pet {
             motion: None,
             trail: VecDeque::new(),
             grab_origin: None,
+            hidden: false,
+            tick_ms: 0,
+            tray: None,
+            icon: None,
         };
         pet.ensure_loaded(&pet.current.clone())?;
         pet.draw_frame()?;
@@ -173,9 +192,76 @@ impl Pet {
         self.win.show();
     }
 
-    /// 启动/停止周期定时器。
-    pub fn set_tick(&self, ms: u32) {
+    /// 启动/停止周期定时器。周期记在 `tick_ms` 里，隐藏时用它原样恢复。
+    pub fn set_tick(&mut self, ms: u32) {
+        self.tick_ms = ms;
         self.win.set_tick(ms);
+    }
+
+    /// 藏进托盘：窗口不可见，定时器停掉。
+    ///
+    /// 定时器一定要停——不动的桌宠也要烧 1.48% 单核，
+    /// 而「藏起来」对用户的意思就是「别再占我资源」。
+    pub fn hide(&mut self) {
+        if self.hidden {
+            return;
+        }
+        self.hidden = true;
+        self.win.hide();
+        self.win.set_tick(0);
+    }
+
+    /// 从托盘唤出。
+    ///
+    /// 没藏过也照样显一次：托盘单击的含义就是「我要看到它」。
+    pub fn unhide(&mut self) {
+        self.win.reveal();
+        if !self.hidden {
+            return;
+        }
+        self.hidden = false;
+        if self.tick_ms > 0 {
+            self.win.set_tick(self.tick_ms);
+        }
+        // 停定时器这段时间里 `last` 停在很久以前：不重置的话
+        // 状态机会吃到几分钟的 dt，刚一睁眼就直接睡着。
+        self.last = Instant::now();
+    }
+
+    /// 当前是否藏着（菜单文案与自检用）。
+    pub fn hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// 窗口当前是否可见（自检用）。
+    pub fn is_visible(&self) -> bool {
+        self.win.is_visible()
+    }
+
+    /// 挂上托盘图标：用当前动画的首帧现场画一张。
+    ///
+    /// 只在真要常驻时才调；`--shot` 那种一闪就退的模式加了又删，
+    /// 通知区会闪一下，没意义。
+    pub fn enable_tray(&mut self) -> Result<()> {
+        if self.tray.is_some() {
+            return Ok(());
+        }
+        let cur = self.current.clone();
+        let entry = self.manifest.require(&cur)?.clone();
+        // 拷一份像素：组装图标期间还要可变借用 self。
+        let pixels = self
+            .anims
+            .get_mut(&cur)
+            .with_context(|| format!("动画 {cur} 尚未加载"))?
+            .frame(0)?
+            .to_vec();
+        let icon = Icon::from_bgra(&pixels, entry.width() as u32, entry.height() as u32)
+            .context("从帧像素生成托盘图标失败")?;
+        let tray =
+            TrayIcon::new(self.win.hwnd(), icon.handle(), TRAY_TIP).context("添加托盘图标失败")?;
+        self.icon = Some(icon);
+        self.tray = Some(tray);
+        Ok(())
     }
 
     /// 清单原始 fps。
@@ -255,6 +341,9 @@ impl Pet {
             Event::Moved { x, y } => self.on_moved(x, y),
             Event::MouseUp { .. } => self.on_button_up(),
             Event::MouseMove { .. } | Event::RightClick { .. } | Event::Quit => Ok(()),
+            // 托盘点击与唤醒由 app 层处理（它们要改可见性、开菜单），
+            // 这里只保证穷举匹配不被绕过去。
+            Event::TrayLeftClick | Event::TrayRightClick { .. } | Event::Woken => Ok(()),
         }
     }
 
@@ -412,25 +501,60 @@ impl Pet {
 
     /// 在屏幕坐标 `(x, y)` 弹出右键菜单，返回应该做什么。
     ///
-    /// 菜单内容就是功能边界的一次声明：这里**故意不放「隐藏」**——
-    /// 还没有托盘图标，藏起来就再也点不到了。
+    /// 桌宠自身的右键和托盘图标的右键**共用同一张菜单**：两边的动作完全一样，
+    /// 只有第一项随「当前藏没藏」换文案。分开维护两张表，只会让两边慢慢长歪。
     pub fn menu(&mut self, x: i32, y: i32) -> Result<Action> {
-        let topmost = self.win.is_topmost();
-        let mut menu = Menu::new()?;
-        menu.command(CMD_HOME, "回到屏幕底部")
-            .check(CMD_TOPMOST, "总在最前", topmost)
-            .separator()
-            .command(CMD_QUIT, "退出");
+        let menu = self.build_menu()?;
         let Some(cmd) = menu.show_at(self.win.hwnd(), x, y)? else {
             return Ok(Action::None);
         };
+        self.dispatch(cmd)
+    }
+
+    /// 菜单项数（自检用：只核对内容没被写坏，不弹出来）。
+    pub fn menu_items(&self) -> Result<usize> {
+        Ok(self.build_menu()?.items())
+    }
+
+    /// 菜单首项文案：藏着时是「唤出」，显示着时是「隐藏」。
+    pub fn hide_label(&self) -> &'static str {
+        if self.hidden {
+            "唤出桌宠"
+        } else {
+            "隐藏到托盘"
+        }
+    }
+
+    fn build_menu(&self) -> Result<Menu> {
+        let topmost = self.win.is_topmost();
+        let mut menu = Menu::new()?;
+        menu.command(CMD_HIDE, self.hide_label())
+            .command(CMD_HOME, "回到屏幕底部")
+            .check(CMD_TOPMOST, "总在最前", topmost)
+            .separator()
+            .command(CMD_QUIT, "退出");
+        Ok(menu)
+    }
+
+    fn dispatch(&mut self, cmd: CommandId) -> Result<Action> {
         match cmd {
+            CMD_HIDE => {
+                let next = !self.hidden;
+                if next {
+                    self.hide();
+                } else {
+                    self.unhide();
+                }
+                Ok(Action::Hidden(next))
+            }
             CMD_HOME => {
                 self.back_to_home()?;
                 Ok(Action::Home)
             }
             CMD_TOPMOST => {
-                let next = !topmost;
+                // 重读一次而不是拿弹菜单前的快照：菜单是模态的，
+                // 中间可能已经改过了。
+                let next = !self.win.is_topmost();
                 self.win.set_topmost(next);
                 Ok(Action::Topmost(next))
             }

@@ -10,6 +10,7 @@
 //! * 逐像素命中测试（`WM_NCHITTEST` 返回 `HTTRANSPARENT`，透明区鼠标穿透）；
 //! * 拖动、定时器、右键事件；
 //! * 原生上下文菜单；
+//! * 托盘图标（帧像素现场画成 `HICON`，不依赖 `.ico` 资源）；
 //! * 窗口截图（自检取证用，产物是 BMP，零第三方依赖）。
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -18,17 +19,21 @@
 compile_error!("feiyu-platform 目前只实现了 Windows 后端");
 
 pub mod dpi;
+pub mod icon;
 pub mod instance;
 pub mod menu;
 pub mod screen;
 pub mod shot;
+pub mod tray;
 pub mod window;
 
 pub use dpi::enable_per_monitor_v2;
+pub use icon::Icon;
 pub use instance::SingleInstance;
 pub use menu::{CommandId, Menu};
 pub use screen::primary_work_area;
-pub use window::{pump, quit, Event, LayeredWindow};
+pub use tray::TrayIcon;
+pub use window::{find_window, pump, quit, wake, Event, LayeredWindow, TRAY_MESSAGE};
 
 /// 平台层错误。
 #[derive(Debug, thiserror::Error)]

@@ -26,17 +26,32 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST,
-    HWND_TOPMOST, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOWNOACTIVATE, ULW_ALPHA, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCHITTEST, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
+    HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MSG,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
+    WM_APP, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 use crate::{Error, Result};
+
+/// 托盘图标的回调消息（`NOTIFYICONDATAW.uCallbackMessage`）。
+///
+/// 用 `WM_APP` 之后的区间：这些消息系统不会自作主张发过来。
+pub const TRAY_MESSAGE: u32 = WM_APP + 1;
+
+/// 「已有实例被第二次启动」的唤醒消息，见 [`wake`]。
+pub const WAKE_MESSAGE: u32 = WM_APP + 2;
+
+/// 窗口类名的宽字符形式。做成函数而不是 `const`：`w!` 宏展开后要知道字符串长度，
+/// 写在函数里最不需要琢磨它能不能放进常量求值。
+fn window_class() -> PCWSTR {
+    windows::core::w!("FeiYuPetWindow")
+}
 
 /// 窗口事件。全部在消息泵线程上按顺序交付。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +69,12 @@ pub enum Event {
     RightClick { x: i32, y: i32 },
     /// 窗口被拖到了新位置（屏幕坐标，左上角）。
     Moved { x: i32, y: i32 },
+    /// 托盘图标上左键单击（约定含义：把桌宠唤出来）。
+    TrayLeftClick,
+    /// 托盘图标上右键（屏幕坐标，直接可以拿去弹菜单）。
+    TrayRightClick { x: i32, y: i32 },
+    /// 别的进程又启动了一份，请求把这一只唤出来。
+    Woken,
     /// 窗口正在销毁。
     Quit,
 }
@@ -184,6 +205,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             push(Event::RightClick { x: pt.x, y: pt.y });
         }
         WM_TIMER => push(Event::Tick),
+        TRAY_MESSAGE => {
+            // 没开 NOTIFYICON_VERSION_4：lparam 低字就是鼠标消息，
+            // 坐标得自己取（v4 才会把坐标塞进 wparam）。
+            match (lparam.0 & 0xFFFF) as u32 {
+                WM_LBUTTONUP => push(Event::TrayLeftClick),
+                WM_RBUTTONUP => {
+                    // SAFETY: 栈上 POINT 接收光标位置。
+                    let mut pt = POINT::default();
+                    let _ = unsafe { GetCursorPos(&mut pt) };
+                    push(Event::TrayRightClick { x: pt.x, y: pt.y });
+                }
+                // 双击、移动这些暂不需要：鼠标划过也会来消息，
+                // 全转成事件只会让泵空转。
+                _ => {}
+            }
+        }
+        WAKE_MESSAGE => push(Event::Woken),
         WM_DESTROY => {
             push(Event::Quit);
             // SAFETY: 结束本线程消息循环。
@@ -247,7 +285,7 @@ pub struct LayeredWindow {
 impl LayeredWindow {
     /// 创建窗口（不显示）。`width/height` 是**位图**尺寸，也是窗口客户区尺寸。
     pub fn create(width: u32, height: u32, x: i32, y: i32, title: &str) -> Result<Self> {
-        let class = windows::core::w!("FeiYuPetWindow");
+        let class = window_class();
         // SAFETY: 取本模块句柄，无需释放。
         let hinstance =
             unsafe { GetModuleHandleW(None) }.map_err(|e| Error::win32("GetModuleHandleW", e))?;
@@ -344,6 +382,55 @@ impl LayeredWindow {
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// 隐藏窗口。不动定时器——那是调用方的事（藏起来的桌宠没必要继续烧 CPU）。
+    pub fn hide(&self) {
+        // SAFETY: 句柄有效。
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+    }
+
+    /// 当前是否可见（自检用）。
+    pub fn is_visible(&self) -> bool {
+        // SAFETY: 只查本窗口的可见性标志。
+        unsafe { IsWindowVisible(self.hwnd).as_bool() }
+    }
+
+    /// 从隐藏状态唤出，并保持原来的 z 序归属。
+    ///
+    /// **不能直接用 [`Self::show`]**：那个会把窗口强行设成 topmost，
+    /// 等于把用户关掉的「总在最前」悄悄打开。
+    pub fn reveal(&self) {
+        // SAFETY: 句柄有效；下面只改可见性与 z 序。
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        if self.is_topmost() {
+            self.set_topmost(true);
+        } else {
+            self.raise();
+        }
+    }
+
+    /// 抬到**同一层** z 序的顶端：置顶的仍在置顶层，不置顶的仍在普通层。
+    ///
+    /// 刚关掉别的窗口时想把它叫出来看看，又不希望它从此一路压在其他窗口上面，
+    /// 用的就是这一步而不是 `set_topmost(true)`。
+    pub fn raise(&self) {
+        // SAFETY: 句柄有效；只改 z 序，不动位置与尺寸。
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOP),
                 0,
                 0,
                 0,
@@ -518,6 +605,25 @@ impl Drop for LayeredWindow {
         }
         let _ = STATE.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
+}
+
+/// 找到已经在跑的那一只桌宠的窗口。
+///
+/// 只按类名找、不限定窗口名：本项目只有一个窗口类，且它带 `WS_EX_TOOLWINDOW`，
+/// 不会在 Alt+Tab 里露面，不会和别的程序撞名。
+pub fn find_window() -> Option<HWND> {
+    // SAFETY: 只读查找，不传窗口名（PCWSTR::null）。
+    unsafe { FindWindowW(window_class(), PCWSTR::null()) }.ok()
+}
+
+/// 请已经在跑的那个实例把自己唤出来。
+///
+/// 跨进程投递 `WM_APP` 区间的自定义消息是允许的：接收方是自己的同类窗口，
+/// 消息号一致，不需要注册全局消息。
+pub fn wake(hwnd: HWND) -> Result<()> {
+    // SAFETY: 句柄由 `find_window` 找到，是只读使用；消息只是一个空载荷信号。
+    unsafe { PostMessageW(Some(hwnd), WAKE_MESSAGE, WPARAM(0), LPARAM(0)) }
+        .map_err(|e| Error::win32("PostMessageW", e))
 }
 
 /// 结束消息循环（从事件回调里调用它可安全退出）。
