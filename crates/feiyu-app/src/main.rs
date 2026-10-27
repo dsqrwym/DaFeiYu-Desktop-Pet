@@ -85,8 +85,14 @@ struct Args {
     tray: bool,
     /// 一开始就藏进托盘，挂 n 秒后退出（量隐藏时的 CPU）。
     hide: Option<u32>,
+    /// 一启动就藏进托盘，但**消息泵照常跑**：验证「隐藏后托盘能不能点开」。
+    /// `--hide` 不跑泵（那是量 CPU 用的），验不了点击。
+    hide_now: bool,
     /// 正常跑 n 秒就优雅退出。观察随机动作、入睡这类「要等才会发生」的行为时用。
     run: Option<u32>,
+    /// 把入睡等待钉成固定秒数（默认随机 18~38 秒）。
+    /// 观察「睡着后被键鼠弄醒」必须能控住这个数。
+    sleep_after: Option<f32>,
     /// 启动时给一个初速度（像素/秒），用来验证滑行与下落。
     fling: Option<(f32, f32)>,
     /// 把某段动画按步长导出成 BMP（判读素材内容用）。
@@ -108,7 +114,9 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         menu: false,
         tray: false,
         hide: None,
+        hide_now: false,
         run: None,
+        sleep_after: None,
         fling: None,
         dump: None,
         list: false,
@@ -133,6 +141,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             }
             "--menu" => out.menu = true,
             "--tray" => out.tray = true,
+            "--hide-now" => out.hide_now = true,
             "--hide" => {
                 out.hide = Some(
                     it.next()
@@ -163,6 +172,14 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                     .parse()
                     .context("--dump 步长需要整数")?;
                 out.dump = Some((id, out_dir, step));
+            }
+            "--sleep-after" => {
+                out.sleep_after = Some(
+                    it.next()
+                        .context("--sleep-after 缺少数秒")?
+                        .parse()
+                        .context("--sleep-after 需要数字秒")?,
+                )
             }
             "--list" => out.list = true,
             "--run" => {
@@ -196,8 +213,10 @@ fn print_help() {
          \x20 --shots <目录>    每段动画各截一张 BMP 后退出\n\
          \x20 --menu           弹一次右键菜单后退出（验证菜单用）\n\
          \x20 --tray           挂上托盘图标跑 5 秒后退出（验证通知区用）\n\
-         \x20 --hide <秒>      先跑 2 秒让动画推进，再藏进托盘挂 n 秒（量隐藏时的 CPU）\n\
+         \x20 --hide <秒>      先跑 2 秒让动画推进，再藏进托盘挂 n 秒（量隐藏时的 CPU，不跑泵）\n\
+         \x20 --hide-now       一启动就藏进托盘但照常跑泵（验证隐藏后托盘能不能点开）\n\
          \x20 --run <秒>       正常跑 n 秒后优雅退出（观察随机动作、入睡这类慢行为）\n\
+         \x20 --sleep-after <秒> 把入睡等待钉成固定值（默认随机 18~38 秒）\n\
          \x20 --fling <vx> <vy> 启动时给一个初速度（像素/秒，验证滑行与下落）\n\
          \x20 --static         画一帧后不再推进（测静止底噪）\n\
          \x20 --bench <n>      连续提交 n 帧，报告单帧耗时\n\
@@ -318,6 +337,9 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
         .or_else(|| args.shots.as_ref().map(|_| "idle".to_owned()));
     let mut pet = Pet::open(&dir, forced.as_deref())?;
     pet.show();
+    if let Some(secs) = args.sleep_after {
+        pet.set_fixed_sleep_after(secs);
+    }
 
     // 调试入口：把「要鼠标才能触发」那一步拆掉，让物理推窗口可以被截屏取证。
     if let Some((vx, vy)) = args.fling {
@@ -359,9 +381,24 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     // 托盘只在真要常驻时才挂：`--shot` 一闪就退，加了又删会让通知区闪一下。
     if args.shot.is_none() {
         pet.enable_tray().context("挂托盘图标失败")?;
+        if args.hide_now {
+            pet.hide();
+            // 真正的隐藏要停定时器（省 CPU），但这个模式的用途恰恰是
+            // 「隐藏后还能不能点开」——没有消息就没有 pump 回调，`--run` 的
+            // 截止也就永远等不到。给一个 500ms 的慢速定时器：够粗到不耗电，
+            // 又够细到能被截止检查看到。
+            pet.set_tick(500);
+            println!(
+                "已藏进托盘（--hide-now）：窗口可见 = {}，托盘图标照常可点。",
+                pet.is_visible()
+            );
+        }
     }
 
-    pet.set_tick(TICK_MS);
+    // 隐藏模式已经自己设了 500ms 的慢速定时器，别拿 8ms 盖掉它。
+    if !args.hide_now {
+        pet.set_tick(TICK_MS);
+    }
     let shot = args.shot.clone();
     let verbose = args.verbose;
     // `--run` 用墙钟截止，只能在泵里判：`SetTimer` 粒度 15.6ms，数拍子不准。

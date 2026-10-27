@@ -58,6 +58,11 @@ pub enum Stimulus {
     /// 只是把计时清零 —— 于是下一次入睡被推后。用户把鼠标在它身上划来划去，
     /// 它就多撑一会儿才睡；真想要它醒得点击或拖拽。
     Attention,
+    /// 睡够了 / 被电脑前的动静弄醒了：回到待机。
+    ///
+    /// 与 [`Stimulus::Click`] 的区别是**不改变心情**：
+    /// 点击是「逗它」，醒来后会开心；这个只是「睡不下去了」，睁眼就该干嘛干嘛。
+    Awaken,
 }
 
 /// 连续点击的统计窗口（秒）：窗口内的点击才算“连点”。
@@ -181,6 +186,11 @@ impl Brain {
                 // 只重置计时，不改姿态：睡着时被鼠标划过也要接着睡。
                 self.elapsed = 0.0;
                 false
+            }
+            Stimulus::Awaken => {
+                self.pokes = 0;
+                self.poke_window = 0.0;
+                self.switch_to(Mood::Idle)
             }
         }
     }
@@ -352,6 +362,28 @@ mod tests {
             assert!(!b.advance(0.5), "睡着后一直睡，不会自己醒");
             assert_eq!(b.mood(), Mood::Sleep);
         }
+    }
+
+    #[test]
+    fn awaken_returns_to_idle_without_becoming_happy() {
+        let mut b = Brain::new(1.0);
+        assert!(b.advance(1.5));
+        assert_eq!(b.mood(), Mood::Sleep);
+
+        // 自然醒不是「被逗」：不该走 Happy/Pout 那条路。
+        assert!(b.stimulus(Stimulus::Awaken));
+        assert_eq!(b.mood(), Mood::Idle);
+        assert_eq!(b.anim_id(), "idle");
+        assert!(!b.advance(0.5), "刚醒就重新计时，不会立刻又睡");
+        assert!(b.advance(1.1), "安静够了还是会困");
+        assert_eq!(b.mood(), Mood::Sleep);
+    }
+
+    #[test]
+    fn awaken_on_idle_is_a_no_op() {
+        let mut b = Brain::new(25.0);
+        assert!(!b.stimulus(Stimulus::Awaken), "待机时唤醒不该引起任何切换");
+        assert_eq!(b.mood(), Mood::Idle);
     }
 
     #[test]

@@ -449,6 +449,21 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         &format!("位移超过阈值进入拖拽姿态（{:?}）", pet.mood()),
         pet.mood() == Some(Mood::Dragged),
     );
+    // 进入拖拽姿态那一刻就必须是「悬空」的样子：`drag` 素材前 20 帧人还站在地上，
+    // 用户报的「拖一两秒才漂浮」就是它演出来的。
+    let drag_frame = pet.frame();
+    let drag_span = pet.loop_span();
+    r.check(
+        &format!("拖拽从悬空段第 {drag_frame} 帧起播（区间 {drag_span:?}）"),
+        drag_span == Some((35, 110)) && (35..=110).contains(&drag_frame),
+    );
+    // 拿着不放 3 秒：不能漂回「站在地上」的开头，也不能演到落地那一段。
+    pet.advance_frames(72)?;
+    let held_frame = pet.frame();
+    r.check(
+        &format!("按住 3 秒仍在悬空段内（第 {held_frame} 帧）"),
+        (35..=110).contains(&held_frame),
+    );
     pet.on_event(Event::MouseUp { x: 10, y: 10 })?;
     r.check(
         &format!("松手后仍在空中保持拖拽姿态（{:?}）", pet.mood()),
@@ -505,12 +520,21 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     );
 
     let span_falling = pet.loop_span();
-    // 入睡段 0~165：推 200 帧足够演完并跨进打呼段。
-    pet.advance_frames(200)?;
+    // 入睡段 0~133：推 140 帧足够演完并跨进打呼段。
+    pet.advance_frames(140)?;
     let span_asleep = pet.loop_span();
     r.check(
         &format!("入睡段 {span_falling:?} 演完转入打呼段 {span_asleep:?}"),
-        span_falling == Some((0, 165)) && span_asleep == Some((75, 165)),
+        span_falling == Some((0, 133)) && span_asleep == Some((116, 148)),
+    );
+    // 打呼段的起点必须在 Z 已经冒出来之后：
+    // 像素统计显示 Z 从第 80 帧才开始出现，区间落在那里就会循环出几帧空白。
+    r.check(
+        &format!(
+            "打呼段起点 {} 在 Z 出现（第 80 帧）之后",
+            span_asleep.map_or(0, |(lo, _)| lo)
+        ),
+        span_asleep.is_some_and(|(lo, _)| lo >= 80),
     );
 
     // 关键一条：睡着后无论过多久，都不能演到帧 210+ 那段「睁眼醒来」。
@@ -535,16 +559,28 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         pet.mood() == Some(Mood::Sleep),
     );
 
-    // 但点一下必须醒，而且醒来后不能还抱着睡眠区间。
+    // 但点一下必须醒——而且要先播「睁眼起身」，不能一下子站到开心。
     pet.on_event(Event::MouseDown { x: 10, y: 10 })?;
     pet.on_event(Event::MouseUp { x: 10, y: 10 })?;
+    let wake_span = pet.loop_span();
     r.check(
-        &format!("点一下就醒（{:?}）", pet.mood()),
-        pet.mood() == Some(Mood::Happy),
+        &format!("点一下就播醒来段（{wake_span:?}，心情 {:?}）", pet.mood()),
+        wake_span.is_some_and(|(lo, hi)| lo >= 169 && hi == 240) && pet.mood() == Some(Mood::Sleep),
     );
+
+    // 醒来段 71 帧演完：回待机，不留在睡眠区间里，也不走到 click_happy。
+    let woke_up = pet.advance_frames(71)?;
     r.check(
-        &format!("醒来后睡眠区间已清空（{:?}）", pet.loop_span()),
-        pet.loop_span().is_none(),
+        &format!(
+            "醒来段演完回待机（{}，心情 {:?}，区间 {:?}）",
+            pet.current(),
+            pet.mood(),
+            pet.loop_span()
+        ),
+        woke_up
+            && pet.current() == "idle"
+            && pet.mood() == Some(Mood::Idle)
+            && pet.loop_span().is_none(),
     );
 
     drop(pet);

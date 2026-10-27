@@ -24,7 +24,7 @@ use feiyu_core::brain::{Brain, Mood, Stimulus};
 use feiyu_core::motion::{fling_velocity, Limits, Motion};
 use feiyu_core::pool::Pool;
 use feiyu_core::rng::Rng;
-use feiyu_core::sleep::{span_to_frames, SleepCycle};
+use feiyu_core::sleep::{span_to_frames, SleepCycle, SleepStage};
 use feiyu_platform::{CommandId, Event, Icon, LayeredWindow, Menu, TrayIcon};
 
 /// 脚底距工作区底边的空隙（像素）。
@@ -42,6 +42,23 @@ const MAX_ANIM_DT: f32 = 0.1;
 /// 「提起了却还没飘」全部来自这段死区。阈值只该挡住真实的手抖
 /// （1~2 像素），不该挡住「提起」这个动作本身。
 const DRAG_THRESHOLD: i32 = 2;
+
+/// `drag` 素材里「已经离地」的那一段（闭区间，帧号）。
+///
+/// 用户报「拖一两秒才漂浮」，罪不在切换逻辑（自检实测切 drag 0.4ms），
+/// 而在素材本身：这段 10 秒的循环是从**站着**开始演的。用 `bbox` 逐帧量
+/// 包围盒（见 `_notes/PROGRESS.md`）得到的实测曲线：
+///
+/// * 0~20：底边贴着画布底部（y2=262），人还站在地上；
+/// * 25~30：正在升起（y2=248 → 239）；
+/// * 35~205：悬空（y2 在 233~251 之间起伏，头顶快贴画布上沿）；
+/// * 210 之后：落地。
+///
+/// 所以从第 35 帧进、在这个区间里循环，「提起来」就是按下即生效的。
+/// 段尾取 110 而不是 205：`110 → 35` 的接缝平均差 14.8，和素材自己
+/// 0.2 秒的变化量（7~13）同级——回绕看不出来；从 205 回 35 会一下跳 12 像素。
+const DRAG_LO: u32 = 35;
+const DRAG_HI: u32 = 110;
 
 /// 松手落地后，先保持被拖拽姿态这么久再回待机。
 ///
@@ -84,6 +101,23 @@ const ACTION_GAP_MAX: f32 = 15.0;
 /// 我们只打包了 3 段，其中 `sleep` 已归睡觉姿态，剩 `stretch` 和 `mirror`。
 /// 权重照原版的 categories=20；二期补 `turn`/`move` 时按原比例追加即可。
 const ACTION_POOL: &[(&str, u32)] = &[("stretch", 20), ("mirror", 20)];
+
+/// 睡着时，系统有键鼠输入就按这个间隔掷一次「自然醒」的骰子（秒）。
+///
+/// 不按输入事件逐次掷：鼠标一动就是几十条消息，逐次掷会让它一秒不到就醒。
+/// 按秒掷才符合「你在电脑前坐了一阵，它被你弄醒了」的观感。
+const WAKE_ROLL_EVERY: f32 = 1.0;
+
+/// 每次掷骰醒来的概率。
+///
+/// 10% → 持续操作时平均十秒醒一次：既有「有几率」的随机感，
+/// 又不会让人敲一下键盘它就从床上掉下来。
+const WAKE_ROLL_CHANCE: f32 = 0.10;
+
+/// 最后一次键鼠操作在这个时间内（毫秒）算「人正在电脑前」。
+///
+/// 比 `WAKE_ROLL_EVERY` 略短：要的是「持续在动」，偶尔碰一下鼠标不算。
+const INPUT_FRESH_MS: u32 = 700;
 
 type Anim = AnimReader<BufReader<File>>;
 
@@ -143,8 +177,13 @@ pub struct Pet {
     /// 落地时刻。置位表示「已落地但还没回待机」，0.1 秒后清。
     landed_at: Option<Instant>,
     /// 当前动画只在这个帧区间内循环（闭区间）。`None` = 整段循环。
-    /// 目前只有睡觉用它：睡着后只在打呼那一段里转，不会自己演到「醒来」。
+    /// 睡觉用它（睡着后只在打呼那一段里转，不会自己演到「醒来」），
+    /// 拖拽也用它（跳过素材开头那段还站在地上的画面）。
     loop_span: Option<(u32, u32)>,
+    /// 固定入睡等待（秒）。`None` = 每次回待机都随机抽。
+    /// 只有 `--sleep-after` 会设它：观察入睡/自然醒这种「要等十几秒才会发生」的行为时
+    /// 不能每次都靠运气。
+    fixed_sleep: Option<f32>,
     /// 睡眠编排。`Some` 表示当前正在按「入睡 → 睡着」分两段播 `sleep`。
     sleep_cycle: Option<SleepCycle>,
     /// 随机源：入睡抖动、待机小动作都从这里取。
@@ -155,6 +194,11 @@ pub struct Pet {
     next_action_at: f32,
     /// 当前播的是不是待机小动作：是的话播完一圈就得回 idle。
     action_playing: bool,
+    /// 正在播「醒来」那段演出。期间状态机不许把动画切走，
+    /// 否则用户点一下看到的还是「突然站起来」。
+    waking: bool,
+    /// 上次掷「自然醒」骰子的时刻。
+    wake_roll: Instant,
     /// 是否被藏进托盘。
     hidden: bool,
     /// 调用方要求的定时器周期，隐藏时用来原样恢复。
@@ -221,6 +265,9 @@ impl Pet {
             pool,
             next_action_at: 0.0,
             action_playing: false,
+            waking: false,
+            wake_roll: Instant::now(),
+            fixed_sleep: None,
             hidden: false,
             tick_ms: 0,
             tray: None,
@@ -393,6 +440,15 @@ impl Pet {
         self.brain.set_sleep_after(secs);
     }
 
+    /// 把入睡等待钉成固定值（秒）。`--sleep-after` 与取证用。
+    ///
+    /// 不钉住不行：每次回到待机都会重抽 18~38 秒，
+    /// 要观察「入睡了之后被键鼠弄醒」，不能每次都靠运气等到它自己困。
+    pub fn set_fixed_sleep_after(&mut self, secs: f32) {
+        self.fixed_sleep = Some(secs);
+        self.brain.set_sleep_after(secs);
+    }
+
     /// 直接推进 `n` 帧，不碰墙钟。**只给自检用**：
     /// 真按 24fps 演完入睡段要等 7 秒，自检等不起。
     ///
@@ -471,6 +527,29 @@ impl Pet {
             } else {
                 // 池子空（素材缺段）：往后顺延，别每帧都重试。
                 self.schedule_next_action();
+            }
+        }
+
+        // 睡着时：电脑前的人一直在动，就有概率把它吵醒。
+        // 只看**持续输入**——偶尔划一下鼠标只会推迟入睡（`Attention`），不会弄醒它。
+        if self.forced.is_none() && self.brain.mood() == Mood::Sleep && !self.waking {
+            let idle_ms = feiyu_platform::last_input_ms();
+            let fresh = idle_ms.is_some_and(|ms| ms < INPUT_FRESH_MS);
+            if fresh && now.duration_since(self.wake_roll).as_secs_f32() >= WAKE_ROLL_EVERY {
+                self.wake_roll = now;
+                let roll = self.rng.unit();
+                // 取证开关：`FEIYU_WAKE_TRACE=1` 时把每次掷骰的输入间隔与点数打出来。
+                // 「有几率自然醒」肉眼根本判不了：没有这行，一次没醒就分不清
+                // 是「运气不济（10% 没中）」还是「输入根本没被读到」。
+                if std::env::var_os("FEIYU_WAKE_TRACE").is_some() {
+                    eprintln!(
+                        "自然醒判定：输入在 {}ms 前，掷 {roll:.3}（<{WAKE_ROLL_CHANCE:.2} 则醒）",
+                        idle_ms.unwrap_or(u32::MAX)
+                    );
+                }
+                if roll < WAKE_ROLL_CHANCE {
+                    self.wake_up()?;
+                }
             }
         }
 
@@ -581,7 +660,7 @@ impl Pet {
         self.down_at = None;
         if !was_dragging {
             self.trail.clear();
-            return self.stimulate(Stimulus::Click);
+            return self.clicked();
         }
         // 拖到哪就从哪开始：先把锚点对回实际窗口位置，再据此起飞。
         self.capture_anchor()?;
@@ -590,6 +669,37 @@ impl Pet {
         // 这里**不**切回待机：鱼还在空中，保持被拖拽的姿态直到落地
         // （见 `tick` 里的 `landed_at`）。松手瞬间就站好会显得像被剪了一帧。
         Ok(())
+    }
+
+    /// 点了一下。睡着时要先播「慢慢醒来」，其余情况交给状态机。
+    fn clicked(&mut self) -> Result<()> {
+        if self.brain.mood() == Mood::Sleep {
+            return self.wake_up();
+        }
+        self.stimulate(Stimulus::Click)
+    }
+
+    /// 开始一次「醒来」：播 Z 消散后的睁眼起身段（实测帧 170~240），播完回待机。
+    ///
+    /// 不直接 `stimulate(Click)`：那会切到 `click_happy`，观众看到的是
+    /// 鱼从躺着一下跳到站着笑，像被剪了一帧。素材里本来就有睁眼起身的过程，
+    /// 不花额外成本就能把它演完。
+    ///
+    /// 睡到一半（`Falling`，还闭着眼往下沉）被点则直接醒：那时跳到起身段反而突兀。
+    fn wake_up(&mut self) -> Result<()> {
+        if self.waking || self.brain.mood() != Mood::Sleep {
+            return Ok(());
+        }
+        match self.sleep_cycle.as_mut() {
+            Some(cycle) if cycle.stage() == SleepStage::Asleep => cycle.start_waking(),
+            _ => return self.stimulate(Stimulus::Awaken),
+        }
+        self.apply_sleep_span();
+        self.frame = self.loop_span.map_or(0, |(lo, _)| lo);
+        self.waking = true;
+        // 复用「播完一圈就收尾」那条路：醒来段不回绕，一落到段尾就交回 `step_frames`。
+        self.action_playing = true;
+        self.draw_frame()
     }
 
     /// 用最近的拖拽采样估一个松手速度，并清空采样。
@@ -837,6 +947,10 @@ impl Pet {
     ///
     /// 每次回到待机都重新抽：固定值会让「它什么时候睡」变成可预测的定时器。
     fn next_sleep_delay(&mut self) -> f32 {
+        // 钉过就照钉的来：取证时不能每轮都抽到不同的等待时间。
+        if let Some(secs) = self.fixed_sleep {
+            return secs;
+        }
         self.rng.range(SLEEP_AFTER_MIN, SLEEP_AFTER_MAX)
     }
 
@@ -851,12 +965,19 @@ impl Pet {
 
     /// 换段之后的收尾。
     ///
-    /// 两件事只有这里知道：
+    /// 三件事只有这里知道：
     /// * 落到 `sleep` 上要起睡眠编排（它从帧 0 演，但只演到冒出 Z）；
+    /// * 落到 `drag` 上要跳掉素材开头那段「还站在地上」的画面；
     /// * 回到 `idle` 要换一个新的入睡时间。
     fn after_switch(&mut self, id: &str) -> Result<()> {
         // 任何真正的姿态切换都结束「待机小动作」这场戏。
         self.action_playing = false;
+        if id == "drag" {
+            // 只播悬空段：素材前 35 帧人还站在地上，用户报的「拖一两秒才漂浮」就是它。
+            self.loop_span = Some((DRAG_LO, DRAG_HI));
+            self.frame = DRAG_LO;
+            return self.draw_frame();
+        }
         if id == "sleep" {
             self.sleep_cycle = Some(SleepCycle::new());
             self.apply_sleep_span();
@@ -895,6 +1016,12 @@ impl Pet {
         }
         self.action_playing = false;
         self.schedule_next_action();
+        if self.waking {
+            // 醒来那段播完：由状态机回到待机，不走 `click_happy`。
+            self.waking = false;
+            self.stimulate(Stimulus::Awaken)?;
+            return Ok(true);
+        }
         self.play("idle")?;
         Ok(true)
     }
@@ -970,8 +1097,14 @@ impl Pet {
         }
         let entry = self.manifest.require(id)?.clone();
         let path = entry.path_in(&self.dir);
+        let started = Instant::now();
         let anim = AnimReader::open(&path)
             .with_context(|| format!("打不开动画 {}（id={id}）", path.display()))?;
+        // 取证开关：首次加载要读文件 + 解 zstd + 建差分索引，
+        // 如果它贵到几百毫秒，“提起来不跟手”就不在拖拽逻辑而在这一行。
+        if std::env::var_os("FEIYU_DRAG_TRACE").is_some() {
+            eprintln!("加载 {id}：{:.1}ms", started.elapsed().as_secs_f64() * 1e3);
+        }
         let header = *anim.header();
         ensure!(
             header.width == entry.width() && header.height == entry.height(),
