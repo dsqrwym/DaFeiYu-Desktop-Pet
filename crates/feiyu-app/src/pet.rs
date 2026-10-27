@@ -216,8 +216,17 @@ impl Pet {
     pub fn bench(&mut self, n: u32) -> Result<(f64, f64)> {
         let entry = self.manifest.require(&self.current)?.clone();
         let (w, h) = (entry.width() as u32, entry.height() as u32);
-        let Self { win, anims, current, frame, drawn, .. } = self;
-        let anim = anims.get_mut(current).with_context(|| format!("动画 {current} 尚未加载"))?;
+        let Self {
+            win,
+            anims,
+            current,
+            frame,
+            drawn,
+            ..
+        } = self;
+        let anim = anims
+            .get_mut(current)
+            .with_context(|| format!("动画 {current} 尚未加载"))?;
         let count = anim.frame_count().max(1);
         let (mut dec, mut drw) = (0u128, 0u128);
         for _ in 0..n {
@@ -238,12 +247,21 @@ impl Pet {
     pub fn draw_frame(&mut self) -> Result<()> {
         let entry = self.manifest.require(&self.current)?.clone();
         // 解构借用：同一次调用里要同时碰 win（可变）与 anims（可变）。
-        let Self { win, anims, current, frame, drawn, .. } = self;
+        let Self {
+            win,
+            anims,
+            current,
+            frame,
+            drawn,
+            ..
+        } = self;
         let anim = anims
             .get_mut(current)
             .with_context(|| format!("动画 {current} 尚未加载"))?;
         let idx = *frame % anim.frame_count().max(1);
-        let pixels = anim.frame(idx).with_context(|| format!("解 {current} 第 {idx} 帧失败"))?;
+        let pixels = anim
+            .frame(idx)
+            .with_context(|| format!("解 {current} 第 {idx} 帧失败"))?;
         win.draw(entry.width() as u32, entry.height() as u32, pixels)
             .context("提交画面失败")?;
         *drawn += 1;
@@ -252,8 +270,7 @@ impl Pet {
 
     /// 截当前窗口到 BMP。
     pub fn capture(&self, path: impl AsRef<Path>) -> Result<(u32, u32)> {
-        feiyu_platform::shot::capture_to_bmp(self.win.hwnd(), path.as_ref())
-            .context("截屏失败")
+        feiyu_platform::shot::capture_to_bmp(self.win.hwnd(), path.as_ref()).context("截屏失败")
     }
 
     /// 窗口矩形（屏幕坐标）。自检用。
@@ -262,7 +279,11 @@ impl Pet {
     }
 
     fn current_count(&self) -> u32 {
-        self.anims.get(&self.current).map(|a| a.frame_count()).unwrap_or(1).max(1)
+        self.anims
+            .get(&self.current)
+            .map(|a| a.frame_count())
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// 把刺激交给状态机；姿态真的变了才换动画。

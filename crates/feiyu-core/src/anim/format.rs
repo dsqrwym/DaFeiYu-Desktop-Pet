@@ -216,7 +216,11 @@ pub fn encode_with(
     header.validate()?;
     header.flags |= FLAG_PREMULTIPLIED;
 
-    let key = if header.key_every > 1 { header.key_every as u32 } else { 1 };
+    let key = if header.key_every > 1 {
+        header.key_every as u32
+    } else {
+        1
+    };
     let expected = header.byte_len();
     let mut entries = Vec::new();
     let mut payload = Vec::new();
@@ -226,12 +230,20 @@ pub fn encode_with(
     for (idx, frame) in frames.into_iter().enumerate() {
         let idx = idx as u32;
         if frame.len() != expected {
-            return Err(AnimError::FrameSize { expected, got: frame.len(), idx });
+            return Err(AnimError::FrameSize {
+                expected,
+                got: frame.len(),
+                idx,
+            });
         }
         // 链首（idx % key == 0）存原图，其余存差值。
         let source: Vec<u8> = if key > 1 && idx % key != 0 {
             let base = prev.as_ref().expect("差分帧必然有前一帧");
-            frame.iter().zip(base.iter()).map(|(a, b)| a.wrapping_sub(*b)).collect()
+            frame
+                .iter()
+                .zip(base.iter())
+                .map(|(a, b)| a.wrapping_sub(*b))
+                .collect()
         } else {
             frame.clone()
         };
@@ -267,7 +279,11 @@ pub fn encode_with(
         cursor += entry.len;
     }
 
-    Ok(AnimFile { header, entries, payload })
+    Ok(AnimFile {
+        header,
+        entries,
+        payload,
+    })
 }
 
 /// 把 [`AnimFile`] 写出到目标。
@@ -283,7 +299,8 @@ pub fn write<W: Write>(w: &mut W, file: &AnimFile) -> Result<(), AnimError> {
     head[24..26].copy_from_slice(&file.header.baseline.to_le_bytes());
     head[26..28].copy_from_slice(&file.header.key_every.to_le_bytes());
     head[28..32].copy_from_slice(&HEADER_SIZE.to_le_bytes());
-    head[32..36].copy_from_slice(&(HEADER_SIZE + file.header.frame_count * ENTRY_SIZE).to_le_bytes());
+    head[32..36]
+        .copy_from_slice(&(HEADER_SIZE + file.header.frame_count * ENTRY_SIZE).to_le_bytes());
     head[36..40].copy_from_slice(&(file.payload.len() as u32).to_le_bytes());
     head[40..42].copy_from_slice(&file.header.origin_x.to_le_bytes());
     head[42..44].copy_from_slice(&file.header.origin_y.to_le_bytes());
@@ -382,7 +399,11 @@ pub enum AnimError {
     #[error("文件损坏: {0}")]
     Corrupt(&'static str),
     #[error("第 {idx} 帧大小不符：期望 {expected} 字节，实际 {got}")]
-    FrameSize { expected: usize, got: usize, idx: u32 },
+    FrameSize {
+        expected: usize,
+        got: usize,
+        idx: u32,
+    },
     #[error("帧号 {idx} 越界（共 {count} 帧）")]
     FrameOutOfRange { idx: u32, count: u32 },
     #[error("解压失败: {0}")]
@@ -433,7 +454,10 @@ mod tests {
             assert_eq!(e.offset, expect);
             expect += e.len;
         }
-        assert_eq!(file.payload.len() as u32, expect - (HEADER_SIZE + 3 * ENTRY_SIZE));
+        assert_eq!(
+            file.payload.len() as u32,
+            expect - (HEADER_SIZE + 3 * ENTRY_SIZE)
+        );
         assert_eq!(buf.len() as u32, expect);
 
         // 解压回来必须逐字节一致。
@@ -458,8 +482,11 @@ mod tests {
     #[test]
     fn rejects_bad_magic() {
         let mut buf = Vec::new();
-        write(&mut buf, &encode(AnimHeader::new(8, 8, 24.0, 8), vec![frame(8, 8, 0)], 0).unwrap())
-            .unwrap();
+        write(
+            &mut buf,
+            &encode(AnimHeader::new(8, 8, 24.0, 8), vec![frame(8, 8, 0)], 0).unwrap(),
+        )
+        .unwrap();
         buf[0] = b'X';
         match read_header(&mut Cursor::new(&buf)) {
             Err(AnimError::BadMagic) => {}
@@ -471,7 +498,11 @@ mod tests {
     fn rejects_frame_size_mismatch() {
         let bad = vec![0u8; 10];
         match encode(AnimHeader::new(8, 8, 24.0, 8), vec![bad], 0) {
-            Err(AnimError::FrameSize { expected: 256, got: 10, idx: 0 }) => {}
+            Err(AnimError::FrameSize {
+                expected: 256,
+                got: 10,
+                idx: 0,
+            }) => {}
             other => panic!("期望 FrameSize，实际 {other:?}"),
         }
     }

@@ -85,7 +85,8 @@ impl AnimEntry {
 impl Manifest {
     /// 从 JSON 文本解析，并做完整性校验。
     pub fn from_json(text: &str) -> Result<Self, AnimError> {
-        let me: Self = serde_json::from_str(text).map_err(|e| AnimError::Manifest(e.to_string()))?;
+        let me: Self =
+            serde_json::from_str(text).map_err(|e| AnimError::Manifest(e.to_string()))?;
         me.validate()?;
         Ok(me)
     }
@@ -194,14 +195,19 @@ mod tests {
         // 落脚行 = origin_y + baseline，这是切动画时对齐的唯一依据。
         assert_eq!(idle.feet_row(), 287);
         assert_eq!(m.require("sleep").unwrap().feet_row(), 290);
-        assert_eq!(idle.path_in(Path::new("assets/anim")).to_string_lossy(), "assets/anim\\idle.fishanim");
+        assert_eq!(
+            idle.path_in(Path::new("assets/anim")).to_string_lossy(),
+            "assets/anim\\idle.fishanim"
+        );
     }
 
     #[test]
     fn rejects_duplicate_id() {
         let bad = SAMPLE.replace(r#""id": "sleep""#, r#""id": "idle""#);
         match Manifest::from_json(&bad) {
-            Err(AnimError::Manifest(msg)) => assert!(msg.contains("重复"), "错误信息应指出重复：{msg}"),
+            Err(AnimError::Manifest(msg)) => {
+                assert!(msg.contains("重复"), "错误信息应指出重复：{msg}")
+            }
             other => panic!("期望拒绝重复 id，实际 {other:?}"),
         }
     }
@@ -209,7 +215,10 @@ mod tests {
     #[test]
     fn rejects_bad_version_and_geometry() {
         let bad_version = SAMPLE.replace(r#""format": 1"#, r#""format": 2"#);
-        assert!(matches!(Manifest::from_json(&bad_version), Err(AnimError::Manifest(_))));
+        assert!(matches!(
+            Manifest::from_json(&bad_version),
+            Err(AnimError::Manifest(_))
+        ));
 
         // 把 sleep 的裁切宽度撑到画布之外。
         let bad_geo = SAMPLE.replace(r#""size": [384, 266]"#, r#""size": [500, 266]"#);

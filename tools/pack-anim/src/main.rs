@@ -158,9 +158,8 @@ fn parse_args() -> Result<Opts> {
     let mut opts = Opts::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        let mut value = || -> Result<String> {
-            args.next().with_context(|| format!("{arg} 缺少取值"))
-        };
+        let mut value =
+            || -> Result<String> { args.next().with_context(|| format!("{arg} 缺少取值")) };
         match arg.as_str() {
             "--src" => opts.src = PathBuf::from(value()?),
             "--out" => opts.out = PathBuf::from(value()?),
@@ -232,8 +231,8 @@ fn collect(opts: &Opts) -> Result<Vec<(PathBuf, String, String)>> {
         return Ok(jobs);
     }
 
-    let dir = fs::read_dir(&opts.src)
-        .with_context(|| format!("无法读取目录 {}", opts.src.display()))?;
+    let dir =
+        fs::read_dir(&opts.src).with_context(|| format!("无法读取目录 {}", opts.src.display()))?;
     let mut found: Vec<(PathBuf, String, String)> = Vec::new();
     for entry in dir {
         let entry = entry?;
@@ -241,7 +240,10 @@ fn collect(opts: &Opts) -> Result<Vec<(PathBuf, String, String)>> {
         if path.extension().and_then(|e| e.to_str()) != Some("webm") {
             continue;
         }
-        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         match NAME_MAP.iter().find(|(cn, _)| *cn == stem) {
             Some((_, slug)) => found.push((path, (*slug).to_string(), stem)),
             None => eprintln!("跳过未登记素材：{stem}"),
@@ -312,14 +314,21 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
         bail!("{} 没有解出任何帧", src.display());
     }
     if bbox.0 == u32::MAX {
-        bail!("{} 整段没有不透明像素，抠像阈值（--thresh {}）可能不对", src.display(), opts.thresh);
+        bail!(
+            "{} 整段没有不透明像素，抠像阈值（--thresh {}）可能不对",
+            src.display(),
+            opts.thresh
+        );
     }
 
     // 裁到全片不透明像素的并集：角色只占 16:9 画面的三成，空白纯属浪费。
     // 裁切信息记在帧头的 origin，渲染端据此还原原画布上的位置，换动画不会跳位。
     let (origin_x, origin_y, frame_w, frame_h) = if opts.crop {
         let (x0, y0) = (bbox.0 as usize, bbox.1 as usize);
-        let (cw, ch) = ((bbox.2 + 1 - bbox.0) as usize, (bbox.3 + 1 - bbox.1) as usize);
+        let (cw, ch) = (
+            (bbox.2 + 1 - bbox.0) as usize,
+            (bbox.3 + 1 - bbox.1) as usize,
+        );
         for f in frames.iter_mut() {
             *f = crop(f, w, x0, y0, cw, ch);
         }
@@ -388,7 +397,11 @@ fn dump_png(dir: &Path, slug: &str, idx: u32, w: u32, h: u32, rgba: &[u8]) -> Re
         let a = rgba[o + 3] as u32;
         let x = (i as u32) % w;
         let y = (i as u32) / w;
-        let bg = if ((x / 12) + (y / 12)) % 2 == 0 { 90u32 } else { 190u32 };
+        let bg = if ((x / 12) + (y / 12)) % 2 == 0 {
+            90u32
+        } else {
+            190u32
+        };
         let mix = |c: u8| ((c as u32 * a + bg * (255 - a)) / 255) as u8;
         *px = image::Rgba([mix(rgba[o]), mix(rgba[o + 1]), mix(rgba[o + 2]), 255]);
     }
@@ -430,7 +443,12 @@ fn print_summary(rows: &[Row]) {
     let packed: u64 = rows.iter().map(|r| r.packed_bytes).sum();
     let frames: u32 = rows.iter().map(|r| r.frames).sum();
     println!("\n合计 {} 段 / {} 帧", rows.len(), frames);
-    println!("原始 {:>7}  →  打包 {:>7}   （压缩 {:.1}×）", kib(raw), kib(packed), raw as f64 / packed.max(1) as f64);
+    println!(
+        "原始 {:>7}  →  打包 {:>7}   （压缩 {:.1}×）",
+        kib(raw),
+        kib(packed),
+        raw as f64 / packed.max(1) as f64
+    );
 }
 
 fn kib(bytes: u64) -> String {
@@ -458,7 +476,10 @@ fn write_manifest(opts: &Opts, rows: &[Row]) -> Result<()> {
     for (i, row) in rows.iter().enumerate() {
         s.push_str("    {\n");
         s.push_str(&format!("      \"id\": \"{}\",\n", row.slug));
-        s.push_str(&format!("      \"name\": \"{}\",\n", json_escape(&row.name)));
+        s.push_str(&format!(
+            "      \"name\": \"{}\",\n",
+            json_escape(&row.name)
+        ));
         s.push_str(&format!("      \"file\": \"{}.fishanim\",\n", row.slug));
         s.push_str(&format!(
             "      \"size\": [{}, {}],\n      \"origin\": [{}, {}],\n",
@@ -468,7 +489,11 @@ fn write_manifest(opts: &Opts, rows: &[Row]) -> Result<()> {
             "      \"baseline\": {},\n      \"frames\": {},\n      \"bytes\": {}\n",
             row.baseline, row.frames, row.packed_bytes
         ));
-        s.push_str(if i + 1 == rows.len() { "    }\n" } else { "    },\n" });
+        s.push_str(if i + 1 == rows.len() {
+            "    }\n"
+        } else {
+            "    },\n"
+        });
     }
     s.push_str("  ]\n}\n");
 
@@ -506,7 +531,11 @@ fn verify(dir: &Path) -> Result<()> {
 
         for i in 0..h.frame_count {
             let f = reader.frame(i)?;
-            ensure!(f.len() == h.byte_len(), "{} 第 {i} 帧长度不符", path.display());
+            ensure!(
+                f.len() == h.byte_len(),
+                "{} 第 {i} 帧长度不符",
+                path.display()
+            );
             let op = f.chunks_exact(4).filter(|p| p[3] != 0).count();
             ensure!(op > 0, "{} 第 {i} 帧全透明", path.display());
             min_op = min_op.min(op);
@@ -527,7 +556,9 @@ fn verify(dir: &Path) -> Result<()> {
         total_frames += h.frame_count as u64;
         println!(
             "  {:<12} {:>4}帧 {}×{} 底{:>3} 偏移({},{}) 不透明 {}-{}  {}  ✓ {:>4}ms",
-            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             h.frame_count,
             h.width,
             h.height,

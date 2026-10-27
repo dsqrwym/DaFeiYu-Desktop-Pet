@@ -99,12 +99,26 @@ pub fn probe_size(ffprobe: &str, input: &Path) -> Result<(u32, u32)> {
         .arg(input)
         .output()
         .with_context(|| format!("无法启动 ffprobe（{ffprobe}）"))?;
-    ensure!(out.status.success(), "ffprobe 失败：{}", String::from_utf8_lossy(&out.stderr));
+    ensure!(
+        out.status.success(),
+        "ffprobe 失败：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().next().unwrap_or("").trim();
     let mut it = line.split(',');
-    let w: u32 = it.next().unwrap_or("").trim().parse().context("ffprobe 宽解析失败")?;
-    let h: u32 = it.next().unwrap_or("").trim().parse().context("ffprobe 高解析失败")?;
+    let w: u32 = it
+        .next()
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .context("ffprobe 宽解析失败")?;
+    let h: u32 = it
+        .next()
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .context("ffprobe 高解析失败")?;
     ensure!(w > 0 && h > 0, "源视频尺寸非法：{w}×{h}");
     Ok((w, h))
 }

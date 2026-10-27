@@ -45,11 +45,18 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let args = parse_args(&std::env::args().skip(1).collect::<Vec<_>>())?;
-    let dir = args.dir.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DIR));
+    let dir = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DIR));
 
     if args.selftest {
         let ok = selftest::run()?;
-        return if ok { Ok(()) } else { bail!("自检未全部通过") };
+        return if ok {
+            Ok(())
+        } else {
+            bail!("自检未全部通过")
+        };
     }
     if args.list {
         return list_anims(&dir);
@@ -94,7 +101,12 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             "--shots" => out.shots = Some(PathBuf::from(it.next().context("--shots 缺少目录")?)),
             "--static" => out.r#static = true,
             "--bench" => {
-                out.bench = Some(it.next().context("--bench 缺少帧数")?.parse().context("--bench 需要整数")?)
+                out.bench = Some(
+                    it.next()
+                        .context("--bench 缺少帧数")?
+                        .parse()
+                        .context("--bench 需要整数")?,
+                )
             }
             "--list" => out.list = true,
             "--selftest" => out.selftest = true,
@@ -135,7 +147,10 @@ fn list_anims(dir: &Path) -> Result<()> {
         manifest.fps,
         manifest.animations.len()
     );
-    println!("{:<12} {:<9} {:>10} {:>7} {:>8}  {}", "id", "帧尺寸", "落脚行", "帧数", "体积", "名称");
+    println!(
+        "{:<12} {:<9} {:>10} {:>7} {:>8}  {}",
+        "id", "帧尺寸", "落脚行", "帧数", "体积", "名称"
+    );
     for a in &manifest.animations {
         println!(
             "{:<12} {:<9} {:>10} {:>7} {:>7.1}M  {}",
@@ -152,8 +167,8 @@ fn list_anims(dir: &Path) -> Result<()> {
 
 fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     // 第二次双击时安静退出：用户看不到任何提示，桌宠也不会变成两只。
-    let Some(_instance) = SingleInstance::acquire(SingleInstance::DEFAULT_NAME)
-        .context("单实例锁创建失败")?
+    let Some(_instance) =
+        SingleInstance::acquire(SingleInstance::DEFAULT_NAME).context("单实例锁创建失败")?
     else {
         println!("已经有一只飞鱼在桌面上了。");
         return Ok(());
@@ -164,7 +179,10 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     }
 
     // `--shots` 也要冻结状态机，否则截图过程里桌宠自己睡着，截到一半换段。
-    let forced = args.anim.clone().or_else(|| args.shots.as_ref().map(|_| "idle".to_owned()));
+    let forced = args
+        .anim
+        .clone()
+        .or_else(|| args.shots.as_ref().map(|_| "idle".to_owned()));
     let mut pet = Pet::open(&dir, forced.as_deref())?;
     pet.show();
 
@@ -292,6 +310,10 @@ fn shoot_all(pet: &mut Pet, dir: &Path) -> Result<()> {
             quit();
         }
     })?;
-    println!("共截 {} 段动画，用时约 {:.1} 秒", ids.len(), (ids.len() as f32) * (SHOT_PER_ANIM as f32) * 0.008);
+    println!(
+        "共截 {} 段动画，用时约 {:.1} 秒",
+        ids.len(),
+        (ids.len() as f32) * (SHOT_PER_ANIM as f32) * 0.008
+    );
     Ok(())
 }

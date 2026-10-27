@@ -15,23 +15,25 @@ use std::sync::Mutex;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM, COLORREF, ERROR_CLASS_ALREADY_EXISTS,
+    GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
+    WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, ScreenToClient,
-    SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
     DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, RGBQUAD,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    GetWindowRect, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW,
-    CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, MSG,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_DESTROY,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
+    IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE,
+    ULW_ALPHA, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 use crate::{Error, Result};
@@ -112,7 +114,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // SAFETY: pt 是栈上有效结构。
             let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
             let hit = hit_test(pt.x, pt.y);
-            return LRESULT(if hit { HTCLIENT as isize } else { HTTRANSPARENT as isize });
+            return LRESULT(if hit {
+                HTCLIENT as isize
+            } else {
+                HTTRANSPARENT as isize
+            });
         }
         WM_LBUTTONDOWN => {
             let (x, y) = client_point(lparam);
@@ -123,7 +129,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = GetCursorPos(&mut cur);
                 let mut rect = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rect);
-                let grab = POINT { x: cur.x - rect.left, y: cur.y - rect.top };
+                let grab = POINT {
+                    x: cur.x - rect.left,
+                    y: cur.y - rect.top,
+                };
                 let _ = with_state(|s| s.grab = Some(grab));
             }
             push(Event::MouseDown { x, y });
@@ -148,7 +157,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         );
                         let mut rect = RECT::default();
                         let _ = GetWindowRect(hwnd, &mut rect);
-                        push(Event::Moved { x: rect.left, y: rect.top });
+                        push(Event::Moved {
+                            x: rect.left,
+                            y: rect.top,
+                        });
                     }
                 }
                 None => push(Event::MouseMove { x, y }),
@@ -204,11 +216,15 @@ impl Dib {
         };
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: 传入合法的 BITMAPINFO 与接收指针；不共享文件映射。
-        let bitmap = unsafe {
-            CreateDIBSection(None, &mut info, DIB_RGB_COLORS, &mut bits, None, 0)
-        }
-        .map_err(|e| Error::win32("CreateDIBSection", e))?;
-        Ok(Self { bitmap, bits: bits as *mut u8, width, height })
+        let bitmap =
+            unsafe { CreateDIBSection(None, &mut info, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .map_err(|e| Error::win32("CreateDIBSection", e))?;
+        Ok(Self {
+            bitmap,
+            bits: bits as *mut u8,
+            width,
+            height,
+        })
     }
 
     fn len(&self) -> usize {
@@ -229,7 +245,8 @@ impl LayeredWindow {
     pub fn create(width: u32, height: u32, x: i32, y: i32, title: &str) -> Result<Self> {
         let class = windows::core::w!("FeiYuPetWindow");
         // SAFETY: 取本模块句柄，无需释放。
-        let hinstance = unsafe { GetModuleHandleW(None) }.map_err(|e| Error::win32("GetModuleHandleW", e))?;
+        let hinstance =
+            unsafe { GetModuleHandleW(None) }.map_err(|e| Error::win32("GetModuleHandleW", e))?;
 
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -245,7 +262,10 @@ impl LayeredWindow {
             // SAFETY: 无参数。
             let err = unsafe { GetLastError() };
             if err != ERROR_CLASS_ALREADY_EXISTS {
-                return Err(Error::win32("RegisterClassW", windows::core::Error::from_win32()));
+                return Err(Error::win32(
+                    "RegisterClassW",
+                    windows::core::Error::from_win32(),
+                ));
             }
         }
 
@@ -280,7 +300,12 @@ impl LayeredWindow {
         unsafe { ReleaseDC(None, screen_dc) };
 
         let zeroed = vec![0u8; dib.len()];
-        let mut window = Self { hwnd, dib, mem_dc, old_bitmap };
+        let mut window = Self {
+            hwnd,
+            dib,
+            mem_dc,
+            old_bitmap,
+        };
         // SAFETY: bits 是 DIB 的有效像素区，长度由 len() 保证。
         unsafe { std::ptr::copy_nonoverlapping(zeroed.as_ptr(), window.dib.bits, zeroed.len()) };
 
@@ -402,7 +427,10 @@ impl LayeredWindow {
 
     /// 把当前 DIB 提交给 DWM。
     fn present(&mut self) -> Result<()> {
-        let size = SIZE { cx: self.dib.width, cy: self.dib.height };
+        let size = SIZE {
+            cx: self.dib.width,
+            cy: self.dib.height,
+        };
         let src = POINT { x: 0, y: 0 };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
@@ -480,7 +508,10 @@ pub fn pump(mut on_event: impl FnMut(Event)) -> Result<()> {
             return Ok(());
         }
         if ret.0 == -1 {
-            return Err(Error::win32("GetMessageW", windows::core::Error::from_win32()));
+            return Err(Error::win32(
+                "GetMessageW",
+                windows::core::Error::from_win32(),
+            ));
         }
         // SAFETY: 标准翻译+分发。
         unsafe {

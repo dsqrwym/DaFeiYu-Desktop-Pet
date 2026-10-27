@@ -93,7 +93,11 @@ impl<R: Read + Seek> AnimReader<R> {
             return Ok(&self.scratch);
         }
 
-        let key = if self.header.uses_delta() { self.header.key_every as u32 } else { 0 };
+        let key = if self.header.uses_delta() {
+            self.header.key_every as u32
+        } else {
+            0
+        };
         if key > 1 {
             // 链号（而不是链首的帧号）必须同量纲才能比：早期版本拿
             // `p / key` 去比 `idx / key * key`，只有第 0 条链碰巧相等，
@@ -129,14 +133,22 @@ impl<R: Read + Seek> AnimReader<R> {
         self.r.seek(SeekFrom::Start(entry.offset as u64))?;
         self.r.read_exact(&mut self.staged)?;
 
-        let target = if is_base { &mut self.scratch } else { &mut self.delta };
+        let target = if is_base {
+            &mut self.scratch
+        } else {
+            &mut self.delta
+        };
         if target.len() != expected {
             target.resize(expected, 0);
         }
         match entry.codec {
             Codec::Raw => {
                 if self.staged.len() != expected {
-                    return Err(AnimError::FrameSize { expected, got: self.staged.len(), idx });
+                    return Err(AnimError::FrameSize {
+                        expected,
+                        got: self.staged.len(),
+                        idx,
+                    });
                 }
                 target.copy_from_slice(&self.staged);
             }
@@ -267,11 +279,16 @@ mod tests {
     #[test]
     fn reads_delta_frames_in_any_order() {
         let frames = smooth(10);
-        let mut reader = AnimReader::new(Cursor::new(build_delta(frames.clone(), 4))).expect("open");
+        let mut reader =
+            AnimReader::new(Cursor::new(build_delta(frames.clone(), 4))).expect("open");
         assert!(reader.header().uses_delta());
         // 乱序取帧，包括链首、链中、链尾与跨链跳转。
         for idx in [7u32, 0, 3, 9, 1, 8, 4] {
-            assert_eq!(reader.frame(idx).unwrap(), &frames[idx as usize][..], "第 {idx} 帧不符");
+            assert_eq!(
+                reader.frame(idx).unwrap(),
+                &frames[idx as usize][..],
+                "第 {idx} 帧不符"
+            );
         }
         // 顺序播放只累加一步。
         for idx in 0..10u32 {
@@ -282,9 +299,14 @@ mod tests {
     #[test]
     fn sequential_playback_decodes_one_per_frame() {
         let frames = smooth(20);
-        let mut reader = AnimReader::new(Cursor::new(build_delta(frames.clone(), 4))).expect("open");
+        let mut reader =
+            AnimReader::new(Cursor::new(build_delta(frames.clone(), 4))).expect("open");
         for idx in 0..20u32 {
-            assert_eq!(reader.frame(idx).unwrap(), &frames[idx as usize][..], "第 {idx} 帧不符");
+            assert_eq!(
+                reader.frame(idx).unwrap(),
+                &frames[idx as usize][..],
+                "第 {idx} 帧不符"
+            );
         }
         // 这是回归测试：早期版本把「链号」和「链首帧号」相加比较，
         // 从第 2 条差分链起每帧都重解整条链（钉床 8 倍），这里钉死次数。

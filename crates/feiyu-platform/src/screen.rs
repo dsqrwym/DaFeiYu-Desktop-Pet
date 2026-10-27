@@ -1,7 +1,9 @@
 //! 屏幕几何：桌宠需要知道「站在哪」，而不是写死坐标。
 
 use windows::Win32::Foundation::RECT;
-use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
+use windows::Win32::UI::WindowsAndMessaging::{
+    SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+};
 
 use crate::{Error, Result};
 

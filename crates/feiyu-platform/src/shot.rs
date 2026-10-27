@@ -11,8 +11,8 @@ use std::path::Path;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GdiFlush, GetDC,
-    GetDIBits, ReleaseDC, SelectObject, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HGDIOBJ,
-    SRCCOPY,
+    GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
@@ -77,7 +77,10 @@ pub fn capture_to_bmp(hwnd: HWND, path: impl AsRef<Path>) -> Result<(u32, u32)> 
 
         blit.map_err(|e| Error::win32("BitBlt", e))?;
         if lines == 0 {
-            return Err(Error::win32("GetDIBits", windows::core::Error::from_win32()));
+            return Err(Error::win32(
+                "GetDIBits",
+                windows::core::Error::from_win32(),
+            ));
         }
         write_bmp(path.as_ref(), width, height, &pixels)?;
     }

@@ -42,7 +42,10 @@ pub fn run() -> Result<bool> {
 
 /// 窗口层：透明、命中、定位、定时器、截屏。
 fn check_window(r: &mut Report) -> Result<()> {
-    r.check("DPI 每显示器 v2 感知", feiyu_platform::enable_per_monitor_v2());
+    r.check(
+        "DPI 每显示器 v2 感知",
+        feiyu_platform::enable_per_monitor_v2(),
+    );
 
     // 单实例：同名的第二次获取必须被拒。
     let first = SingleInstance::acquire("Local\\FeiYuPet.Selftest").context("创建互斥体失败")?;
@@ -135,22 +138,39 @@ fn check_assets(r: &mut Report) -> Result<()> {
     let dir = Path::new(ANIM_DIR);
     let path = dir.join("manifest.json");
     if !path.exists() {
-        r.skip(&format!("素材清单 {} 不存在（先跑 pack-anim）", path.display()));
+        r.skip(&format!(
+            "素材清单 {} 不存在（先跑 pack-anim）",
+            path.display()
+        ));
         return Ok(());
     }
     let manifest = feiyu_core::anim::Manifest::load(&path)?;
-    r.check(&format!("清单版本 {} 受支持", manifest.format), manifest.format == 1);
+    r.check(
+        &format!("清单版本 {} 受支持", manifest.format),
+        manifest.format == 1,
+    );
     r.check(
         &format!("清单有 {} 段动画", manifest.animations.len()),
         manifest.animations.len() >= 5,
     );
 
-    let missing: Vec<&str> =
-        manifest.animations.iter().filter(|a| !a.path_in(dir).exists()).map(|a| a.id.as_str()).collect();
-    r.check(&format!("清单里每个文件都存在（缺 {:?}）", missing), missing.is_empty());
+    let missing: Vec<&str> = manifest
+        .animations
+        .iter()
+        .filter(|a| !a.path_in(dir).exists())
+        .map(|a| a.id.as_str())
+        .collect();
+    r.check(
+        &format!("清单里每个文件都存在（缺 {:?}）", missing),
+        missing.is_empty(),
+    );
 
     // 脚底行必须落在画布内，且各段的脚底行应大致一致（同一角色同一画布）。
-    let feet: Vec<i32> = manifest.animations.iter().map(|a| a.feet_row() as i32).collect();
+    let feet: Vec<i32> = manifest
+        .animations
+        .iter()
+        .map(|a| a.feet_row() as i32)
+        .collect();
     let spread = feet.iter().max().unwrap_or(&0) - feet.iter().min().unwrap_or(&0);
     r.check(
         &format!("各段落脚行差异 {spread} 像素（≤16 视为同一条地面）"),
@@ -178,7 +198,10 @@ fn check_animation_switch(r: &mut Report) -> Result<()> {
 
     let idle = pet.rect();
     let (w0, h0) = (idle.2 - idle.0, idle.3 - idle.1);
-    r.check(&format!("idle 窗口 {w0}×{h0} 在屏幕内"), w0 > 0 && h0 > 0 && idle.0 >= left && idle.2 <= right);
+    r.check(
+        &format!("idle 窗口 {w0}×{h0} 在屏幕内"),
+        w0 > 0 && h0 > 0 && idle.0 >= left && idle.2 <= right,
+    );
     r.check(
         &format!("idle 脚底贴地面：窗口底 {} / 目标 {}", idle.3, feet_line),
         idle.3 == feet_line,
@@ -193,7 +216,10 @@ fn check_animation_switch(r: &mut Report) -> Result<()> {
         (w1, h1) != (w0, h0),
     );
     r.check(
-        &format!("换尺寸后脚底没跳（窗口底 {} / 目标 {}）", sleep.3, feet_line),
+        &format!(
+            "换尺寸后脚底没跳（窗口底 {} / 目标 {}）",
+            sleep.3, feet_line
+        ),
         sleep.3 == feet_line,
     );
 
@@ -213,12 +239,18 @@ fn check_animation_switch(r: &mut Report) -> Result<()> {
     // 换段之后还得能正常解帧提交。
     let before = pet.drawn();
     pet.draw_frame().context("换段后提交失败")?;
-    r.check(&format!("换段后仍能提交（{} → {} 帧）", before, pet.drawn()), pet.drawn() == before + 1);
+    r.check(
+        &format!("换段后仍能提交（{} → {} 帧）", before, pet.drawn()),
+        pet.drawn() == before + 1,
+    );
 
     // 清单与文件不一致时必须报错，而不是错位着播下去。
     let bad = Pet::open(dir, Some("definitely_not_an_anim")).err();
     r.check(
-        &format!("清单里不存在的 id 会被拒（{:?}）", bad.as_ref().map(|e| format!("{e:#}"))),
+        &format!(
+            "清单里不存在的 id 会被拒（{:?}）",
+            bad.as_ref().map(|e| format!("{e:#}"))
+        ),
         bad.is_some(),
     );
 
@@ -250,12 +282,19 @@ impl Report {
     }
 
     fn summary(&self) -> String {
-        let tail = if self.failed == 0 { "，全部通过" } else { "，存在失败项" };
+        let tail = if self.failed == 0 {
+            "，全部通过"
+        } else {
+            "，存在失败项"
+        };
         let skipped = if self.skipped == 0 {
             String::new()
         } else {
             format!("，跳过 {}", self.skipped)
         };
-        format!("自检结果：{} 通过 / {} 失败{skipped}{tail}", self.passed, self.failed)
+        format!(
+            "自检结果：{} 通过 / {} 失败{skipped}{tail}",
+            self.passed, self.failed
+        )
     }
 }

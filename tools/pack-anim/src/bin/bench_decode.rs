@@ -12,7 +12,9 @@ use feiyu_core::anim::format::{read_header, Codec};
 use feiyu_core::anim::AnimReader;
 
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).context("用法：bench-decode <文件.fishanim>")?;
+    let path = std::env::args()
+        .nth(1)
+        .context("用法：bench-decode <文件.fishanim>")?;
     let file = File::open(&path).with_context(|| format!("打不开 {path}"))?;
     let mut r = BufReader::with_capacity(64 * 1024, file);
     let (header, table) = read_header(&mut r)?;
@@ -65,7 +67,11 @@ fn main() -> Result<()> {
 
     let n = table.len() as f64;
     println!("①只读盘      {:>8.3} ms/帧", io / n);
-    println!("②读盘+解压   {:>8.3} ms/帧（解压本身 {:.3}）", decomp / n, (decomp - io) / n);
+    println!(
+        "②读盘+解压   {:>8.3} ms/帧（解压本身 {:.3}）",
+        decomp / n,
+        (decomp - io) / n
+    );
     println!("③差分累加    {:>8.3} ms/帧", add / n);
     println!(
         "   帧字节 {} KiB，解压吞吐 {:.0} MB/s",
@@ -104,7 +110,13 @@ fn main() -> Result<()> {
         .chunks(16)
         .enumerate()
         .take(8)
-        .map(|(g, c)| format!("{:>2}:{:.2}", g * 16, c.iter().sum::<f64>() / c.len() as f64))
+        .map(|(g, c)| {
+            format!(
+                "{:>2}:{:.2}",
+                g * 16,
+                c.iter().sum::<f64>() / c.len() as f64
+            )
+        })
         .collect();
     println!("   每 16 帧均耗时：{}", groups.join("  "));
     Ok(())

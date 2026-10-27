@@ -1,6 +1,6 @@
 //! 单实例互斥：防止用户双击两次出现两只桌宠各跑一套物理。
 
-use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, ERROR_ALREADY_EXISTS};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
 
 use crate::{Error, Result};

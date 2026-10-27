@@ -86,7 +86,13 @@ impl Default for Brain {
 impl Brain {
     /// 新建，`sleep_after` 为无互动多久后睡觉（秒）。
     pub fn new(sleep_after: f32) -> Self {
-        Self { mood: Mood::Idle, elapsed: 0.0, poke_window: 0.0, pokes: 0, sleep_after }
+        Self {
+            mood: Mood::Idle,
+            elapsed: 0.0,
+            poke_window: 0.0,
+            pokes: 0,
+            sleep_after,
+        }
     }
 
     /// 当前姿态。
@@ -132,7 +138,11 @@ impl Brain {
                 self.pokes = self.pokes.saturating_add(1);
                 self.poke_window = POKE_WINDOW;
                 // 睡着时点一下先醒过来，不算“戳烦了”。
-                let next = if self.pokes >= POKES_TO_POUT { Mood::Pout } else { Mood::Happy };
+                let next = if self.pokes >= POKES_TO_POUT {
+                    Mood::Pout
+                } else {
+                    Mood::Happy
+                };
                 self.switch_to(next)
             }
             Stimulus::DragStart => {
@@ -252,13 +262,21 @@ mod tests {
 
     #[test]
     fn every_mood_maps_to_a_unique_anim() {
-        let moods = [Mood::Idle, Mood::Sleep, Mood::Happy, Mood::Pout, Mood::Dragged];
+        let moods = [
+            Mood::Idle,
+            Mood::Sleep,
+            Mood::Happy,
+            Mood::Pout,
+            Mood::Dragged,
+        ];
         let mut ids: Vec<&str> = moods.iter().map(|m| m.anim_id()).collect();
         let n = ids.len();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), n, "不同姿态必须对应不同素材");
-        assert!(moods.iter().all(|m| !m.anim_id().is_empty() && !m.label().is_empty()));
+        assert!(moods
+            .iter()
+            .all(|m| !m.anim_id().is_empty() && !m.label().is_empty()));
     }
 
     #[test]
