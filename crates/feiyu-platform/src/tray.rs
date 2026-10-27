@@ -1,6 +1,6 @@
 //! 托盘图标（`Shell_NotifyIconW`）的最小封装。
 //!
-//! 只做三件事：添加、改提示文字、删除。**不做** `NIM_SETVERSION(NOTIFYICON_VERSION_4)`：
+//! 只做四件事：添加、改提示文字、换图标、删除。**不做** `NIM_SETVERSION(NOTIFYICON_VERSION_4)`：
 //! v4 会把鼠标坐标搬进 `wparam` 并改变 `lparam` 的编码语义，而我们不需要气球通知
 //! 和自定义图标 id。保持 legacy 编码（`lparam` 低字就是鼠标消息）在 Win7~Win11
 //! 全都支持，窗口那边的分派能少一半分支。
@@ -51,6 +51,27 @@ impl TrayIcon {
         if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
             return Err(Error::win32(
                 "Shell_NotifyIconW(NIM_MODIFY)",
+                windows::core::Error::from_win32(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 换掉通知区里显示的图标。
+    ///
+    /// **调用方必须「先换这里，再销毁旧图标」**。顺序反过来的话，旧 `HICON` 已经被
+    /// `DestroyIcon`，而系统还指着它，通知区会闪一下空白（或直接变成一个空格子，
+    /// 直到鼠标划过通知区才恢复）。
+    ///
+    /// 本函数**不持有**这个 `HICON`；传进来的句柄必须比托盘图标的寿命更长。
+    pub fn set_icon(&self, icon: HICON) -> Result<()> {
+        let mut data = data_for(self.hwnd, "");
+        data.uFlags = NIF_ICON;
+        data.hIcon = icon;
+        // SAFETY: data 是完整的 NOTIFYICONDATAW，hIcon 在调用期间有效。
+        if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+            return Err(Error::win32(
+                "Shell_NotifyIconW(NIM_MODIFY 换图标)",
                 windows::core::Error::from_win32(),
             ));
         }

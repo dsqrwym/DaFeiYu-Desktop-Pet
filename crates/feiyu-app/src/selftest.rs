@@ -311,9 +311,33 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         items.as_ref().is_ok_and(|n| *n == 5),
     );
 
+    // ---- 托盘图标用「此刻那一帧」：必须真的跟着动画走 ----
+    //
+    // 这条不是走形式：如果 `enable_tray` 仍写死 `frame(0)`，下面两个条件
+    // （帧号推进了、像素变了）至少有一个会失。
+    let px_first = pet.current_frame_pixels()?;
+    // 帧号由真实 dt 累积而来，得真的等一会儿才能推进（24fps 下 1 帧 = 42ms）。
+    std::thread::sleep(std::time::Duration::from_millis(220));
+    pet.on_event(Event::Tick)?;
+    let frame_now = pet.frame();
+    let px_now = pet.current_frame_pixels()?;
+    r.check(
+        &format!(
+            "托盘图标取当前帧而非首帧（第 0 帧 vs 第 {frame_now} 帧，像素{}）",
+            if px_first == px_now {
+                "相同（错）"
+            } else {
+                "不同"
+            }
+        ),
+        frame_now > 0 && px_first != px_now,
+    );
+
     // ---- 隐藏 / 唤出：窗口真的会不可见，菜单文案跟着换 ----
     pet.show();
     let shown = pet.is_visible();
+    // 藏的那一刻帧号必须已经离开首帧，否则「定格」和「写死首帧」看不出区别。
+    let frame_at_hide = pet.frame();
     pet.hide();
     let after_hide = pet.is_visible();
     let label_hidden = pet.hide_label().to_owned();
@@ -331,6 +355,10 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     r.check(
         &format!("唤出后首项变回「{}」", pet.hide_label()),
         pet.hide_label() == "隐藏到托盘",
+    );
+    r.check(
+        &format!("隐藏时定格在第 {frame_at_hide} 帧（非首帧才算真定格）"),
+        frame_at_hide > 0,
     );
 
     let area = pet.area();

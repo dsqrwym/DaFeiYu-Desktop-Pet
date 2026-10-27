@@ -198,7 +198,7 @@ impl Pet {
         self.win.set_tick(ms);
     }
 
-    /// 藏进托盘：窗口不可见，定时器停掉。
+    /// 藏进托盘：窗口不可见，定时器停掉，同时把托盘图标定格成「这一刻」。
     ///
     /// 定时器一定要停——不动的桌宠也要烧 1.48% 单核，
     /// 而「藏起来」对用户的意思就是「别再占我资源」。
@@ -207,6 +207,14 @@ impl Pet {
             return;
         }
         self.hidden = true;
+        // 先把图标换成屏幕上正在显示的那一帧，再收窗口：
+        // 用户看到的效果是「鱼被收进兜里，兜里露出来的就是它被收走时的样子」。
+        // 失败不阻断隐藏——用户要的是「收起来」，图标长什么样是锦上添花。
+        if self.tray.is_some() {
+            if let Err(e) = self.refresh_tray_icon() {
+                eprintln!("换托盘图标失败（照原样隐藏了）：{e:#}");
+            }
+        }
         self.win.hide();
         self.win.set_tick(0);
     }
@@ -238,7 +246,7 @@ impl Pet {
         self.win.is_visible()
     }
 
-    /// 挂上托盘图标：用当前动画的首帧现场画一张。
+    /// 挂上托盘图标：用**当前正在播的那一帧**现场画一张。
     ///
     /// 只在真要常驻时才调；`--shot` 那种一闪就退的模式加了又删，
     /// 通知区会闪一下，没意义。
@@ -246,22 +254,65 @@ impl Pet {
         if self.tray.is_some() {
             return Ok(());
         }
-        let cur = self.current.clone();
-        let entry = self.manifest.require(&cur)?.clone();
-        // 拷一份像素：组装图标期间还要可变借用 self。
-        let pixels = self
-            .anims
-            .get_mut(&cur)
-            .with_context(|| format!("动画 {cur} 尚未加载"))?
-            .frame(0)?
-            .to_vec();
-        let icon = Icon::from_bgra(&pixels, entry.width() as u32, entry.height() as u32)
-            .context("从帧像素生成托盘图标失败")?;
+        let icon = self.icon_of_current_frame()?;
         let tray =
             TrayIcon::new(self.win.hwnd(), icon.handle(), TRAY_TIP).context("添加托盘图标失败")?;
         self.icon = Some(icon);
         self.tray = Some(tray);
         Ok(())
+    }
+
+    /// 把托盘图标换成当前帧的样子。
+    ///
+    /// 顺序不能颠倒：**先让系统指向新图标，再让旧 `Icon` 析构**。
+    /// 反过来会有一瞬系统指着一个已经 `DestroyIcon` 的句柄，通知区闪空白。
+    fn refresh_tray_icon(&mut self) -> Result<()> {
+        if self.tray.is_none() {
+            return Ok(());
+        }
+        let icon = self.icon_of_current_frame()?;
+        if let Some(tray) = self.tray.as_ref() {
+            tray.set_icon(icon.handle())?;
+        }
+        // 赋值这一刻旧图标才析构，而此时系统已经指到新的上面了。
+        self.icon = Some(icon);
+        Ok(())
+    }
+
+    /// 当前帧的预乘 BGRA 像素（副本）。
+    ///
+    /// 给自检和取证用：确认「托盘图标取的是此刻」而不是写死的首帧。
+    /// 返回副本而不是切片，是因为调用方接下来往往要再可变借用 `self`。
+    pub fn current_frame_pixels(&mut self) -> Result<Vec<u8>> {
+        let cur = self.current.clone();
+        let idx = self.frame;
+        Ok(self
+            .anims
+            .get_mut(&cur)
+            .with_context(|| format!("动画 {cur} 尚未加载"))?
+            .frame(idx)?
+            .to_vec())
+    }
+
+    /// 用「屏幕上正在显示的那一帧」画一张图标。
+    ///
+    /// 取 `self.frame` 而不是第 0 帧：托盘里那个小东西才是「被暂存的大肥鱼」。
+    ///
+    /// 成本几乎为零：`draw_frame()` 刚刚解过这一帧，[`AnimReader`] 的 `pos` 缓存会
+    /// 直接命中、返回已有缓冲。**但如果 `frame` 和 `pos` 不同步，这里会退化成
+    /// 「从最近的关键帧重解整条差分链」（最坏 16 帧、~2.5ms）**，所以调用点必须
+    /// 在 [`Self::draw_frame`] 之后，不能先改 `frame` 再来取。
+    fn icon_of_current_frame(&mut self) -> Result<Icon> {
+        let cur = self.current.clone();
+        let entry = self.manifest.require(&cur)?.clone();
+        let pixels = self.current_frame_pixels()?;
+        Icon::from_bgra(&pixels, entry.width() as u32, entry.height() as u32)
+            .context("从帧像素生成托盘图标失败")
+    }
+
+    /// 当前帧号（对当前动画取模）。自检与取证用。
+    pub fn frame(&self) -> u32 {
+        self.frame
     }
 
     /// 清单原始 fps。

@@ -168,7 +168,7 @@ fn print_help() {
          \x20 --shots <目录>    每段动画各截一张 BMP 后退出\n\
          \x20 --menu           弹一次右键菜单后退出（验证菜单用）\n\
          \x20 --tray           挂上托盘图标跑 5 秒后退出（验证通知区用）\n\
-         \x20 --hide <秒>      一开始就藏进托盘，挂 n 秒后退出（量隐藏时的 CPU）\n\
+         \x20 --hide <秒>      先跑 2 秒让动画推进，再藏进托盘挂 n 秒（量隐藏时的 CPU）\n\
          \x20 --fling <vx> <vy> 启动时给一个初速度（像素/秒，验证滑行与下落）\n\
          \x20 --static         画一帧后不再推进（测静止底噪）\n\
          \x20 --bench <n>      连续提交 n 帧，报告单帧耗时\n\
@@ -383,18 +383,42 @@ fn menu_event(ev: Event, pet: &mut Pet, verbose: bool) -> bool {
 
 /// 藏进托盘挂 n 秒：用来量「藏起来之后到底还烧不烧 CPU」。
 ///
-/// 这里刻意**不跑消息泵**：隐藏时定时器已经停了，泵只是在 `GetMessageW` 上阻塞，
+/// 隐藏**之前先正常跑 2 秒**：一是让动画推进到非首帧（否则托盘图标和启动时那张
+/// 一模一样，光看输出分不出「定格」有没有生效），二是更接近真实使用——没人会在
+/// 第 0 帧就去点隐藏。
+///
+/// 隐藏之后刻意**不跑消息泵**：定时器已经停了，泵只是在 `GetMessageW` 上阻塞，
 /// CPU 贡献可忽略，直接用 `sleep` 把时间耗掉更干净。代价是这段时间里的托盘
 /// 点击不会响应——它只用于测量，不是给人用的日常模式。
 fn hide_demo(pet: &mut Pet, secs: u32) -> Result<()> {
+    // 按**墙钟**计时，不数拍子：`SetTimer` 粒度 15.6ms，数 48 拍以为是 2 秒，实际跑成 4 秒。
+    const WARMUP_SECS: f32 = 2.0;
     pet.enable_tray().context("挂托盘图标失败")?;
     pet.set_tick(TICK_MS);
-    pet.hide();
-    println!(
-        "已藏进托盘：窗口可见 = {}，藏着 = {}，定时器已停。挂 {secs} 秒后退出。",
-        pet.is_visible(),
-        pet.hidden()
-    );
+    let started = std::time::Instant::now();
+    let mut hid = false;
+    pump(|ev| {
+        if !hid && ev == Event::Tick && started.elapsed().as_secs_f32() >= WARMUP_SECS {
+            hid = true;
+            // 先定格再收窗口：托盘里那个小东西就是它被收走时的样子。
+            pet.hide();
+            println!(
+                "已藏进托盘：定格在第 {} 帧，窗口可见 = {}，藏着 = {}，定时器已停。挂 {secs} 秒后退出。",
+                pet.frame(),
+                pet.is_visible(),
+                pet.hidden()
+            );
+            quit();
+            return;
+        }
+        if let Err(e) = pet.on_event(ev) {
+            eprintln!("错误：{e:#}");
+            quit();
+        }
+    })?;
+    if !hid {
+        bail!("窗口提前退出，没来得及隐藏");
+    }
     std::thread::sleep(std::time::Duration::from_secs(u64::from(secs)));
     println!("退出（共提交 {} 帧）", pet.drawn());
     Ok(())

@@ -13,6 +13,10 @@
 # 生成物：.fishanim / manifest.json 由 pack-anim 产出，随 release 分发
 /assets/
 
+# 开发过程笔记（给协作者与 AI 看的工作记录，不是交付物）
+# 刻意不放在 /target/ 下：cargo clean 会把那种笔记连根删掉。
+/_notes/
+
 # 本地运行态
 /config.json
 /config.toml
