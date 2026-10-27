@@ -1,10 +1,14 @@
 //! 素材与动画子模块。
 //!
-//! 当前只有 `.fishanim` 容器（[`format`] 读写格式、[`reader`] 运行时取帧）。
-//! 后续阶段在此追加：`manifest`（素材索引）、`state`（状态机）、`physics`（拖拽与抛掷）。
+//! * [`format`] —— `.fishanim` 二进制容器读写；
+//! * [`reader`] —— 运行时随机取帧；
+//! * [`manifest`] —— 素材清单，把动画 id 映射到文件与画布几何。
+//! * [`crate::brain`] —— 纯逻辑状态机，决定该播哪段动画。
 
 pub mod format;
+pub mod manifest;
 pub mod reader;
 
 pub use format::{AnimError, AnimFile, AnimHeader, Codec, FrameEntry};
+pub use manifest::{AnimEntry, Canvas, Manifest};
 pub use reader::AnimReader;

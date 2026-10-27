@@ -387,6 +387,8 @@ pub enum AnimError {
     FrameOutOfRange { idx: u32, count: u32 },
     #[error("解压失败: {0}")]
     Zstd(String),
+    #[error("素材清单有问题: {0}")]
+    Manifest(String),
 }
 
 #[cfg(test)]

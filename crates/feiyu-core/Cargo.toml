@@ -8,3 +8,6 @@ description = "FeiYu 桌宠的平台无关核心：素材容器、动画清单�
 [dependencies]
 zstd.workspace = true
 thiserror.workspace = true
+# 只用于读 manifest.json；容器二进制由 format 模块手写，不靠 serde。
+serde.workspace = true
+serde_json.workspace = true

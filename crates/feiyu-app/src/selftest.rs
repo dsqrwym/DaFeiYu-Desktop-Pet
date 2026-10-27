@@ -1,24 +1,47 @@
-//! 自检：把「窗口真的能逐像素透明、真的能点到、真的画出来了」变成可执行断言。
+//! 自检：把「窗口真的能逐像素透明、真的能点到、真的画出来了、真的会换姿势」
+//! 变成可执行断言。
 //!
 //! 全部走真实 Win32 路径（真建窗口、真提交位图、真从屏幕上抓像素），
 //! 不做 mock——mock 过的窗口测不出 DWM 合成问题。
+//!
+//! 素材（`assets/anim/`）不入库，缺失时相关项标记为「跳过」而不是失败，
+//! 否则新克隆的仓库跑自检会永远红。
 
 use std::fs;
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use feiyu_platform::{pump, quit, Event, LayeredWindow, SingleInstance};
+
+use crate::pet::Pet;
 
 const W: u32 = 200;
 const H: u32 = 240;
 const WIN_X: i32 = 400;
 const WIN_Y: i32 = 300;
 
+/// 素材目录。
+const ANIM_DIR: &str = "assets/anim";
+
+/// 脚底距工作区底边的空隙，必须与 `pet.rs` 的 `BOTTOM_GAP` 一致。
+const BOTTOM_GAP: i32 = 4;
+
 /// 逐个执行断言，返回是否全部通过。
 pub fn run() -> Result<bool> {
     let mut r = Report::default();
     println!("飞鱼自检\n");
 
+    check_window(&mut r)?;
+    check_assets(&mut r)?;
+    check_animation_switch(&mut r)?;
+
+    println!("\n{}", r.summary());
+    Ok(r.failed == 0)
+}
+
+/// 窗口层：透明、命中、定位、定时器、截屏。
+fn check_window(r: &mut Report) -> Result<()> {
     r.check("DPI 每显示器 v2 感知", feiyu_platform::enable_per_monitor_v2());
 
     // 单实例：同名的第二次获取必须被拒。
@@ -104,14 +127,110 @@ pub fn run() -> Result<bool> {
     );
 
     drop(win);
-    println!("\n{}", r.summary());
-    Ok(r.failed == 0)
+    Ok(())
+}
+
+/// 素材层：清单能解析、字段自洽、文件都在。
+fn check_assets(r: &mut Report) -> Result<()> {
+    let dir = Path::new(ANIM_DIR);
+    let path = dir.join("manifest.json");
+    if !path.exists() {
+        r.skip(&format!("素材清单 {} 不存在（先跑 pack-anim）", path.display()));
+        return Ok(());
+    }
+    let manifest = feiyu_core::anim::Manifest::load(&path)?;
+    r.check(&format!("清单版本 {} 受支持", manifest.format), manifest.format == 1);
+    r.check(
+        &format!("清单有 {} 段动画", manifest.animations.len()),
+        manifest.animations.len() >= 5,
+    );
+
+    let missing: Vec<&str> =
+        manifest.animations.iter().filter(|a| !a.path_in(dir).exists()).map(|a| a.id.as_str()).collect();
+    r.check(&format!("清单里每个文件都存在（缺 {:?}）", missing), missing.is_empty());
+
+    // 脚底行必须落在画布内，且各段的脚底行应大致一致（同一角色同一画布）。
+    let feet: Vec<i32> = manifest.animations.iter().map(|a| a.feet_row() as i32).collect();
+    let spread = feet.iter().max().unwrap_or(&0) - feet.iter().min().unwrap_or(&0);
+    r.check(
+        &format!("各段落脚行差异 {spread} 像素（≤16 视为同一条地面）"),
+        spread <= 16,
+    );
+    Ok(())
+}
+
+/// 运行时层：真的能换动画，且换的时候尺寸变、脚底不跳。
+fn check_animation_switch(r: &mut Report) -> Result<()> {
+    let dir = Path::new(ANIM_DIR);
+    if !dir.join("manifest.json").exists() {
+        r.skip("素材缺失，跳过运行时动画切换检查");
+        return Ok(());
+    }
+    let Ok((left, _, right, bottom)) = feiyu_platform::primary_work_area() else {
+        r.skip("取屏幕工作区失败，跳过动画切换检查");
+        return Ok(());
+    };
+    let feet_line = bottom - BOTTOM_GAP;
+
+    // 强制模式：状态机不参与，这样才能稳定断言尺寸。
+    let mut pet = Pet::open(dir, Some("idle")).context("打开桌宠失败")?;
+    r.check("强制模式下状态机不参与", pet.mood().is_none());
+
+    let idle = pet.rect();
+    let (w0, h0) = (idle.2 - idle.0, idle.3 - idle.1);
+    r.check(&format!("idle 窗口 {w0}×{h0} 在屏幕内"), w0 > 0 && h0 > 0 && idle.0 >= left && idle.2 <= right);
+    r.check(
+        &format!("idle 脚底贴地面：窗口底 {} / 目标 {}", idle.3, feet_line),
+        idle.3 == feet_line,
+    );
+
+    // 切到最宽的一段，尺寸必然变化。
+    pet.play("sleep").context("切到 sleep 失败")?;
+    let sleep = pet.rect();
+    let (w1, h1) = (sleep.2 - sleep.0, sleep.3 - sleep.1);
+    r.check(
+        &format!("切到 sleep 尺寸跟着变：{w0}×{h0} → {w1}×{h1}"),
+        (w1, h1) != (w0, h0),
+    );
+    r.check(
+        &format!("换尺寸后脚底没跳（窗口底 {} / 目标 {}）", sleep.3, feet_line),
+        sleep.3 == feet_line,
+    );
+
+    // 再切到最窄的一段，横向锚定也不能飘。
+    pet.play("stretch").context("切到 stretch 失败")?;
+    let stretch = pet.rect();
+    r.check(
+        &format!("再切 stretch 脚底仍贴地（窗口底 {}）", stretch.3),
+        stretch.3 == feet_line,
+    );
+    let (cw0, cw1) = ((idle.0 + idle.2) / 2, (stretch.0 + stretch.2) / 2);
+    r.check(
+        &format!("水平中心漂移 {} 像素（≤48 视为稳定）", (cw0 - cw1).abs()),
+        (cw0 - cw1).abs() <= 48,
+    );
+
+    // 换段之后还得能正常解帧提交。
+    let before = pet.drawn();
+    pet.draw_frame().context("换段后提交失败")?;
+    r.check(&format!("换段后仍能提交（{} → {} 帧）", before, pet.drawn()), pet.drawn() == before + 1);
+
+    // 清单与文件不一致时必须报错，而不是错位着播下去。
+    let bad = Pet::open(dir, Some("definitely_not_an_anim")).err();
+    r.check(
+        &format!("清单里不存在的 id 会被拒（{:?}）", bad.as_ref().map(|e| format!("{e:#}"))),
+        bad.is_some(),
+    );
+
+    drop(pet);
+    Ok(())
 }
 
 #[derive(Default)]
 struct Report {
     passed: u32,
     failed: u32,
+    skipped: u32,
 }
 
 impl Report {
@@ -125,12 +244,18 @@ impl Report {
         }
     }
 
+    fn skip(&mut self, name: &str) {
+        self.skipped += 1;
+        println!("  - {name}（跳过）");
+    }
+
     fn summary(&self) -> String {
-        format!(
-            "自检结果：{} 通过 / {} 失败{}",
-            self.passed,
-            self.failed,
-            if self.failed == 0 { "，全部通过" } else { "，存在失败项" }
-        )
+        let tail = if self.failed == 0 { "，全部通过" } else { "，存在失败项" };
+        let skipped = if self.skipped == 0 {
+            String::new()
+        } else {
+            format!("，跳过 {}", self.skipped)
+        };
+        format!("自检结果：{} 通过 / {} 失败{skipped}{tail}", self.passed, self.failed)
     }
 }

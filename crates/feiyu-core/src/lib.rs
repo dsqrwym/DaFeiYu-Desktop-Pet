@@ -6,5 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod anim;
+pub mod brain;
 
-pub use anim::{AnimError, AnimHeader, AnimReader, Codec, FrameEntry};
+pub use anim::{AnimEntry, AnimError, AnimHeader, AnimReader, Codec, FrameEntry, Manifest};
+pub use brain::{Brain, Mood, Stimulus};
