@@ -1,5 +1,5 @@
-//! 自检：把「窗口真的能逐像素透明、真的能点到、真的画出来了、真的会换姿势」
-//! 变成可执行断言。
+//! 自检：把「窗口真的能逐像素透明、真的能点到、真的画出来了、真的会换姿势、
+//! 真的能被拖起来又落回地面」变成可执行断言。
 //!
 //! 全部走真实 Win32 路径（真建窗口、真提交位图、真从屏幕上抓像素），
 //! 不做 mock——mock 过的窗口测不出 DWM 合成问题。
@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use feiyu_core::{Limits, Mood, Motion};
 use feiyu_platform::{pump, quit, Event, LayeredWindow, SingleInstance};
 
 use crate::pet::Pet;
@@ -35,6 +36,7 @@ pub fn run() -> Result<bool> {
     check_window(&mut r)?;
     check_assets(&mut r)?;
     check_animation_switch(&mut r)?;
+    check_interaction(&mut r)?;
 
     println!("\n{}", r.summary());
     Ok(r.failed == 0)
@@ -256,6 +258,154 @@ fn check_animation_switch(r: &mut Report) -> Result<()> {
 
     drop(pet);
     Ok(())
+}
+
+/// 交互层：菜单能建、锚点边界与工作区自洽、能落回地面、点击与拖拽能区分。
+fn check_interaction(r: &mut Report) -> Result<()> {
+    let dir = Path::new(ANIM_DIR);
+    let manifest_path = dir.join("manifest.json");
+    if !manifest_path.exists() {
+        r.skip("素材缺失，跳过交互检查");
+        return Ok(());
+    }
+    let manifest = feiyu_core::anim::Manifest::load(&manifest_path)?;
+
+    // 菜单：真建一次（不弹出）。弹出来是模态的，自检里没法自动关掉，
+    // 所以只能验到「Win32 那层没被写坏」为止；外观请用 `--menu` 看。
+    let built = feiyu_platform::Menu::new().and_then(|mut m| {
+        m.command(1, "回到屏幕底部")
+            .check(2, "总在最前", true)
+            .separator()
+            .command(3, "退出");
+        Ok(m.items())
+    });
+    let menu_desc = match &built {
+        Ok(n) => format!("{n} 项"),
+        Err(e) => format!("失败：{e:#}"),
+    };
+    r.check(
+        &format!("右键菜单能构造（{menu_desc}）"),
+        built.as_ref().is_ok_and(|n| *n == 4),
+    );
+
+    // ---- 几何：锚点范围必须与工作区、窗口尺寸自洽 ----
+    let mut pet = Pet::open(dir, Some("idle")).context("打开桌宠失败")?;
+    let area = pet.area();
+    let ground = (area.3 - BOTTOM_GAP) as f32;
+    let limits = pet.limits();
+    let (l, _, rr, b) = pet.rect();
+    r.check(
+        &format!("初始脚底贴地（窗口底 {b} / 地面 {}）", ground as i32),
+        b == ground as i32,
+    );
+    r.check(
+        &format!("锚点上界=地面（{:.1} / {ground:.1}）", limits.y.1),
+        (limits.y.1 - ground).abs() < 0.5,
+    );
+    let span = limits.x.1 - limits.x.0;
+    let expect = (area.2 - area.0 - (rr - l)) as f32;
+    r.check(
+        &format!("横向可动范围 {span:.1} = 工作区宽-窗口宽 {expect:.1}"),
+        (span - expect).abs() <= 1.0,
+    );
+
+    // ---- 运动学：用真实边界跑一遍，确保落得下去也停得下来 ----
+    let (landed, frames) = settle(Motion::fling(0.0, 0.0), (limits.x.0, limits.y.0), limits);
+    let landed_desc = match landed {
+        Some(p) => format!("{frames} 帧后 y={:.1}", p.1),
+        None => "900 帧仍未落地".to_owned(),
+    };
+    r.check(
+        &format!("从顶上自由落体：{landed_desc}"),
+        landed.is_some_and(|p| (p.1 - limits.y.1).abs() < 0.5),
+    );
+
+    let (stopped, frames) = settle(
+        Motion::fling(2000.0, 0.0),
+        (limits.x.0 + 50.0, limits.y.1),
+        limits,
+    );
+    r.check(
+        &format!("横向快甩 {} 秒内停稳", frames as f32 / 60.0),
+        stopped.is_some_and(|p| p.0 >= limits.x.0 - 0.5 && p.0 <= limits.x.1 + 0.5),
+    );
+
+    // ---- 回到底部：窗口左边缘必须落在「画布中心 - 半画布 + origin_x」上 ----
+    pet.play("stretch").context("切到 stretch 失败")?;
+    pet.back_to_home()?;
+    let entry = manifest.require("stretch")?.clone();
+    let expect_x =
+        (area.0 + area.2) / 2 - manifest.canvas.width as i32 / 2 + entry.origin[0] as i32;
+    let (hl, _, hr, hb) = pet.rect();
+    r.check(
+        &format!(
+            "回到底部：底 {hb} / 地面 {}，左 {hl} / 期望 {expect_x}",
+            ground as i32
+        ),
+        hb == ground as i32 && (hl - expect_x).abs() <= 1 && (hr - hl) == entry.width() as i32,
+    );
+    r.check("窗口默认为总在最前", pet.topmost());
+    drop(pet);
+
+    // ---- 点击 / 拖拽的区分：直接喂事件，走的是运行时真路径 ----
+    let mut pet = Pet::open(dir, None).context("打开桌宠失败（自由模式）")?;
+
+    // 1 像素抖动：必须仍然算「点击」，否则手的微小位移会把点击吞掉。
+    pet.on_event(Event::MouseDown { x: 10, y: 10 })?;
+    let (jl, jt, _, _) = pet.rect();
+    pet.on_event(Event::Moved {
+        x: jl + 1,
+        y: jt - 1,
+    })?;
+    r.check(
+        &format!("1 像素抖动不算拖拽（{:?}）", pet.mood()),
+        pet.mood() != Some(Mood::Dragged),
+    );
+    pet.on_event(Event::MouseUp { x: 10, y: 10 })?;
+    r.check(
+        &format!("抖动后松手仍算点击（{:?}）", pet.mood()),
+        pet.mood() == Some(Mood::Happy),
+    );
+
+    // 移出阈值：进入被拖拽姿态；松手回到待机。
+    pet.on_event(Event::MouseDown { x: 10, y: 10 })?;
+    let (ml, mt, _, _) = pet.rect();
+    pet.on_event(Event::Moved {
+        x: ml + 40,
+        y: mt + 24,
+    })?;
+    r.check(
+        &format!("位移超过阈值进入拖拽姿态（{:?}）", pet.mood()),
+        pet.mood() == Some(Mood::Dragged),
+    );
+    pet.on_event(Event::MouseUp { x: 10, y: 10 })?;
+    r.check(
+        &format!("松手回到待机（{:?}）", pet.mood()),
+        pet.mood() == Some(Mood::Idle),
+    );
+
+    // 已贴地且零速度：一拍内必须停稳，窗口不能再溜。
+    let before = pet.rect();
+    pet.tick()?;
+    r.check(
+        &format!("贴地松手后一拍内停稳（{:?} → {:?}）", before, pet.rect()),
+        pet.rect() == before,
+    );
+
+    drop(pet);
+    Ok(())
+}
+
+/// 一直推进到停稳，返回 `(最终锚点, 帧数)`；没停则第一个元素为 `None`。
+fn settle(mut m: Motion, mut anchor: (f32, f32), limits: Limits) -> (Option<(f32, f32)>, usize) {
+    for i in 0..900 {
+        let (next, rest) = m.step(anchor, limits, 1.0 / 60.0);
+        anchor = next;
+        if rest {
+            return (Some(anchor), i + 1);
+        }
+    }
+    (None, 900)
 }
 
 #[derive(Default)]

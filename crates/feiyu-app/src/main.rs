@@ -7,6 +7,7 @@
 //! * `--list` —— 打印素材清单（不建窗口）；
 //! * `--shot <文件>` —— 跑 0.5 秒后截一张；
 //! * `--shots <目录>` —— 每段动画各截一张，用于肉眼验收全部素材；
+//! * `--menu` —— 弹一次右键菜单后退出，用来确认菜单在真机上长什么样；
 //! * `--bench <n>` / `--static` —— 性能与静止底噪测量。
 
 mod pet;
@@ -19,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use feiyu_core::anim::Manifest;
 use feiyu_platform::{pump, quit, Event, SingleInstance};
 
-use crate::pet::Pet;
+use crate::pet::{Action, Pet};
 
 /// 素材目录默认值（相对当前工作目录）。
 const DEFAULT_DIR: &str = "assets/anim";
@@ -74,6 +75,10 @@ struct Args {
     r#static: bool,
     /// 基准模式：连续提交 n 帧并报告单帧耗时。
     bench: Option<u32>,
+    /// 弹一次右键菜单就退出（验证菜单用）。
+    menu: bool,
+    /// 启动时给一个初速度（像素/秒），用来验证滑行与下落。
+    fling: Option<(f32, f32)>,
     list: bool,
     selftest: bool,
     /// 打印动画切换日志。
@@ -88,6 +93,8 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         shots: None,
         r#static: false,
         bench: None,
+        menu: false,
+        fling: None,
         list: false,
         selftest: false,
         verbose: false,
@@ -107,6 +114,20 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                         .parse()
                         .context("--bench 需要整数")?,
                 )
+            }
+            "--menu" => out.menu = true,
+            "--fling" => {
+                let vx = it
+                    .next()
+                    .context("--fling 缺少 vx")?
+                    .parse()
+                    .context("--fling 的 vx 需要数字")?;
+                let vy = it
+                    .next()
+                    .context("--fling 缺少 vy")?
+                    .parse()
+                    .context("--fling 的 vy 需要数字")?;
+                out.fling = Some((vx, vy));
             }
             "--list" => out.list = true,
             "--selftest" => out.selftest = true,
@@ -129,6 +150,8 @@ fn print_help() {
          \x20 --list           打印素材清单\n\
          \x20 --shot <文件>     跑 0.5 秒后截屏存 BMP 并退出\n\
          \x20 --shots <目录>    每段动画各截一张 BMP 后退出\n\
+         \x20 --menu           弹一次右键菜单后退出（验证菜单用）\n\
+         \x20 --fling <vx> <vy> 启动时给一个初速度（像素/秒，验证滑行与下落）\n\
          \x20 --static         画一帧后不再推进（测静止底噪）\n\
          \x20 --bench <n>      连续提交 n 帧，报告单帧耗时\n\
          \x20 --verbose        打印动画切换\n\
@@ -186,6 +209,11 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     let mut pet = Pet::open(&dir, forced.as_deref())?;
     pet.show();
 
+    // 调试入口：把「要鼠标才能触发」那一步拆掉，让物理推窗口可以被截屏取证。
+    if let Some((vx, vy)) = args.fling {
+        pet.start_fling(vx, vy);
+    }
+
     if let Some(n) = args.bench {
         let (dec, drw) = pet.bench(n)?;
         println!(
@@ -199,6 +227,10 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
 
     if args.r#static {
         return still(&mut pet);
+    }
+
+    if args.menu {
+        return menu_once(&mut pet);
     }
 
     if let Some(out) = &args.shots {
@@ -215,9 +247,22 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     let mut failure: Option<anyhow::Error> = None;
 
     pump(|ev| {
-        // TODO(P3)：右键弹原生菜单。当前先用它退出，免得只能去任务管理器杀。
-        if matches!(ev, Event::RightClick { .. }) {
-            quit();
+        // 右键弹原生菜单。菜单是模态的：它内部会跑自己的消息循环，
+        // 期间窗口定时器照常触发，所以动画不会卡在选中前那一帧。
+        if let Event::RightClick { x, y } = ev {
+            match pet.menu(x, y) {
+                Ok(Action::Quit) => {
+                    quit();
+                    return;
+                }
+                Ok(Action::Topmost(on)) => {
+                    if verbose {
+                        println!("总在最前：{}", if on { "开" } else { "关" });
+                    }
+                }
+                Ok(Action::None | Action::Home) => {}
+                Err(e) => eprintln!("菜单出错：{e:#}"),
+            }
             return;
         }
         if let Err(e) = pet.on_event(ev) {
@@ -234,7 +279,9 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
             ticks += 1;
             if ticks >= SHOT_TICKS {
                 match pet.capture(path) {
-                    Ok((w, h)) => println!("已截屏 {w}×{h} → {}", path.display()),
+                    Ok((w, h)) => {
+                        println!("已截屏 {w}×{h}，窗口 {:?} → {}", pet.rect(), path.display())
+                    }
                     Err(e) => eprintln!("截屏失败：{e:#}"),
                 }
                 captured = true;
@@ -250,6 +297,18 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
         bail!("窗口提前退出，没有截到图");
     }
     println!("退出（共提交 {} 帧）", pet.drawn());
+    Ok(())
+}
+
+/// 弹一次右键菜单然后退出：用来确认菜单在真机上长什么样。
+fn menu_once(pet: &mut Pet) -> Result<()> {
+    let (left, top, _, _) = pet.rect();
+    // 从窗口左上角往内偏一点弹，免得菜单正好盖住角色。
+    let action = pet.menu(left + 12, top + 12)?;
+    println!(
+        "菜单结果：{action:?}；当前总在最前 = {}",
+        if pet.topmost() { "开" } else { "关" }
+    );
     Ok(())
 }
 

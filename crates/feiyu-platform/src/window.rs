@@ -29,11 +29,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-    IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE,
-    ULW_ALPHA, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST,
+    HWND_TOPMOST, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_SHOWNOACTIVATE, ULW_ALPHA, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCHITTEST, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::{Error, Result};
@@ -49,7 +49,8 @@ pub enum Event {
     MouseMove { x: i32, y: i32 },
     /// 左键抬起。
     MouseUp { x: i32, y: i32 },
-    /// 右键抬起，用于弹菜单。
+    /// 右键抬起，用于弹菜单。坐标是**屏幕**坐标（菜单需要屏幕坐标，
+    /// 而不是客户区坐标——客户区坐标还得再由调用方换算一次）。
     RightClick { x: i32, y: i32 },
     /// 窗口被拖到了新位置（屏幕坐标，左上角）。
     Moved { x: i32, y: i32 },
@@ -176,8 +177,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             push(Event::MouseUp { x, y });
         }
         WM_RBUTTONUP => {
-            let (x, y) = client_point(lparam);
-            push(Event::RightClick { x, y });
+            // 菜单直接吃屏幕坐标，这里不再传客户区坐标。
+            // SAFETY: 栈上 POINT 接收光标位置。
+            let mut pt = POINT::default();
+            let _ = unsafe { GetCursorPos(&mut pt) };
+            push(Event::RightClick { x: pt.x, y: pt.y });
         }
         WM_TIMER => push(Event::Tick),
         WM_DESTROY => {
@@ -360,6 +364,33 @@ impl LayeredWindow {
         // SAFETY: 句柄有效，rect 为栈上接收结构。
         unsafe { GetWindowRect(self.hwnd, &mut rect) }.ok();
         (rect.left, rect.top, rect.right, rect.bottom)
+    }
+
+    /// 切换「总在最前」。
+    ///
+    /// 关掉之后窗口会落到普通窗口的 z 序顶端：仍然看得见，但被别的窗口盖住
+    /// 就点不到了——这正是这个开关的意义（工作时不想被桌宠压住）。
+    pub fn set_topmost(&self, on: bool) {
+        let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        // SAFETY: 句柄有效；只改 z 序，不动位置与尺寸。
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// 当前是否「总在最前」（自检用）。
+    pub fn is_topmost(&self) -> bool {
+        // SAFETY: 读本窗口扩展样式。
+        let style = unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) } as u32;
+        style & WS_EX_TOPMOST.0 != 0
     }
 
     /// 移动窗口左上角（屏幕坐标，物理像素）。

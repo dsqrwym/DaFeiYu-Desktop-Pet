@@ -7,17 +7,22 @@
 //!   用它而不是 `origin_y + baseline`——后者是画布坐标，把两者搞混会让角色错位几百像素。
 //! * 横向：`window_x = 锚点x - 画布宽/2 + origin_x`。以原画布中心为基准，
 //!   这样 193 宽的 `stretch` 和 384 宽的 `sleep` 不会各自左右游移。
+//!
+//! 拖动不再「松手就停」：松手时用最近 120ms 的采样估一个速度，交给
+//! [`feiyu_core::motion`] 做滑行 + 重力。位置的真源是锚点 `(anchor_x, feet_y)`，
+//! 窗口每帧跟着锚点走，所以滑行途中换动画也不会跳位。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
-use feiyu_core::anim::{AnimReader, Manifest};
+use feiyu_core::anim::{AnimEntry, AnimReader, Manifest};
 use feiyu_core::brain::{Brain, Mood, Stimulus};
-use feiyu_platform::{Event, LayeredWindow};
+use feiyu_core::motion::{fling_velocity, Limits, Motion};
+use feiyu_platform::{CommandId, Event, LayeredWindow, Menu};
 
 /// 脚底距工作区底边的空隙（像素）。
 const BOTTOM_GAP: i32 = 4;
@@ -25,7 +30,40 @@ const BOTTOM_GAP: i32 = 4;
 /// 单帧推进的时间上限：卡顿后不要一次跳过几十帧。
 const MAX_ANIM_DT: f32 = 0.1;
 
+/// 位移超过这个距离才算「拖拽」，否则松手仍当一次点击。
+///
+/// 没有这个阈值时，点击鼠标时手抖一两个像素就会把「点一下」吞成拖拽，
+/// 表现是「点它没反应」。
+const DRAG_THRESHOLD: i32 = 4;
+
+/// 拖拽采样只保留最近这么久（秒）。
+///
+/// 窗口开太长会把「拖到位、停住两秒、再松手」算成一次快甩；
+/// 太短又会在正常拖动时凑不够两个采样点。
+const TRAIL_WINDOW: f32 = 0.12;
+
+/// 右键菜单的命令 id（含义见 [`Pet::menu`]）。
+const CMD_HOME: CommandId = 1;
+const CMD_TOPMOST: CommandId = 2;
+const CMD_QUIT: CommandId = 3;
+
 type Anim = AnimReader<BufReader<File>>;
+
+/// 右键菜单选完之后要做什么。
+///
+/// 退出这动作留给 app 层执行：`feiyu-platform` 不该知道应用语义，
+/// `pet` 也不该自己去关消息循环。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// 什么都没选（点了别处或按了 Esc）。
+    None,
+    /// 角色已搬回屏幕底部中央。
+    Home,
+    /// 「总在最前」切换后的新状态。
+    Topmost(bool),
+    /// 用户要退出。
+    Quit,
+}
 
 /// 一只桌宠的全部运行时状态。
 pub struct Pet {
@@ -48,10 +86,18 @@ pub struct Pet {
     last: Instant,
     /// 强制播放某段动画时置位，此时状态机不参与决策（截图/调试用）。
     forced: Option<String>,
-    /// 正在被拖拽（收到过 Moved、还没松手）。
+    /// 正在被拖拽（位移已超过阈值、还没松手）。
     dragging: bool,
     /// 累计提交帧数。
     drawn: u64,
+    /// 主显示器工作区 `(left, top, right, bottom)`。反弹边界与「回到底部」都靠它。
+    area: (i32, i32, i32, i32),
+    /// 松手后的滑行/下落；`None` 表示已停稳。
+    motion: Option<Motion>,
+    /// 最近的拖拽采样 `(时刻, 窗口左上角)`，松手时用来估甩动速度。
+    trail: VecDeque<(Instant, i32, i32)>,
+    /// 左键按下时的窗口左上角，用来区分「点击」与「拖拽」。
+    grab_origin: Option<(i32, i32)>,
 }
 
 impl Pet {
@@ -68,14 +114,12 @@ impl Pet {
         let entry = manifest.require(&first)?.clone();
 
         // 锚点：主屏工作区底部居中（工作区已排除任务栏）。
-        let (left, _, right, bottom) =
-            feiyu_platform::primary_work_area().context("取屏幕工作区失败，无法定位窗口")?;
-        let anchor_x = (left + right) / 2;
-        let feet_y = bottom - BOTTOM_GAP;
+        let area = feiyu_platform::primary_work_area().context("取屏幕工作区失败，无法定位窗口")?;
+        let anchor_x = (area.0 + area.2) / 2;
+        let feet_y = area.3 - BOTTOM_GAP;
 
         // 先按清单算好位置再建窗口，避免窗口先出现在 (0,0) 再跳过去。
-        let x = anchor_x - manifest.canvas.width as i32 / 2 + entry.origin[0] as i32;
-        let y = feet_y - entry.baseline as i32;
+        let (x, y) = window_pos(manifest.canvas.width, &entry, anchor_x, feet_y);
         let win = LayeredWindow::create(entry.width() as u32, entry.height() as u32, x, y, "飞鱼")
             .context("创建分层窗口失败")?;
 
@@ -94,6 +138,10 @@ impl Pet {
             forced: forced.map(str::to_owned),
             dragging: false,
             drawn: 0,
+            area,
+            motion: None,
+            trail: VecDeque::new(),
+            grab_origin: None,
         };
         pet.ensure_loaded(&pet.current.clone())?;
         pet.draw_frame()?;
@@ -142,15 +190,13 @@ impl Pet {
         }
         self.ensure_loaded(id)?;
         let entry = self.manifest.require(id)?.clone();
-        let x = self.anchor_x - self.manifest.canvas.width as i32 / 2 + entry.origin[0] as i32;
-        let y = self.feet_y - entry.baseline as i32;
 
         self.current = id.to_owned();
         self.frame = 0;
         self.acc = 0.0;
         // 先摆位置再画：`UpdateLayeredWindow` 带尺寸时**保留左上角**，
         // 所以新尺寸的帧若是宽高变大的，必须先落位，否则会从旧左上角长出去。
-        self.win.move_to(x, y);
+        self.place_window(&entry);
         self.draw_frame()
     }
 
@@ -165,6 +211,21 @@ impl Pet {
         if self.forced.is_none() && self.brain.advance(dt) {
             let id = self.brain.anim_id();
             self.play(id)?;
+        }
+
+        // 松手后的滑行/下落。先算运动再推进帧：位置是这一帧的最终结果，
+        // 顺序反了会让迟一帧的落点闪到边界外。
+        if let Some(mut motion) = self.motion.take() {
+            let entry = self.manifest.require(&self.current)?.clone();
+            let limits = self.limits_for(&entry);
+            let anchor = (self.anchor_x as f32, self.feet_y as f32);
+            let ((x, y), rest) = motion.step(anchor, limits, dt);
+            self.anchor_x = x.round() as i32;
+            self.feet_y = y.round() as i32;
+            self.place_window(&entry);
+            if !rest {
+                self.motion = Some(motion);
+            }
         }
 
         let anim_dt = dt.min(MAX_ANIM_DT);
@@ -183,29 +244,79 @@ impl Pet {
     pub fn on_event(&mut self, ev: Event) -> Result<()> {
         match ev {
             Event::Tick => self.tick(),
-            // 记下“还没开始拖”，松手时据此区分点击与拖拽。
+            // 记下按下时的位置：位移不足阈值就仍按「点击」算。
             Event::MouseDown { .. } => {
+                let (left, top, _, _) = self.win.rect();
+                self.grab_origin = Some((left, top));
                 self.dragging = false;
+                self.trail.clear();
                 Ok(())
             }
-            Event::Moved { .. } => {
-                if !self.dragging {
-                    self.dragging = true;
-                    self.stimulate(Stimulus::DragStart)?;
-                }
-                Ok(())
-            }
-            Event::MouseUp { .. } => {
-                if self.dragging {
-                    self.dragging = false;
-                    // 拖到哪就停在哪：把锚点重新对齐到实际窗口位置。
-                    self.capture_anchor()?;
-                    self.stimulate(Stimulus::DragEnd)
-                } else {
-                    self.stimulate(Stimulus::Click)
-                }
-            }
+            Event::Moved { x, y } => self.on_moved(x, y),
+            Event::MouseUp { .. } => self.on_button_up(),
             Event::MouseMove { .. } | Event::RightClick { .. } | Event::Quit => Ok(()),
+        }
+    }
+
+    /// 窗口被拖到了 `(x, y)`（屏幕坐标，左上角）。
+    fn on_moved(&mut self, x: i32, y: i32) -> Result<()> {
+        let now = Instant::now();
+        self.trail.push_back((now, x, y));
+        self.prune_trail(now);
+
+        if !self.dragging {
+            let Some((ox, oy)) = self.grab_origin else {
+                return Ok(());
+            };
+            // 取两轴最大位移：斜着抖也算抖。
+            if (x - ox).abs().max((y - oy).abs()) < DRAG_THRESHOLD {
+                return Ok(());
+            }
+            self.dragging = true;
+            self.stimulate(Stimulus::DragStart)?;
+        }
+        Ok(())
+    }
+
+    /// 左键抬起：真拖过就「甩出去 + 落地」，没拖过就算点了一下。
+    fn on_button_up(&mut self) -> Result<()> {
+        let was_dragging = std::mem::replace(&mut self.dragging, false);
+        self.grab_origin = None;
+        if !was_dragging {
+            self.trail.clear();
+            return self.stimulate(Stimulus::Click);
+        }
+        // 拖到哪就从哪开始：先把锚点对回实际窗口位置，再据此起飞。
+        self.capture_anchor()?;
+        let (vx, vy) = self.take_fling();
+        self.motion = Some(Motion::fling(vx, vy));
+        self.stimulate(Stimulus::DragEnd)
+    }
+
+    /// 用最近的拖拽采样估一个松手速度，并清空采样。
+    fn take_fling(&mut self) -> (f32, f32) {
+        let now = Instant::now();
+        // 先在**松手这一刻**剪一遍：否则「拖到位后停住一秒再松手」
+        // 会拿一秒前的数据算出一次根本不存在的快甩。
+        self.prune_trail(now);
+        let base = self.trail.front().map(|s| s.0).unwrap_or(now);
+        let samples: Vec<(f32, i32, i32)> = self
+            .trail
+            .iter()
+            .map(|(t, x, y)| (t.duration_since(base).as_secs_f32(), *x, *y))
+            .collect();
+        self.trail.clear();
+        fling_velocity(&samples)
+    }
+
+    /// 丢掉过老的拖拽采样。
+    fn prune_trail(&mut self, now: Instant) {
+        while self
+            .trail
+            .front()
+            .is_some_and(|s| now.duration_since(s.0).as_secs_f32() > TRAIL_WINDOW)
+        {
+            self.trail.pop_front();
         }
     }
 
@@ -278,6 +389,108 @@ impl Pet {
         self.win.rect()
     }
 
+    /// 主显示器工作区 `(left, top, right, bottom)`。自检用。
+    pub fn area(&self) -> (i32, i32, i32, i32) {
+        self.area
+    }
+
+    /// 当前是否「总在最前」。自检用。
+    pub fn topmost(&self) -> bool {
+        self.win.is_topmost()
+    }
+
+    /// 当前动画的锚点允许范围。自检用。
+    pub fn limits(&self) -> Limits {
+        let Ok(entry) = self.manifest.require(&self.current) else {
+            return Limits {
+                x: (0.0, 0.0),
+                y: (0.0, 0.0),
+            };
+        };
+        self.limits_for(entry)
+    }
+
+    /// 在屏幕坐标 `(x, y)` 弹出右键菜单，返回应该做什么。
+    ///
+    /// 菜单内容就是功能边界的一次声明：这里**故意不放「隐藏」**——
+    /// 还没有托盘图标，藏起来就再也点不到了。
+    pub fn menu(&mut self, x: i32, y: i32) -> Result<Action> {
+        let topmost = self.win.is_topmost();
+        let mut menu = Menu::new()?;
+        menu.command(CMD_HOME, "回到屏幕底部")
+            .check(CMD_TOPMOST, "总在最前", topmost)
+            .separator()
+            .command(CMD_QUIT, "退出");
+        let Some(cmd) = menu.show_at(self.win.hwnd(), x, y)? else {
+            return Ok(Action::None);
+        };
+        match cmd {
+            CMD_HOME => {
+                self.back_to_home()?;
+                Ok(Action::Home)
+            }
+            CMD_TOPMOST => {
+                let next = !topmost;
+                self.win.set_topmost(next);
+                Ok(Action::Topmost(next))
+            }
+            CMD_QUIT => Ok(Action::Quit),
+            other => {
+                // 菜单里没有这一项：不静默吞掉，留条线索。
+                eprintln!("未知菜单命令 {other}，已忽略");
+                Ok(Action::None)
+            }
+        }
+    }
+
+    /// 给一个初速度让它自己滑/落。
+    ///
+    /// 只给调试模式（`--fling`）用：真机拖拽走 [`Self::on_button_up`]，
+    /// 路径一模一样，这个入口只是把「需要鼠标才能触发」这一步拆掉，
+    /// 让「物理真的在推窗口」可以被截屏取证。
+    pub fn start_fling(&mut self, vx: f32, vy: f32) {
+        self.motion = Some(Motion::fling(vx, vy));
+    }
+
+    /// 搬回工作区底部中央，并终止正在进行的滑行/下落。
+    pub fn back_to_home(&mut self) -> Result<()> {
+        self.anchor_x = (self.area.0 + self.area.2) / 2;
+        self.feet_y = self.area.3 - BOTTOM_GAP;
+        self.motion = None;
+        let entry = self.manifest.require(&self.current)?.clone();
+        self.place_window(&entry);
+        Ok(())
+    }
+
+    /// 按锚点摆放窗口。
+    fn place_window(&self, entry: &AnimEntry) {
+        let (x, y) = window_pos(
+            self.manifest.canvas.width,
+            entry,
+            self.anchor_x,
+            self.feet_y,
+        );
+        self.win.move_to(x, y);
+    }
+
+    /// 当前动画的锚点允许范围。
+    ///
+    /// 由「裁切几何 + 工作区」算出来：窗口左右边缘不能越过工作区，
+    /// 脚底的下界就是地面。区间可能退化（窗口比工作区还宽），
+    /// 这里直接压成中点——[`Motion::step`] 只拿它做比较，自己不会兜底。
+    fn limits_for(&self, entry: &AnimEntry) -> Limits {
+        // 锚点 → 窗口左边缘的距离。
+        let dx = self.manifest.canvas.width as f32 / 2.0 - entry.origin[0] as f32;
+        // 锚点 → 窗口上边缘的距离。
+        let dy = entry.baseline as f32;
+        let w = entry.width() as f32;
+        let ground = (self.area.3 - BOTTOM_GAP) as f32;
+        Limits {
+            x: ordered(self.area.0 as f32 + dx, self.area.2 as f32 - w + dx),
+            y: ordered(self.area.1 as f32 + dy, ground),
+        }
+    }
+
     fn current_count(&self) -> u32 {
         self.anims
             .get(&self.current)
@@ -337,5 +550,25 @@ impl Pet {
         );
         self.anims.insert(id.to_owned(), anim);
         Ok(())
+    }
+}
+
+/// 由锚点算出窗口左上角。
+///
+/// 所有「摆窗口」的地方必须走这里：同一个公式散落三份时，改动漏掉一处
+/// 就会变成 P1 那种「纵向错 46 像素」的 bug。
+fn window_pos(canvas_width: u16, entry: &AnimEntry, anchor_x: i32, feet_y: i32) -> (i32, i32) {
+    let x = anchor_x - canvas_width as i32 / 2 + entry.origin[0] as i32;
+    let y = feet_y - entry.baseline as i32;
+    (x, y)
+}
+
+/// 保证区间左小右大；退化（窗口比工作区还大）时压成中点。
+fn ordered(lo: f32, hi: f32) -> (f32, f32) {
+    if lo <= hi {
+        (lo, hi)
+    } else {
+        let mid = (lo + hi) / 2.0;
+        (mid, mid)
     }
 }

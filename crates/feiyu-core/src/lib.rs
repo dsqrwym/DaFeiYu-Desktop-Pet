@@ -7,6 +7,8 @@
 
 pub mod anim;
 pub mod brain;
+pub mod motion;
 
 pub use anim::{AnimEntry, AnimError, AnimHeader, AnimReader, Codec, FrameEntry, Manifest};
 pub use brain::{Brain, Mood, Stimulus};
+pub use motion::{fling_velocity, Limits, Motion};
