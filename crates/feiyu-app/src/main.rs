@@ -88,6 +88,10 @@ struct Args {
     /// 一启动就藏进托盘，但**消息泵照常跑**：验证「隐藏后托盘能不能点开」。
     /// `--hide` 不跑泵（那是量 CPU 用的），验不了点击。
     hide_now: bool,
+    /// 跑起来 n 秒之后再藏进托盘，**且不补定时器**——这才是菜单里点
+    /// 「隐藏到托盘」走的那条路径（`--hide-now` 会补一个 500ms 拍子，
+    /// 两者行为不完全一样，托盘问题必须用这条验）。
+    hide_after: Option<u32>,
     /// 正常跑 n 秒就优雅退出。观察随机动作、入睡这类「要等才会发生」的行为时用。
     run: Option<u32>,
     /// 把入睡等待钉成固定秒数（默认随机 18~38 秒）。
@@ -115,6 +119,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         tray: false,
         hide: None,
         hide_now: false,
+        hide_after: None,
         run: None,
         sleep_after: None,
         fling: None,
@@ -142,6 +147,14 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             "--menu" => out.menu = true,
             "--tray" => out.tray = true,
             "--hide-now" => out.hide_now = true,
+            "--hide-after" => {
+                out.hide_after = Some(
+                    it.next()
+                        .context("--hide-after 缺少数秒")?
+                        .parse()
+                        .context("--hide-after 需要整数秒")?,
+                )
+            }
             "--hide" => {
                 out.hide = Some(
                     it.next()
@@ -215,6 +228,7 @@ fn print_help() {
          \x20 --tray           挂上托盘图标跑 5 秒后退出（验证通知区用）\n\
          \x20 --hide <秒>      先跑 2 秒让动画推进，再藏进托盘挂 n 秒（量隐藏时的 CPU，不跑泵）\n\
          \x20 --hide-now       一启动就藏进托盘但照常跑泵（验证隐藏后托盘能不能点开）\n\
+         \x20 --hide-after <秒> 跑 n 秒后从泵内部藏进托盘且不补定时器（等价于菜单里点隐藏）\n\
          \x20 --run <秒>       正常跑 n 秒后优雅退出（观察随机动作、入睡这类慢行为）\n\
          \x20 --sleep-after <秒> 把入睡等待钉成固定值（默认随机 18~38 秒）\n\
          \x20 --fling <vx> <vy> 启动时给一个初速度（像素/秒，验证滑行与下落）\n\
@@ -409,8 +423,27 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     let mut captured = false;
     let mut last = pet.current().to_owned();
     let mut failure: Option<anyhow::Error> = None;
+    // `--hide-after`：跑一会儿之后从泵内部隐藏，行为等同于菜单里点「隐藏到托盘」
+    // （`hide()` 会停定时器，而且不会有人再把它开回来）。
+    let hide_after = args.hide_after;
+    let started = std::time::Instant::now();
+    let mut hid = false;
 
     pump(|ev| {
+        // 取证开关：把每个事件原样打出来。「托盘点了没反应」这类问题，
+        // 光看姿态日志分不出「消息没到」还是「到了但没反应」。
+        if std::env::var_os("FEIYU_EVENT_TRACE").is_some() {
+            println!("事件：{ev:?}");
+        }
+        if !hid && hide_after.is_some_and(|s| started.elapsed().as_secs() >= u64::from(s)) {
+            hid = true;
+            pet.hide();
+            println!(
+                "已藏进托盘（--hide-after，不补定时器）：窗口可见 = {}，藏着 = {}",
+                pet.is_visible(),
+                pet.hidden()
+            );
+        }
         if let Some(d) = deadline {
             if std::time::Instant::now() >= d {
                 println!("到时间了，退出（共提交 {} 帧）", pet.drawn());
@@ -488,7 +521,16 @@ fn menu_event(ev: Event, pet: &mut Pet, verbose: bool) -> bool {
     let (Event::RightClick { x, y } | Event::TrayRightClick { x, y }) = ev else {
         return false;
     };
-    match pet.menu(x, y) {
+    let started = std::time::Instant::now();
+    let outcome = pet.menu(x, y);
+    let waited = started.elapsed().as_millis();
+    // 取证开关：菜单到底返回了什么、在里面待了多久。
+    // 耗时≈ 0ms 且返回 None = 菜单根本没显示（被前台锁拒了）；
+    // 耗时到几百 ms 才返回 None = 菜单显示了，是外面那一下点击把它关掉的。
+    if std::env::var_os("FEIYU_EVENT_TRACE").is_some() {
+        println!("菜单返回：{outcome:?}（耗时 {waited}ms）");
+    }
+    match outcome {
         Ok(Action::Quit) => quit(),
         Ok(Action::Topmost(on)) => {
             if verbose {

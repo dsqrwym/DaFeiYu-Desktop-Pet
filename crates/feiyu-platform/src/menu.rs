@@ -12,10 +12,12 @@
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, PostMessageW, SetForegroundWindow, TrackPopupMenuEx,
-    HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetForegroundWindow, GetWindowLongPtrW,
+    GetWindowThreadProcessId, PostMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    TrackPopupMenuEx, GWL_EXSTYLE, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL, WS_EX_NOACTIVATE,
 };
 
 use crate::{Error, Result};
@@ -85,10 +87,32 @@ impl Menu {
         // TPMPARAMS 传 None 表示不做范围限制。
         unsafe {
             // 见模块注释：NOACTIVATE 窗口得自己顶到前台。
+            //
+            // 但光调 `SetForegroundWindow` 不够：带 `WS_EX_NOACTIVATE` 的窗口
+            // **永远成不了前台窗口**（这不是 bug，是那个扩展样式的定义）。
+            // 而 `TrackPopupMenu` 在窗口不是前台时会**立即取消、返回 0**、
+            // 菜单一帧都不显示——实测日志就是 `菜单返回：Ok(None)`。
+            // 所以弹之前临时把这个位摘掉，弹完立刻还原：平时点鱼仍然不抢焦点。
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_NOACTIVATE.0 as isize));
+            // 只调 `SetForegroundWindow` 还不够：系统有「前台锁」，别的进程正
+            // 在前台时这个请求会被默默丢弃（返回 false，菜单依旧立刻取消）。
+            // 标准做法是把本线程的输入队列暂时挂到当前前台线程上，改完再拆了。
+            let fg = GetForegroundWindow();
+            let fg_thread = GetWindowThreadProcessId(fg, None);
+            let me = GetCurrentThreadId();
+            let attached = fg_thread != 0
+                && fg_thread != me
+                && AttachThreadInput(me, fg_thread, true).as_bool();
             let _ = SetForegroundWindow(hwnd);
             let flags = TPM_RETURNCMD | TPM_RIGHTBUTTON;
             let picked = TrackPopupMenuEx(self.handle, flags.0, x, y, hwnd, None);
             let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+            if attached {
+                let _ = AttachThreadInput(me, fg_thread, false);
+            }
+            // 无论菜单怎么结束，都要把样式还原——漏了这一步，桌宠从此会抢焦点。
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
             // 没选就是 0；TPM_RETURNCMD 下返回值直接是 id。
             Ok((picked.0 > 0).then_some(picked.0 as CommandId))
         }
