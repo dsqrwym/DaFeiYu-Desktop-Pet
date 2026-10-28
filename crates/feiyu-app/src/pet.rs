@@ -119,6 +119,27 @@ const WAKE_ROLL_CHANCE: f32 = 0.10;
 /// 比 `WAKE_ROLL_EVERY` 略短：要的是「持续在动」，偶尔碰一下鼠标不算。
 const INPUT_FRESH_MS: u32 = 700;
 
+/// 接缝两侧的平均像素差超过这个值，就不硬切，改成几帧淡过去。
+///
+/// 标尺是素材自己（`target/seam_probe.ps1` 逐对比整段）：
+///
+/// | 动画 | 相邻帧均值 / 峰值 | 循环接缝 | 比接缝更大的自然步 |
+/// |---|---|---|---|
+/// | idle | 4.14 / 17.11 | 15.43 | 3 步 |
+/// | drag | 4.49 / 36.72 | 14.86 | 10 步 |
+/// | sleep | 2.12 / 8.50 | **8.45** | **1 步** |
+///
+/// 阈值取 6.0 而不是「比峰值还大」：睡眠段那个接缝几乎就是整段素材里最狠的一步，
+/// 不淡就会被看成「抽一下」；而 idle/drag 的接缝虽然落在自然范围里，但也是偏大的那几帧。
+const SEAM_DISSOLVE_MAD: f32 = 6.0;
+
+/// 接缝淡入用几帧。6 帧 ≈ 250ms：每步只走接缝的 1/6，
+/// 8.45 的硬跳变成 1.4/帧，落回素材自身的噪声里（睡眠段相邻帧平均 2.12）。
+///
+/// 代价是这 6 拍里**帧号不动**；接缝全在「Z 没冒 / 已散尽、身姿几乎静止」
+/// 的时刻，所以看不出停顿。
+const SEAM_DISSOLVE_FRAMES: u32 = 6;
+
 type Anim = AnimReader<BufReader<File>>;
 
 /// 右键菜单选完之后要做什么。
@@ -137,6 +158,28 @@ pub enum Action {
     Hidden(bool),
     /// 用户要退出。
     Quit,
+}
+
+/// 循环接缝的淡入。
+///
+/// 素材里**找不到**「回绕时一模一样」的两帧：整段是画家一口气演完的
+/// 10 秒，身体一直在缓慢起伏，任何时间段都会差着一两像素。所以接缝不硬切，
+/// 用几帧把旧画面淡成新画面——每一步只走接缝的 1/6，眼睛归成「正常在动」。
+struct Dissolve {
+    /// 接缝前一帧的像素（预乘 BGRA，和 `LayeredWindow::draw` 吃的一样）。
+    from: Vec<u8>,
+    /// 混合结果。复用，免得到接缝时又申请四百 KB。
+    out: Vec<u8>,
+    /// 已淡到第几帧 / 一共几帧。
+    done: u32,
+    total: u32,
+}
+
+impl Dissolve {
+    /// 混合进度：`from` 占 `1 - t`，新帧占 `t`。
+    fn t(&self) -> (u32, u32) {
+        (self.done.min(self.total), self.total.max(1))
+    }
 }
 
 /// 一只桌宠的全部运行时状态。
@@ -180,6 +223,8 @@ pub struct Pet {
     /// 睡觉用它（睡着后只在打呼那一段里转，不会自己演到「醒来」），
     /// 拖拽也用它（跳过素材开头那段还站在地上的画面）。
     loop_span: Option<(u32, u32)>,
+    /// 正在淡化循环接缝。`Some` 时帧号停住，画面上是两帧的混合。
+    dissolve: Option<Dissolve>,
     /// 固定入睡等待（秒）。`None` = 每次回待机都随机抽。
     /// 只有 `--sleep-after` 会设它：观察入睡/自然醒这种「要等十几秒才会发生」的行为时
     /// 不能每次都靠运气。
@@ -260,6 +305,7 @@ impl Pet {
             down_at: None,
             landed_at: None,
             loop_span: None,
+            dissolve: None,
             sleep_cycle: None,
             rng: Rng::from_time(),
             pool,
@@ -435,6 +481,11 @@ impl Pet {
         self.loop_span
     }
 
+    /// 是否正在淡化循环接缝。自检用：它不生效的话回绕又会变成硬切。
+    pub fn seam_dissolving(&self) -> bool {
+        self.dissolve.is_some()
+    }
+
     /// 重设「多久不互动就睡」。给自检和将来的设置项用。
     pub fn set_sleep_after(&mut self, secs: f32) {
         self.brain.set_sleep_after(secs);
@@ -490,8 +541,10 @@ impl Pet {
         self.frame = 0;
         self.acc = 0.0;
         // 换段就丢掉上一段的区间限制：否则从「睡着」切到「开心」时，
-        // 新动画会莫名其妙只播前 70%。
+        // 新动画会莫名其妙只播前 70%。淡入也是上一段的事，一并丢掉——
+        // 不然新段的头几帧会跟旧段的画面混在一起。
         self.loop_span = None;
+        self.dissolve = None;
         self.sleep_cycle = None;
         // 先摆位置再画：`UpdateLayeredWindow` 带尺寸时**保留左上角**，
         // 所以新尺寸的帧若是宽高变大的，必须先落位，否则会从旧左上角长出去。
@@ -679,22 +732,34 @@ impl Pet {
         self.stimulate(Stimulus::Click)
     }
 
-    /// 开始一次「醒来」：播 Z 消散后的睁眼起身段（实测帧 170~240），播完回待机。
+    /// 开始一次「醒来」：从**当前帧**接着演到最后一帧，播完回待机。
     ///
     /// 不直接 `stimulate(Click)`：那会切到 `click_happy`，观众看到的是
     /// 鱼从躺着一下跳到站着笑，像被剪了一帧。素材里本来就有睁眼起身的过程，
     /// 不花额外成本就能把它演完。
+    ///
+    /// 也不能从固定的第 170 帧起播（旧实现）：睡着时 Z 正挂在中间，一下跳到
+    /// Z 已经消失的 170，画面差实测 11.7——比循环接缝还大一倍，用户说的「闪一下」
+    /// 就是它。从当前帧往后演，Z 会在 149~173 自己飘散掉，一帧都没跳过。
     ///
     /// 睡到一半（`Falling`，还闭着眼往下沉）被点则直接醒：那时跳到起身段反而突兀。
     fn wake_up(&mut self) -> Result<()> {
         if self.waking || self.brain.mood() != Mood::Sleep {
             return Ok(());
         }
+        // 当前帧换成比例：`span_to_frames` 的 round 是精确的，传进去多少换回来还是多少。
+        let count = self.current_count();
+        let from = match count.checked_sub(1) {
+            Some(last) if last > 0 => self.frame.min(last) as f32 / last as f32,
+            _ => 0.0,
+        };
         match self.sleep_cycle.as_mut() {
-            Some(cycle) if cycle.stage() == SleepStage::Asleep => cycle.start_waking(),
+            Some(cycle) if cycle.stage() == SleepStage::Asleep => cycle.start_waking(from),
             _ => return self.stimulate(Stimulus::Awaken),
         }
         self.apply_sleep_span();
+        // 正在淡接缝时被点醒：淡入的两端已经不相关了，直接收掉。
+        self.dissolve = None;
         self.frame = self.loop_span.map_or(0, |(lo, _)| lo);
         self.waking = true;
         // 复用「播完一圈就收尾」那条路：醒来段不回绕，一落到段尾就交回 `step_frames`。
@@ -773,6 +838,7 @@ impl Pet {
             current,
             frame,
             drawn,
+            dissolve,
             ..
         } = self;
         let anim = anims
@@ -782,8 +848,21 @@ impl Pet {
         let pixels = anim
             .frame(idx)
             .with_context(|| format!("解 {current} 第 {idx} 帧失败"))?;
-        win.draw(entry.width() as u32, entry.height() as u32, pixels)
-            .context("提交画面失败")?;
+        match dissolve {
+            // 接缝淡入：把上一轮刚放完的那帧和这一帧按进度混合。
+            //
+            // `done == 0` 这一拍也要走这里（混合比例 0 = 纯旧帧）：接缝那一下
+            // 必须先画出「刚过去的那帧」，否则顺序会变成「硬切到新帧 → 再弹回旧帧」，
+            // 比不淡还跳。
+            Some(d) => {
+                let (num, den) = d.t();
+                blend_frame(&d.from, pixels, num, den, &mut d.out);
+                win.draw(entry.width() as u32, entry.height() as u32, &d.out)?;
+            }
+            _ => {
+                win.draw(entry.width() as u32, entry.height() as u32, pixels)?;
+            }
+        }
         *drawn += 1;
         Ok(())
     }
@@ -1031,8 +1110,17 @@ impl Pet {
     /// 没有被限定区间时就是普通的整段循环；被限定（睡觉）时只在段内转，
     /// 段播完再问一次睡眠编排要不要换段——这是「睡着后不再自己醒来」的实现点。
     fn advance_frame(&mut self, step: u32, count: u32) {
+        // 正在淡接缝：帧号先停住，把淡入推进一步就完事。
+        // 这几帧画面上是「旧帧 → 新帧」的混合，两端都不变才能算出稳定的过渡。
+        if self.step_dissolve() {
+            return;
+        }
         let Some((lo, hi)) = self.loop_span else {
-            self.frame = (self.frame + step) % count;
+            let next = (self.frame + step) % count;
+            if next < self.frame {
+                self.start_seam_dissolve(self.frame, next);
+            }
+            self.frame = next;
             return;
         };
         if lo > hi || hi >= count {
@@ -1057,11 +1145,79 @@ impl Pet {
             .as_mut()
             .is_some_and(|c| c.on_segment_end())
         {
+            // 换段时把帧号**夹进**新区间，而不是一律拨回段首：
+            // 入睡段停在 133，而 133 本来就在打呼段的 76~174 里，
+            // 拨回 76 等于倒退 57 帧（Z 会缩一下）。
             self.apply_sleep_span();
-            self.frame = self.loop_span.map_or(lo, |(a, _)| a);
+            if let Some((a, b)) = self.loop_span {
+                self.frame = self.frame.clamp(a, b);
+            } else {
+                self.frame = lo;
+            }
         } else {
-            self.frame = lo + (next - hi - 1) % span;
+            let next_frame = lo + (next - hi - 1) % span;
+            // 段尾接段首：整个播放器里唯一一次大跳。跳得狠就淡过去。
+            self.start_seam_dissolve(self.frame, next_frame);
+            self.frame = next_frame;
         }
+    }
+
+    /// 推进一拍接缝淡入。返回 `true` 表示这一拍帧号不动。
+    fn step_dissolve(&mut self) -> bool {
+        let Some(d) = self.dissolve.as_mut() else {
+            return false;
+        };
+        d.done += 1;
+        if d.done >= d.total {
+            // 淡完了：最后一帧就是新帧本身（`draw_frame` 会原样画出来）。
+            self.dissolve = None;
+        }
+        true
+    }
+
+    /// 段尾要接回段首时调一次：接缝够硬就准备淡过去。
+    ///
+    /// `from` 是刚放完的那一帧，`to` 是下一拍要显示的那一帧。
+    fn start_seam_dissolve(&mut self, from: u32, to: u32) {
+        // 醒来段播完也要回绕，但那是「醒完了」，接下来就回待机：
+        // 淡化只会把「站起来」的最后一步糊掉。
+        if self.waking {
+            return;
+        }
+        let Some(prev) = self.snapshot_frame(from) else {
+            return;
+        };
+        let Some(next) = self.snapshot_frame(to) else {
+            return;
+        };
+        if seam_mad(&prev, &next) < SEAM_DISSOLVE_MAD {
+            return;
+        }
+        // 取证开关：接缝是不是真的被淡过去了。只盯屏幕的话，
+        // 「接缝落在素材自己也有的大步里」时根本分不出到底有没有淡。
+        if std::env::var_os("FEIYU_SEAM_TRACE").is_some() {
+            eprintln!(
+                "接缝 {} → {}（{}）：mad {:.2}，{} 帧淡过去",
+                from,
+                to,
+                self.current,
+                seam_mad(&prev, &next),
+                SEAM_DISSOLVE_FRAMES
+            );
+        }
+        self.dissolve = Some(Dissolve {
+            from: prev,
+            out: next,
+            done: 0,
+            total: SEAM_DISSOLVE_FRAMES,
+        });
+    }
+
+    /// 取某一帧的像素副本。接缝要用它把「刚过去的那个画面」留在手里。
+    fn snapshot_frame(&mut self, idx: u32) -> Option<Vec<u8>> {
+        let anim = self.anims.get_mut(&self.current)?;
+        let idx = idx % anim.frame_count().max(1);
+        anim.frame(idx).ok().map(<[u8]>::to_vec)
     }
 
     /// 把刺激交给状态机；姿态真的变了才换动画。
@@ -1135,6 +1291,39 @@ fn window_pos(canvas_width: u16, entry: &AnimEntry, anchor_x: i32, feet_y: i32) 
     (x, y)
 }
 
+/// 两帧的平均像素差。用来判断一个循环接缝硬不硬。
+///
+/// 每 16 个字节采一个样（一行 384 像素 = 1536 字节，即一行采 96 点），
+/// 二十四万多个采样点，四百 KB 的帧算一遍不到 0.1ms——只在接缝处跑一次。
+fn seam_mad(a: &[u8], b: &[u8]) -> f32 {
+    let (mut sum, mut n) = (0u64, 0u64);
+    for (x, y) in a.iter().zip(b).step_by(16) {
+        sum += u64::from((*x).abs_diff(*y));
+        n += 1;
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum as f32 / n as f32
+    }
+}
+
+/// 把 `from` 和 `to` 按 `num/den` 线性混合，写进 `out`。
+///
+/// 帧像素是**预乘** BGRA，逐通道线性插值就是正确的那种混合（预乘之后
+/// 透明度已经乘进颜色里，插值不会出现半透明边缘发黑）。
+fn blend_frame(from: &[u8], to: &[u8], num: u32, den: u32, out: &mut Vec<u8>) {
+    let den = den.max(1);
+    let num = num.min(den);
+    out.clear();
+    out.extend(to.iter().enumerate().map(|(i, b)| {
+        // 长度不一致时（换了素材还没重画）就以新帧为准，不越界。
+        let a = u32::from(from.get(i).copied().unwrap_or(*b));
+        let b = u32::from(*b);
+        ((a * (den - num) + b * num) / den) as u8
+    }));
+}
+
 /// 保证区间左小右大；退化（窗口比工作区还大）时压成中点。
 fn ordered(lo: f32, hi: f32) -> (f32, f32) {
     if lo <= hi {
@@ -1142,5 +1331,54 @@ fn ordered(lo: f32, hi: f32) -> (f32, f32) {
     } else {
         let mid = (lo + hi) / 2.0;
         (mid, mid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 混合的两端必须精确落在原帧上：`t=0` 是接缝前那帧，`t=1` 是新帧。
+    /// 任一端偏一点，接缝处就还是能看到一下跳。
+    #[test]
+    fn blend_hits_both_ends_exactly() {
+        let from = [0u8, 10, 200, 255];
+        let to = [200u8, 10, 0, 255];
+        let mut out = Vec::new();
+
+        blend_frame(&from, &to, 0, 6, &mut out);
+        assert_eq!(out, from.to_vec(), "t=0 必须原样画出旧帧");
+
+        blend_frame(&from, &to, 6, 6, &mut out);
+        assert_eq!(out, to.to_vec(), "t=1 必须原样画出新帧");
+
+        blend_frame(&from, &to, 3, 6, &mut out);
+        assert_eq!(out, vec![100, 10, 100, 255], "中间取中点");
+    }
+
+    /// 长度不一致时以新帧为准，不许越界、不许 panic。
+    #[test]
+    fn blend_survives_size_mismatch() {
+        let from = [1u8, 2];
+        let to = [7u8, 8, 9];
+        let mut out = Vec::new();
+        blend_frame(&from, &to, 0, 4, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2], 9, "缺的那一端直接取新帧");
+    }
+
+    /// 同一帧的差必须是 0；差得越多读数越大——阈值 6.0 才靠得住。
+    #[test]
+    fn seam_mad_measures_distance() {
+        let a: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        assert_eq!(seam_mad(&a, &a), 0.0);
+
+        let mut b = a.clone();
+        for (i, v) in b.iter_mut().enumerate() {
+            if i % 2 == 0 {
+                *v = v.saturating_sub(32);
+            }
+        }
+        assert!(seam_mad(&a, &b) > SEAM_DISSOLVE_MAD, "差 32 已经远超阈值");
     }
 }

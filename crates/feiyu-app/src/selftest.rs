@@ -520,36 +520,88 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     );
 
     let span_falling = pet.loop_span();
-    // 入睡段 0~133：推 140 帧足够演完并跨进打呼段。
-    pet.advance_frames(140)?;
+    // 入睡段 0~133：一步步推到段尾，看它换段时会不会把帧号拨回去。
+    pet.advance_frames(133)?;
+    r.check(
+        &format!("入睡段演到最后一帧（第 {} 帧）", pet.frame()),
+        pet.frame() == 133,
+    );
+    pet.advance_frames(1)?;
     let span_asleep = pet.loop_span();
     r.check(
-        &format!("入睡段 {span_falling:?} 演完转入打呼段 {span_asleep:?}"),
-        span_falling == Some((0, 133)) && span_asleep == Some((116, 148)),
+        &format!(
+            "入睡段 {span_falling:?} 演完转入打呼段 {span_asleep:?}（接上第 {} 帧）",
+            pet.frame()
+        ),
+        // 换段时帧号 133 本来就在 76~174 里，拨回 76 会倒退 57 帧——Z 会缩一下。
+        span_falling == Some((0, 133)) && span_asleep == Some((76, 174)) && pet.frame() == 133,
     );
-    // 打呼段的起点必须在 Z 已经冒出来之后：
-    // 像素统计显示 Z 从第 80 帧才开始出现，区间落在那里就会循环出几帧空白。
+    // 打呼段要包住完整的 Z：从「Z 还没冒」到「Z 已散尽」。
+    // 76 之前没有气泡，174 之后也没有——这样回绕时没有任何东西跳位置。
     r.check(
         &format!(
-            "打呼段起点 {} 在 Z 出现（第 80 帧）之后",
-            span_asleep.map_or(0, |(lo, _)| lo)
+            "打呼段 {}~{} 两端都没有 Z（Z 在 76~174）",
+            span_asleep.map_or(0, |(lo, _)| lo),
+            span_asleep.map_or(0, |(_, hi)| hi)
         ),
-        span_asleep.is_some_and(|(lo, _)| lo >= 80),
+        span_asleep.is_some_and(|(lo, hi)| lo <= 76 && hi >= 174),
     );
 
     // 关键一条：睡着后无论过多久，都不能演到帧 210+ 那段「睁眼醒来」。
+    // 顺带钉住「段内不跳帧」：帧号只能一帧一帧往前走，唯一允许的大跳是
+    // 段尾 → 段首这一下回绕（那是排好的接缝，不是 bug）。
     let (lo, hi) = span_asleep.unwrap_or((0, 0));
     let mut escaped = 0u32;
-    for _ in 0..1000 {
-        pet.advance_frames(7)?;
+    let mut bad_jump = 0u32;
+    let mut wraps = 0u32;
+    let mut faded = 0u32;
+    let mut hard_cut = 0u32;
+    let mut faded_frames = 0u32;
+    let mut prev = pet.frame();
+    for _ in 0..7000 {
+        pet.advance_frames(1)?;
         let f = pet.frame();
         if f < lo || f > hi {
             escaped += 1;
         }
+        if f < prev {
+            // 只可能是回绕：必须从段尾直接回到段首。
+            wraps += 1;
+            if !(prev == hi && f == lo) {
+                bad_jump += 1;
+            }
+            // 回绕这一下必须已经在淡化：否则就是硬切，接缝又会被看见。
+            if pet.seam_dissolving() {
+                faded += 1;
+            } else {
+                hard_cut += 1;
+            }
+        }
+        if pet.seam_dissolving() {
+            faded_frames += 1;
+        }
+        prev = f;
     }
     r.check(
         &format!("睡着后 7000 帧都留在打呼段 {lo}~{hi}（越界 {escaped} 次）"),
         escaped == 0,
+    );
+    r.check(
+        &format!(
+            "千帧推进没出现意外跳帧（回绕 {wraps} 次，全部是 {hi} → {lo}，异常 {bad_jump} 次）"
+        ),
+        bad_jump == 0 && wraps > 0,
+    );
+    r.check(
+        &format!("每次回绕都走了接缝淡入（淡 {faded} 次，硬切 {hard_cut} 次）"),
+        hard_cut == 0 && faded == wraps && wraps > 0,
+    );
+    r.check(
+        &format!(
+            "淡入期间帧号停住不往前跑（共 {faded_frames} 帧，约 {:.0} 帧/次）",
+            faded_frames as f32 / wraps.max(1) as f32
+        ),
+        faded_frames > 0,
     );
 
     // 鼠标划过只推迟入睡，不许叫醒。
@@ -560,19 +612,29 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     );
 
     // 但点一下必须醒——而且要先播「睁眼起身」，不能一下子站到开心。
+    // 而且必须从**当前那一帧**接着播：跳到固定的 170 帧会让 Z 凭空消失
+    // （画面差实测 11.7），用户看到的就是「闪一下」。
+    let sleep_frame = pet.frame();
     pet.on_event(Event::MouseDown { x: 10, y: 10 })?;
     pet.on_event(Event::MouseUp { x: 10, y: 10 })?;
     let wake_span = pet.loop_span();
     r.check(
-        &format!("点一下就播醒来段（{wake_span:?}，心情 {:?}）", pet.mood()),
-        wake_span.is_some_and(|(lo, hi)| lo >= 169 && hi == 240) && pet.mood() == Some(Mood::Sleep),
+        &format!(
+            "点一下就从第 {sleep_frame} 帧接着播醒来段（{wake_span:?}，心情 {:?}）",
+            pet.mood()
+        ),
+        wake_span == Some((sleep_frame, 240))
+            && pet.frame() == sleep_frame
+            && pet.mood() == Some(Mood::Sleep),
     );
 
-    // 醒来段 71 帧演完：回待机，不留在睡眠区间里，也不走到 click_happy。
-    let woke_up = pet.advance_frames(71)?;
+    // 醒来段的长度随「点了多晚」变：睡在 116 帧醒来要演 125 帧，停在 148 则只需 93 帧。
+    // 写完就回待机，不留在睡眠区间里，也不走到 click_happy。
+    let wake_len = 240 - wake_span.map_or(0, |(lo, _)| lo) + 1;
+    let woke_up = pet.advance_frames(wake_len)?;
     r.check(
         &format!(
-            "醒来段演完回待机（{}，心情 {:?}，区间 {:?}）",
+            "醒来段演 {wake_len} 帧后回待机（{}，心情 {:?}，区间 {:?}）",
             pet.current(),
             pet.mood(),
             pet.loop_span()
