@@ -85,6 +85,8 @@ const CMD_HOME: CommandId = 1;
 const CMD_TOPMOST: CommandId = 2;
 const CMD_QUIT: CommandId = 3;
 const CMD_HIDE: CommandId = 4;
+/// 「跟随鼠标」（= 转向跟随）开关。
+const CMD_FOLLOW: CommandId = 5;
 
 /// 托盘图标的悬停提示。
 const TRAY_TIP: &str = "飞鱼";
@@ -258,6 +260,11 @@ fn clip(id: &str) -> Option<&'static ClipSpec> {
     CLIPS.iter().find(|c| c.id == id)
 }
 
+/// 两次「转头看鼠标」之间的最小间隔（秒）。
+///
+/// 没冷却的话鼠标在"一个肥鱼宽"的边界上抖一下，鱼就会一直扭头。
+const LOOK_COOLDOWN: f32 = 4.0;
+
 /// 自己走一趟走多远（屏幕像素）。
 ///
 /// 太短看不出在走，太长会一路撞到工作区边上；再长也会被边界夹住。
@@ -322,6 +329,8 @@ pub enum Action {
     Home,
     /// 「总在最前」切换后的新状态。
     Topmost(bool),
+    /// 「跟随鼠标」切换后的新状态。
+    Follow(bool),
     /// 隐藏状态切换后的新状态（`true` = 已藏进托盘）。
     Hidden(bool),
     /// 用户要退出。
@@ -431,8 +440,12 @@ pub struct Pet {
     action_playing: bool,
     /// 正在自己走一段（只有待机小动作里的 `move_*` 会起它）。
     walk: Option<Walk>,
-    /// 跟随鼠标：待机时离鼠标太远就走过去（上游 Python 的 follow 模式）。
+    /// 跟随鼠标：待机时鼠标**离开**「一个肥鱼宽」的范围就转头看它。
     follow: bool,
+    /// 上一拍鼠标是不是在鱼的范围里（用来判断「刚离开」）。
+    was_near: bool,
+    /// 上次转头的时刻（冷却，免得来回扭头）。
+    look_cd: Instant,
     /// 当前这一帧要不要水平镜像。
     ///
     /// 走路时用：素材只有一套朝向，往反方向走必须镜像，否则就是倒着走。
@@ -521,6 +534,9 @@ impl Pet {
             action_playing: false,
             walk: None,
             follow: false,
+            was_near: false,
+            // 初始就当成「很久以前」：否则刚启动的 4 秒内第一次转头会被冷却拦下。
+            look_cd: Instant::now() - std::time::Duration::from_secs(60),
             flip: false,
             flip_buf: Vec::new(),
             waking: false,
@@ -844,16 +860,12 @@ impl Pet {
             }
         }
 
-        // 跟随鼠标：待机时离鼠标太远就走过去。
-        // 上游 Python 的 follow 模式也是「整只走过去」，不是只转眼球。
-        if self.follow
-            && self.forced.is_none()
-            && self.brain.mood() == Mood::Idle
-            && !self.action_playing
-            && self.walk.is_none()
-        {
+        // 跟随鼠标 = **转向跟随**：鼠标离开「一个肥鱼宽」的范围时，转头看一眼
+        // 那个方向。不是一直盯着鼠标——它本身就是一次小动作（turn），
+        // 所以会被随机动作占住，也会占住随机动作（`action_playing`）。
+        if self.follow && self.forced.is_none() && self.brain.mood() == Mood::Idle {
             if let Some((mx, _)) = feiyu_platform::cursor_pos() {
-                self.walk_toward(mx);
+                self.poll_look(mx);
             }
         }
 
@@ -1217,6 +1229,7 @@ impl Pet {
         let mut menu = Menu::new()?;
         menu.command(CMD_HIDE, self.hide_label())
             .command(CMD_HOME, "回到屏幕底部")
+            .check(CMD_FOLLOW, "跟随鼠标", self.follow)
             .check(CMD_TOPMOST, "总在最前", topmost)
             .separator()
             .command(CMD_QUIT, "退出");
@@ -1237,6 +1250,11 @@ impl Pet {
             CMD_HOME => {
                 self.back_to_home()?;
                 Ok(Action::Home)
+            }
+            CMD_FOLLOW => {
+                let next = !self.follow;
+                self.follow = next;
+                Ok(Action::Follow(next))
             }
             CMD_TOPMOST => {
                 // 重读一次而不是拿弹菜单前的快照：菜单是模态的，
@@ -1509,8 +1527,12 @@ impl Pet {
         started
     }
 
-    /// 朝屏幕上的某个 x 走过去（跟随鼠标用）。返回是否真的开始走。
-    pub fn walk_toward(&mut self, x: i32) -> bool {
+    /// 朝屏幕上的某个 x 走过去。返回是否真的开始走。
+    ///
+    /// 暂时没入口：`--follow` 按用户要求改成了**转向跟随**（转头看，不挪步）。
+    /// 留着这个方法，将来要「走到鼠标旁边」时接线即可。
+    #[allow(dead_code)]
+    fn walk_toward(&mut self, x: i32) -> bool {
         let dx = (x - self.anchor_x) as f32;
         // 已经在它旁边了就别再挪：鼠标停在鱼身上时不该一直抖。
         if dx.abs() < 60.0 {
@@ -1524,6 +1546,53 @@ impl Pet {
             self.action_playing = true;
         }
         started
+    }
+
+    /// 当前动画的帧宽（判断「一个肥鱼宽」的范围用）。
+    fn current_width(&self) -> i32 {
+        self.manifest
+            .require(&self.current)
+            .map(|e| e.width() as i32)
+            .unwrap_or(200)
+    }
+
+    /// 转头看一边：播一遍 `turn`（整段：正面→侧面→背面→正面）。
+    ///
+    /// 素材默认先往一侧转；鼠标在左就镜像过去。演完由 `step_frames` 收回待机。
+    fn play_turn(&mut self, towards_left: bool) -> bool {
+        if self.play("turn").is_err() {
+            return false;
+        }
+        self.action_playing = true;
+        self.flip = towards_left;
+        let _ = self.draw_frame();
+        true
+    }
+
+    /// 用给定的鼠标 x 跑一次「转向跟随」判定，返回是否转头了。
+    ///
+    /// `tick` 用真实光标调它；自检用假坐标调它——鼠标没法在测试里"移开"。
+    pub(crate) fn poll_look(&mut self, cursor_x: i32) -> bool {
+        let width = self.current_width().max(80);
+        let dx = cursor_x - self.anchor_x;
+        let near = dx.abs() <= width;
+        // 只在「刚离开」那一拍、而且它在待机时才转头。
+        let mut turned = false;
+        if self.was_near
+            && !near
+            && !self.action_playing
+            && self.look_cd.elapsed().as_secs_f32() >= LOOK_COOLDOWN
+        {
+            self.look_cd = Instant::now();
+            turned = self.play_turn(dx < 0);
+        }
+        self.was_near = near;
+        turned
+    }
+
+    /// 把转头冷却清零。只给自检用（否则测一次要真等 4 秒）。
+    pub(crate) fn reset_look_cooldown(&mut self) {
+        self.look_cd = Instant::now() - std::time::Duration::from_secs(60);
     }
 
     /// 参数表里这段的说明。`--showcase` 与自检用。

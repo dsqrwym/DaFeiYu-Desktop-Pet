@@ -94,7 +94,7 @@ struct Args {
     hide_after: Option<u32>,
     /// 逐段演示：每段播几秒，并把「该看到什么」打出来给人对照。
     showcase: bool,
-    /// 跟随鼠标：待机时朝鼠标走过去（对齐上游 Python 的 follow 模式）。
+    /// 跟随鼠标（**转向跟随**）：待机时鼠标离开「一个肥鱼宽」的范围就转头看它。
     follow: bool,
     /// 帧率覆写（素材是 24fps；调低显得更像手绘，调高更跟手）。
     fps: Option<f32>,
@@ -249,7 +249,7 @@ fn print_help() {
          \x20 --hide-now       一启动就藏进托盘但照常跑泵（验证隐藏后托盘能不能点开）\n\
          \x20 --hide-after <秒> 跑 n 秒后从泵内部藏进托盘且不补定时器（等价于菜单里点隐藏）\n\
          \x20 --showcase       逐段演示：每段播完整一圈，并把「该看到什么」打出来\n\
-         \x20 --follow         跟随鼠标：待机时朝鼠标走过去\n\
+         \x20 --follow         跟随鼠标（转向）：鼠标离开一个鱼身宽就转头看它\n\
          \x20 --fps <数值>     覆写帧率（默认用清单里的 24）\n\
          \x20 --run <秒>       正常跑 n 秒后优雅退出（观察随机动作、入睡这类慢行为）\n\
          \x20 --sleep-after <秒> 把入睡等待钉成固定值（默认随机 18~38 秒）\n\
@@ -602,6 +602,11 @@ fn menu_event(ev: Event, pet: &mut Pet, verbose: bool) -> bool {
         Ok(Action::Topmost(on)) => {
             if verbose {
                 println!("总在最前：{}", if on { "开" } else { "关" });
+            }
+        }
+        Ok(Action::Follow(on)) => {
+            if verbose {
+                println!("跟随鼠标：{}", if on { "开" } else { "关" });
             }
         }
         Ok(Action::Hidden(on)) => {

@@ -308,7 +308,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
             "右键菜单能构造（{items_desc}，首项「{}」）",
             pet.hide_label()
         ),
-        items.as_ref().is_ok_and(|n| *n == 5),
+        items.as_ref().is_ok_and(|n| *n == 6),
     );
 
     // ---- 托盘图标用「此刻那一帧」：必须真的跟着动画走 ----
@@ -787,6 +787,28 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         ),
         no_desc.is_empty(),
     );
+
+    // ---- 转向跟随：鼠标从「鱼身上」移到「一个鱼身宽以外」时转一次头 ----
+    // 用户的两条要求：①鼠标在鱼旁边不转；②只有「离开了」才转，且只转一次。
+    // 先把上一段走路演完（`poll_look` 在 `action_playing` 期间不抢戏）。
+    let _ = pet.advance_frames(220)?;
+    pet.back_to_home()?;
+    pet.set_follow(true);
+    pet.reset_look_cooldown();
+    let near_x = pet.anchor_x();
+    let far_x = near_x + 900;
+    let not_turned = pet.poll_look(near_x);
+    let turned = pet.poll_look(far_x);
+    let again = pet.poll_look(far_x + 50); // 已经在外面了，不该再转
+    r.check(
+        &format!(
+            "鼠标移出鱼身宽后转头一次（{}，镜像 = {}）",
+            pet.current(),
+            pet.flipped()
+        ),
+        !not_turned && turned && !again && pet.current() == "turn",
+    );
+    pet.set_follow(false);
 
     drop(pet);
     Ok(())
