@@ -209,6 +209,22 @@ const CLIPS: &[ClipSpec] = &[
         on_enter: OnEnter::Plain,
     },
     ClipSpec {
+        id: "click_shy",
+        desc: "点击回应-害羞惊讶（暂未接：点击目前只给开心/生气），整段循环，位置不动",
+        weight: 0,
+        span: None,
+        walk: None,
+        on_enter: OnEnter::Plain,
+    },
+    ClipSpec {
+        id: "move_run",
+        desc: "原地左转奔跑（第 120 帧是趴在地上的，所以只演示、不用于走路）",
+        weight: 0,
+        span: None,
+        walk: None,
+        on_enter: OnEnter::Plain,
+    },
+    ClipSpec {
         id: "turn",
         desc: "原地转身：正面 → 侧面 → 背面 → 正面，位置不动",
         weight: 5,
@@ -349,6 +365,11 @@ struct Walk {
     dir: f32,
     /// 每帧走多少像素。
     per_frame: f32,
+    /// 已经走到哪（**浮点**累加，只在摆窗口时才取整）。
+    ///
+    /// 必须浮点：短距离时每帧才 0.4 像素，逐帧 `round()` 会被舍成 0，
+    /// 结果就是「原地踏步、窗口不动」。
+    x: f32,
 }
 
 /// 一只桌宠的全部运行时状态。
@@ -410,6 +431,8 @@ pub struct Pet {
     action_playing: bool,
     /// 正在自己走一段（只有待机小动作里的 `move_*` 会起它）。
     walk: Option<Walk>,
+    /// 跟随鼠标：待机时离鼠标太远就走过去（上游 Python 的 follow 模式）。
+    follow: bool,
     /// 当前这一帧要不要水平镜像。
     ///
     /// 走路时用：素材只有一套朝向，往反方向走必须镜像，否则就是倒着走。
@@ -497,6 +520,7 @@ impl Pet {
             next_action_at: 0.0,
             action_playing: false,
             walk: None,
+            follow: false,
             flip: false,
             flip_buf: Vec::new(),
             waking: false,
@@ -732,9 +756,9 @@ impl Pet {
         self.flip
     }
 
-    /// 参数表：(id, 说明, 帧区间)。`--showcase` 用。
-    pub fn clip_table() -> Vec<(&'static str, &'static str, Option<(u32, u32)>)> {
-        CLIPS.iter().map(|c| (c.id, c.desc, c.span)).collect()
+    /// 开关「跟随鼠标」。`--follow` 与将来的菜单项用。
+    pub fn set_follow(&mut self, on: bool) {
+        self.follow = on;
     }
 
     /// 覆写帧率。`--fps` 用；`None` 时用清单里的（24）。
@@ -817,6 +841,19 @@ impl Pet {
             } else {
                 // 池子空（素材缺段）：往后顺延，别每帧都重试。
                 self.schedule_next_action();
+            }
+        }
+
+        // 跟随鼠标：待机时离鼠标太远就走过去。
+        // 上游 Python 的 follow 模式也是「整只走过去」，不是只转眼球。
+        if self.follow
+            && self.forced.is_none()
+            && self.brain.mood() == Mood::Idle
+            && !self.action_playing
+            && self.walk.is_none()
+        {
+            if let Some((mx, _)) = feiyu_platform::cursor_pos() {
+                self.walk_toward(mx);
             }
         }
 
@@ -1345,6 +1382,16 @@ impl Pet {
     /// 同上，但可以**指定方向**（`Some(-1.0)` 左 / `Some(1.0)` 右）。
     /// 自检靠它验镜像：不能靠抽签碰运气。
     fn begin_walk_with(&mut self, spec: &'static ClipSpec, forced: Option<f32>) -> bool {
+        self.begin_walk_full(spec, forced, None)
+    }
+
+    /// 同上，但可以把距离也钉住（跟随鼠标时要“走多远就多远”）。
+    fn begin_walk_full(
+        &mut self,
+        spec: &'static ClipSpec,
+        forced: Option<f32>,
+        distance: Option<f32>,
+    ) -> bool {
         let Some(walk) = spec.walk.as_ref() else {
             return false;
         };
@@ -1382,7 +1429,10 @@ impl Pet {
             None => false,
         };
         let room = if dir < 0.0 { room_left } else { room_right };
-        let want = self.rng.range(WALK_MIN_PX, WALK_MAX_PX).min(room);
+        let want = match distance {
+            Some(d) => d.clamp(24.0, WALK_MAX_PX * 2.0).min(room),
+            None => self.rng.range(WALK_MIN_PX, WALK_MAX_PX).min(room),
+        };
         if want < 24.0 {
             return false;
         }
@@ -1407,16 +1457,18 @@ impl Pet {
             left: want,
             dir,
             per_frame: want / frames,
+            x: self.anchor_x as f32,
         });
         true
     }
 
     /// 推进一步位移。走完就把 `walk` 清掉（动画仍由 `step_frames` 收尾）。
     fn step_walk(&mut self, step: u32) -> Result<()> {
-        let Some((dir, moved, done)) = self.walk.as_mut().map(|w| {
+        let Some((x, done)) = self.walk.as_mut().map(|w| {
             let s = (w.per_frame * step as f32).min(w.left);
             w.left -= s;
-            (w.dir, s, w.left <= 0.0)
+            w.x += w.dir * s;
+            (w.x, w.left <= 0.0)
         }) else {
             return Ok(());
         };
@@ -1425,8 +1477,8 @@ impl Pet {
         }
         let entry = self.manifest.require(&self.current)?.clone();
         let limits = self.limits_for(&entry);
-        let next = self.anchor_x as f32 + dir * moved;
-        self.anchor_x = next.clamp(limits.x.0, limits.x.1).round() as i32;
+        // 浮点累加后的位置取整再夹边界：短距离（每帧不到 1px）也能慢慢挪。
+        self.anchor_x = x.clamp(limits.x.0, limits.x.1).round() as i32;
         self.place_window(&entry);
         Ok(())
     }
@@ -1457,9 +1509,39 @@ impl Pet {
         started
     }
 
+    /// 朝屏幕上的某个 x 走过去（跟随鼠标用）。返回是否真的开始走。
+    pub fn walk_toward(&mut self, x: i32) -> bool {
+        let dx = (x - self.anchor_x) as f32;
+        // 已经在它旁边了就别再挪：鼠标停在鱼身上时不该一直抖。
+        if dx.abs() < 60.0 {
+            return false;
+        }
+        let Some(spec) = CLIPS.iter().find(|c| c.walk.is_some()) else {
+            return false;
+        };
+        let started = self.begin_walk_full(spec, Some(dx.signum()), Some(dx.abs()));
+        if started {
+            self.action_playing = true;
+        }
+        started
+    }
+
     /// 参数表里这段的说明。`--showcase` 与自检用。
     pub(crate) fn clip_desc(id: &str) -> &'static str {
         clip(id).map_or("", |c| c.desc)
+    }
+
+    /// 当前动画总帧数。`--showcase` 按它算「播完整一圈要几秒」。
+    pub fn frame_count(&self) -> u32 {
+        self.current_count()
+    }
+
+    /// 演示用：照参数表播这一段（带位移的会真的走一趟）。
+    pub fn demo_clip(&mut self, id: &str) -> Result<()> {
+        if clip(id).is_some_and(|c| c.walk.is_some()) && self.wander_with(id) {
+            return Ok(());
+        }
+        self.play(id)
     }
 
     /// 按睡眠编排的当前阶段重算循环区间。

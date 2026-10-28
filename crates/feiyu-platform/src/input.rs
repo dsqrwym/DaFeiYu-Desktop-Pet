@@ -7,8 +7,23 @@
 //! `GetLastInputInfo` 读的是整个会话级共享的输入时间戳，
 //! 不需要钩子、不需要权限，也不看谁有焦点。
 
+use windows::Win32::Foundation::POINT;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+/// 鼠标当前在哪（屏幕像素）。取不到就返回 `None`。
+///
+/// 「跟随鼠标」要的是**位置**，跟 `last_input_ms` 的「多久没动」不一样。
+pub fn cursor_pos() -> Option<(i32, i32)> {
+    let mut pt = POINT::default();
+    // SAFETY: pt 是栈上有效结构。
+    if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+        Some((pt.x, pt.y))
+    } else {
+        None
+    }
+}
 
 /// 距用户最后一次键盘/鼠标操作过去了多少毫秒。
 ///

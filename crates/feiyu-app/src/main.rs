@@ -94,6 +94,8 @@ struct Args {
     hide_after: Option<u32>,
     /// 逐段演示：每段播几秒，并把「该看到什么」打出来给人对照。
     showcase: bool,
+    /// 跟随鼠标：待机时朝鼠标走过去（对齐上游 Python 的 follow 模式）。
+    follow: bool,
     /// 帧率覆写（素材是 24fps；调低显得更像手绘，调高更跟手）。
     fps: Option<f32>,
     /// 正常跑 n 秒就优雅退出。观察随机动作、入睡这类「要等才会发生」的行为时用。
@@ -125,6 +127,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         hide_now: false,
         hide_after: None,
         showcase: false,
+        follow: false,
         fps: None,
         run: None,
         sleep_after: None,
@@ -162,6 +165,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                 )
             }
             "--showcase" => out.showcase = true,
+            "--follow" => out.follow = true,
             "--fps" => {
                 out.fps = Some(
                     it.next()
@@ -244,7 +248,8 @@ fn print_help() {
          \x20 --hide <秒>      先跑 2 秒让动画推进，再藏进托盘挂 n 秒（量隐藏时的 CPU，不跑泵）\n\
          \x20 --hide-now       一启动就藏进托盘但照常跑泵（验证隐藏后托盘能不能点开）\n\
          \x20 --hide-after <秒> 跑 n 秒后从泵内部藏进托盘且不补定时器（等价于菜单里点隐藏）\n\
-         \x20 --showcase       逐段演示：每段播几秒，并把「该看到什么」打出来\n\
+         \x20 --showcase       逐段演示：每段播完整一圈，并把「该看到什么」打出来\n\
+         \x20 --follow         跟随鼠标：待机时朝鼠标走过去\n\
          \x20 --fps <数值>     覆写帧率（默认用清单里的 24）\n\
          \x20 --run <秒>       正常跑 n 秒后优雅退出（观察随机动作、入睡这类慢行为）\n\
          \x20 --sleep-after <秒> 把入睡等待钉成固定值（默认随机 18~38 秒）\n\
@@ -372,6 +377,9 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     pet.show();
     if let Some(fps) = args.fps {
         pet.set_fps(fps);
+    }
+    if args.follow {
+        pet.set_follow(true);
     }
     if args.showcase {
         return showcase(&mut pet);
@@ -528,26 +536,29 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
 /// `--showcase`：逐段播一遍，并把「该看到什么」打出来。
 ///
 /// 存在的理由很具体：素材合不合适、区间切得对不对、朝向对不对，
-/// 只有人眼能定。每段播几秒（够看到一轮循环），然后换下一段。
+/// 只有人眼能定。**按清单顺序走、每段播完整一圈**（不是固定几秒）：
+/// 素材一段就是 241 帧 ≈ 10 秒，截短了根本看不出「该停的停没停」。
 fn showcase(pet: &mut Pet) -> Result<()> {
-    const SHOWCASE_SECS: f32 = 4.0;
-    let available: Vec<String> = pet.ids().map(str::to_owned).collect();
+    let ids: Vec<String> = pet.ids().map(str::to_owned).collect();
     println!(
-        "逐段演示，每段 {SHOWCASE_SECS:.0} 秒（共 {} 段）",
-        Pet::clip_table().len()
+        "逐段演示：{} 段，每段播完整一圈（{:.0}fps，带位移的会真的走一趟）",
+        ids.len(),
+        pet.fps()
     );
-    for (id, desc, span) in Pet::clip_table() {
-        if !available.iter().any(|a| a == id) {
-            continue;
-        }
+    for id in ids {
+        let desc = Pet::clip_desc(&id);
         println!("\n=== {id} ===");
-        println!("  应该看到：{desc}");
-        if let Some((lo, hi)) = span {
-            println!("  播放区间：第 {lo}~{hi} 帧（跳过前摇/收势）");
+        if desc.is_empty() {
+            println!("  （参数表里还没写说明）");
+        } else {
+            println!("  应该看到：{desc}");
         }
-        pet.play(id)?;
+        pet.demo_clip(&id)?;
+        let frames = pet.frame_count().max(1);
+        let secs = frames as f32 / pet.fps().max(1.0);
+        println!("  播 {frames} 帧 ≈ {secs:.1} 秒（完整一圈）");
         let started = std::time::Instant::now();
-        while started.elapsed().as_secs_f32() < SHOWCASE_SECS {
+        while started.elapsed().as_secs_f32() < secs {
             std::thread::sleep(std::time::Duration::from_millis(10));
             pet.tick()?;
         }
