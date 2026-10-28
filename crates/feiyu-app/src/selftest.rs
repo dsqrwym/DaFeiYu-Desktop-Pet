@@ -520,11 +520,11 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     );
 
     let span_falling = pet.loop_span();
-    // 入睡段 0~133：一步步推到段尾，看它换段时会不会把帧号拨回去。
-    pet.advance_frames(133)?;
+    // 入睡段 0~127：一步步推到段尾，看它换段时会不会把帧号拨回去。
+    pet.advance_frames(127)?;
     r.check(
         &format!("入睡段演到最后一帧（第 {} 帧）", pet.frame()),
-        pet.frame() == 133,
+        pet.frame() == 127,
     );
     pet.advance_frames(1)?;
     let span_asleep = pet.loop_span();
@@ -533,18 +533,19 @@ fn check_interaction(r: &mut Report) -> Result<()> {
             "入睡段 {span_falling:?} 演完转入打呼段 {span_asleep:?}（接上第 {} 帧）",
             pet.frame()
         ),
-        // 换段时帧号 133 本来就在 76~174 里，拨回 76 会倒退 57 帧——Z 会缩一下。
-        span_falling == Some((0, 133)) && span_asleep == Some((76, 174)) && pet.frame() == 133,
+        // 入睡段就停在打呼段的上界：换段时帧号一步都不用回退。
+        span_falling == Some((0, 127)) && span_asleep == Some((76, 127)) && pet.frame() == 127,
     );
-    // 打呼段要包住完整的 Z：从「Z 还没冒」到「Z 已散尽」。
-    // 76 之前没有气泡，174 之后也没有——这样回绕时没有任何东西跳位置。
+    // 打呼段必须停在「身体开始起身」之前。
+    // 身体从 76 帧起一直在慢慢往上起，127 是它回到起点姿势的那一刻；
+    // 循环到 174（位移已经 10.8）就会看到「起身一点又坐回去」。
     r.check(
         &format!(
-            "打呼段 {}~{} 两端都没有 Z（Z 在 76~174）",
+            "打呼段 {}~{} 止于起身之前（实测 176 开始起）",
             span_asleep.map_or(0, |(lo, _)| lo),
             span_asleep.map_or(0, |(_, hi)| hi)
         ),
-        span_asleep.is_some_and(|(lo, hi)| lo <= 76 && hi >= 174),
+        span_asleep.is_some_and(|(lo, hi)| lo <= 76 && hi <= 130),
     );
 
     // 关键一条：睡着后无论过多久，都不能演到帧 210+ 那段「睁眼醒来」。
@@ -628,8 +629,8 @@ fn check_interaction(r: &mut Report) -> Result<()> {
             && pet.mood() == Some(Mood::Sleep),
     );
 
-    // 醒来段的长度随「点了多晚」变：睡在 116 帧醒来要演 125 帧，停在 148 则只需 93 帧。
-    // 写完就回待机，不留在睡眠区间里，也不走到 click_happy。
+    // 醒来段的长度随「点了多晚」变：睡在 76 帧醒来要演 165 帧，停在 127 则只需 114 帧。
+    // 演完就回待机，不留在睡眠区间里，也不走到 click_happy。
     let wake_len = 240 - wake_span.map_or(0, |(lo, _)| lo) + 1;
     let woke_up = pet.advance_frames(wake_len)?;
     r.check(
