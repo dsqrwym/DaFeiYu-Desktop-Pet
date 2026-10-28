@@ -110,6 +110,19 @@ const ACTION_GAP_MAX: f32 = 15.0;
 /// 权重照原版的 categories=20；二期补 `turn`/`move` 时按原比例追加即可。
 const ACTION_POOL: &[(&str, u32)] = &[("stretch", 20), ("mirror", 20)];
 
+/// 会**带着位移**的待机动作：抽中就去走一段。
+///
+/// `moves` 三段里只取两段：`move_run`（原地左转奔跑）脚步很快，配上现在的
+/// 平移速度会很滑稽；先上大闸步和漂浮踏步。
+/// 权重按原版 moves=5 的比例拉开：漂浮 6、 snippy 4。
+const MOVE_POOL: &[(&str, u32)] = &[("move_float", 6), ("move_crab", 4)];
+
+/// 自己走一趟走多远（屏幕像素）。
+///
+/// 太短看不出在走，太长会一路撞到工作区边上；再长也会被边界夹住。
+const WALK_MIN_PX: f32 = 120.0;
+const WALK_MAX_PX: f32 = 420.0;
+
 /// 睡着时，系统有键鼠输入就按这个间隔掷一次「自然醒」的骰子（秒）。
 ///
 /// 不按输入事件逐次掷：鼠标一动就是几十条消息，逐次掷会让它一秒不到就醒。
@@ -200,6 +213,19 @@ impl Dissolve {
     }
 }
 
+/// 正在走的一段路。
+///
+/// 位移按**帧**推进（不是按秒）：这样它和动画片段天然同步——一段素材演完，
+/// 路也正好走完，不会出现「人已经到了还在原地踏步」。
+struct Walk {
+    /// 还剩多少像素没走。
+    left: f32,
+    /// 方向：-1 往左，+1 往右。
+    dir: f32,
+    /// 每帧走多少像素。
+    per_frame: f32,
+}
+
 /// 一只桌宠的全部运行时状态。
 pub struct Pet {
     win: LayeredWindow,
@@ -257,6 +283,8 @@ pub struct Pet {
     next_action_at: f32,
     /// 当前播的是不是待机小动作：是的话播完一圈就得回 idle。
     action_playing: bool,
+    /// 正在自己走一段（只有待机小动作里的 `move_*` 会起它）。
+    walk: Option<Walk>,
     /// 正在播「醒来」那段演出。期间状态机不许把动画切走，
     /// 否则用户点一下看到的还是「突然站起来」。
     waking: bool,
@@ -299,7 +327,12 @@ impl Pet {
         // 池子要在 `manifest` 被 move 进 `pet` 之前建：字段按声明顺序求值，
         // 写到 `manifest` 之后就拿不到它了。
         let available: Vec<&str> = manifest.ids().collect();
-        let pool = Pool::new(ACTION_POOL.iter().copied()).retained(&available);
+        let combined: Vec<(&str, u32)> = ACTION_POOL
+            .iter()
+            .chain(MOVE_POOL.iter())
+            .copied()
+            .collect();
+        let pool = Pool::new(combined).retained(&available);
 
         let mut pet = Self {
             win,
@@ -329,6 +362,7 @@ impl Pet {
             pool,
             next_action_at: 0.0,
             action_playing: false,
+            walk: None,
             waking: false,
             wake_roll: Instant::now(),
             fixed_sleep: None,
@@ -567,6 +601,8 @@ impl Pet {
         // 不然新段的头几帧会跟旧段的画面混在一起。
         self.loop_span = None;
         self.dissolve = None;
+        // 换段就说明这条路不用走了（拖拽 / 点击 / 睡着都会走到这里）。
+        self.walk = None;
         self.sleep_cycle = None;
         // 先摆位置再画：`UpdateLayeredWindow` 带尺寸时**保留左上角**，
         // 所以新尺寸的帧若是宽高变大的，必须先落位，否则会从旧左上角长出去。
@@ -599,6 +635,10 @@ impl Pet {
             if let Some(id) = self.pool.pick(&mut self.rng) {
                 self.action_playing = true;
                 self.play(id)?;
+                // `move_*` 是带位移的：开一段路，演完一段素材就走完。
+                if MOVE_POOL.iter().any(|(m, _)| *m == id) {
+                    self.begin_walk();
+                }
             } else {
                 // 池子空（素材缺段）：往后顺延，别每帧都重试。
                 self.schedule_next_action();
@@ -1099,6 +1139,81 @@ impl Pet {
         Ok(())
     }
 
+    /// 开始自己走一段：随机选一边，距离 120~420px，被工作区边界夹住。
+    ///
+    /// 速度 = 距离 ÷ 这一段素材的帧数：**一段素材正好配一段路**。
+    /// 两边都贴墙（工作区比窗口还窄这种退化情形下）就干脆不走。
+    fn begin_walk(&mut self) {
+        let Ok(entry) = self.manifest.require(&self.current) else {
+            return;
+        };
+        let limits = self.limits_for(entry);
+        let here = self.anchor_x as f32;
+        let room_left = here - limits.x.0;
+        let room_right = limits.x.1 - here;
+        let dir = match (room_left > 8.0, room_right > 8.0) {
+            (true, true) => {
+                if self.rng.unit() < 0.5 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            }
+            (true, false) => -1.0,
+            (false, true) => 1.0,
+            (false, false) => return,
+        };
+        let room = if dir < 0.0 { room_left } else { room_right };
+        let want = self.rng.range(WALK_MIN_PX, WALK_MAX_PX).min(room);
+        // 贴着墙就别扭了：剩不到一行字宽就别走。
+        if want < 24.0 {
+            return;
+        }
+        let frames = self.current_count().max(1) as f32;
+        self.walk = Some(Walk {
+            left: want,
+            dir,
+            per_frame: want / frames,
+        });
+    }
+
+    /// 推进一步位移。走完就把 `walk` 清掉（动画仍由 `step_frames` 收尾）。
+    fn step_walk(&mut self, step: u32) -> Result<()> {
+        let Some((dir, moved, done)) = self.walk.as_mut().map(|w| {
+            let s = (w.per_frame * step as f32).min(w.left);
+            w.left -= s;
+            (w.dir, s, w.left <= 0.0)
+        }) else {
+            return Ok(());
+        };
+        if done {
+            self.walk = None;
+        }
+        let entry = self.manifest.require(&self.current)?.clone();
+        let limits = self.limits_for(&entry);
+        let next = self.anchor_x as f32 + dir * moved;
+        self.anchor_x = next.clamp(limits.x.0, limits.x.1).round() as i32;
+        self.place_window(&entry);
+        Ok(())
+    }
+
+    /// 强制走一段。**只给自检用**：真实走路靠待机池抽签。
+    pub(crate) fn start_wander(&mut self) -> bool {
+        let Some(id) = MOVE_POOL
+            .iter()
+            .map(|(m, _)| *m)
+            .find(|m| self.manifest.require(m).is_ok())
+        else {
+            return false;
+        };
+        if self.play(id).is_err() {
+            return false;
+        }
+        self.action_playing = true;
+        self.begin_walk();
+        self.walk.is_some()
+    }
+
     /// 按睡眠编排的当前阶段重算循环区间。
     fn apply_sleep_span(&mut self) {
         let Some(cycle) = self.sleep_cycle.as_ref() else {
@@ -1116,6 +1231,8 @@ impl Pet {
         let count = self.current_count();
         let before = self.frame;
         self.advance_frame(step, count);
+        // 带位移的小动作（`move_*`）：帧往前走，窗口也跟着挪。
+        self.step_walk(step)?;
         // `step` 最多两三帧（`MAX_ANIM_DT` 卡着），所以帧号变小只可能是回绕，
         // 不会漏跳一整圈。
         if !self.action_playing || self.frame >= before {

@@ -692,6 +692,24 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         went_idle && pet.current() == "idle",
     );
 
+    // ---- 自己走一段：抽到 move_* 时窗口真的会挪，一段素材演完就停 ----
+    let started = pet.start_wander();
+    let before_walk = pet.rect();
+    let walked_idle = pet.advance_frames(245)?;
+    let after_walk = pet.rect();
+    let dx = after_walk.0 - before_walk.0;
+    r.check(
+        &format!("自己走一段（横向 {dx}px，落地仍在工作区内）"),
+        started && dx.abs() >= 40 && after_walk.2 <= pet.area().2 && after_walk.0 >= pet.area().0,
+    );
+    r.check(
+        &format!(
+            "一段素材演完就停下回待机（{}，回待机 = {walked_idle}）",
+            pet.current()
+        ),
+        walked_idle && pet.current() == "idle",
+    );
+
     drop(pet);
     Ok(())
 }
