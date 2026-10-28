@@ -31,7 +31,7 @@ pub mod window;
 
 pub use dpi::enable_per_monitor_v2;
 pub use icon::Icon;
-pub use input::{cursor_pos, last_input_ms};
+pub use input::{cursor_pos, last_input_ms, left_button_down};
 pub use instance::SingleInstance;
 pub use menu::{CommandId, Menu};
 pub use screen::primary_work_area;

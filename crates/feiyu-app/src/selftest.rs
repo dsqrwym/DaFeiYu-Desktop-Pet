@@ -308,7 +308,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
             "右键菜单能构造（{items_desc}，首项「{}」）",
             pet.hide_label()
         ),
-        items.as_ref().is_ok_and(|n| *n == 6),
+        items.as_ref().is_ok_and(|n| *n == 7),
     );
 
     // ---- 托盘图标用「此刻那一帧」：必须真的跟着动画走 ----
@@ -809,6 +809,24 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         !not_turned && turned && !again && pet.current() == "turn",
     );
     pet.set_follow(false);
+
+    // ---- 点哪走哪：距差不到「一个鱼身宽」不动，超了就开走 ----
+    // `turn` 是 241 帧的整段，得推完才能测（`walk_to` 在演动作时不抢）。
+    let _ = pet.advance_frames(260)?;
+    pet.back_to_home()?;
+    let x0 = pet.anchor_x();
+    let too_near = pet.walk_to(x0 + 40);
+    let far = pet.walk_to(x0 + 900);
+    let walked = pet.walk_to(x0 + 900);
+    r.check(
+        &format!(
+            "点哪走哪：近距离不动（{too_near}），远处开走（{far}，{}）",
+            pet.current()
+        ),
+        !too_near && far,
+    );
+    // 已经在走的时候不该重复开新的一段。
+    r.check(&format!("走路期间不重复起新的一段（{walked}）"), !walked);
 
     drop(pet);
     Ok(())

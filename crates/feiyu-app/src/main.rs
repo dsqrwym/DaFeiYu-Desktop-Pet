@@ -96,6 +96,8 @@ struct Args {
     showcase: bool,
     /// 跟随鼠标（**转向跟随**）：待机时鼠标离开「一个肥鱼宽」的范围就转头看它。
     follow: bool,
+    /// 点哪走哪：点桌面（离鱼超过一个鱼身宽）就走过去。
+    click_walk: bool,
     /// 帧率覆写（素材是 24fps；调低显得更像手绘，调高更跟手）。
     fps: Option<f32>,
     /// 正常跑 n 秒就优雅退出。观察随机动作、入睡这类「要等才会发生」的行为时用。
@@ -128,6 +130,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         hide_after: None,
         showcase: false,
         follow: false,
+        click_walk: false,
         fps: None,
         run: None,
         sleep_after: None,
@@ -166,6 +169,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             }
             "--showcase" => out.showcase = true,
             "--follow" => out.follow = true,
+            "--click-walk" => out.click_walk = true,
             "--fps" => {
                 out.fps = Some(
                     it.next()
@@ -250,6 +254,7 @@ fn print_help() {
          \x20 --hide-after <秒> 跑 n 秒后从泵内部藏进托盘且不补定时器（等价于菜单里点隐藏）\n\
          \x20 --showcase       逐段演示：每段播完整一圈，并把「该看到什么」打出来\n\
          \x20 --follow         跟随鼠标（转向）：鼠标离开一个鱼身宽就转头看它\n\
+         \x20 --click-walk     点哪走哪：点桌面且距离超过一个鱼身宽就走过去\n\
          \x20 --fps <数值>     覆写帧率（默认用清单里的 24）\n\
          \x20 --run <秒>       正常跑 n 秒后优雅退出（观察随机动作、入睡这类慢行为）\n\
          \x20 --sleep-after <秒> 把入睡等待钉成固定值（默认随机 18~38 秒）\n\
@@ -380,6 +385,9 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     }
     if args.follow {
         pet.set_follow(true);
+    }
+    if args.click_walk {
+        pet.set_click_walk(true);
     }
     if args.showcase {
         return showcase(&mut pet);
@@ -607,6 +615,11 @@ fn menu_event(ev: Event, pet: &mut Pet, verbose: bool) -> bool {
         Ok(Action::Follow(on)) => {
             if verbose {
                 println!("跟随鼠标：{}", if on { "开" } else { "关" });
+            }
+        }
+        Ok(Action::ClickWalk(on)) => {
+            if verbose {
+                println!("点哪走哪：{}", if on { "开" } else { "关" });
             }
         }
         Ok(Action::Hidden(on)) => {

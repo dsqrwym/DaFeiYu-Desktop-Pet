@@ -87,6 +87,8 @@ const CMD_QUIT: CommandId = 3;
 const CMD_HIDE: CommandId = 4;
 /// 「跟随鼠标」（= 转向跟随）开关。
 const CMD_FOLLOW: CommandId = 5;
+/// 「点哪走哪」开关。
+const CMD_CLICK_WALK: CommandId = 6;
 
 /// 托盘图标的悬停提示。
 const TRAY_TIP: &str = "飞鱼";
@@ -331,6 +333,8 @@ pub enum Action {
     Topmost(bool),
     /// 「跟随鼠标」切换后的新状态。
     Follow(bool),
+    /// 「点哪走哪」切换后的新状态。
+    ClickWalk(bool),
     /// 隐藏状态切换后的新状态（`true` = 已藏进托盘）。
     Hidden(bool),
     /// 用户要退出。
@@ -446,6 +450,10 @@ pub struct Pet {
     was_near: bool,
     /// 上次转头的时刻（冷却，免得来回扭头）。
     look_cd: Instant,
+    /// 点桌面就让鱼走过去（菜单开关，默认关）。
+    click_walk: bool,
+    /// 上一拍左键是不是按着的（做「按下」沿检测）。
+    lb_down: bool,
     /// 当前这一帧要不要水平镜像。
     ///
     /// 走路时用：素材只有一套朝向，往反方向走必须镜像，否则就是倒着走。
@@ -537,6 +545,8 @@ impl Pet {
             was_near: false,
             // 初始就当成「很久以前」：否则刚启动的 4 秒内第一次转头会被冷却拦下。
             look_cd: Instant::now() - std::time::Duration::from_secs(60),
+            click_walk: false,
+            lb_down: false,
             flip: false,
             flip_buf: Vec::new(),
             waking: false,
@@ -866,6 +876,23 @@ impl Pet {
         if self.follow && self.forced.is_none() && self.brain.mood() == Mood::Idle {
             if let Some((mx, _)) = feiyu_platform::cursor_pos() {
                 self.poll_look(mx);
+            }
+        }
+
+        // 点哪走哪：点桌面**不会产生我们窗口的消息**，只能轮询左键的「按下沿」。
+        // 点在自己身上不算（那是点击反应），距离不到一个鱼身宽也不动。
+        if self.click_walk && self.forced.is_none() && self.brain.mood() == Mood::Idle {
+            let down = feiyu_platform::left_button_down();
+            let pressed = down && !self.lb_down;
+            self.lb_down = down;
+            if pressed {
+                if let Some((mx, my)) = feiyu_platform::cursor_pos() {
+                    let (l, t, r, b) = self.win.rect();
+                    let on_me = mx >= l && mx < r && my >= t && my < b;
+                    if !on_me {
+                        self.walk_to(mx);
+                    }
+                }
             }
         }
 
@@ -1230,6 +1257,7 @@ impl Pet {
         menu.command(CMD_HIDE, self.hide_label())
             .command(CMD_HOME, "回到屏幕底部")
             .check(CMD_FOLLOW, "跟随鼠标", self.follow)
+            .check(CMD_CLICK_WALK, "点哪走哪", self.click_walk)
             .check(CMD_TOPMOST, "总在最前", topmost)
             .separator()
             .command(CMD_QUIT, "退出");
@@ -1255,6 +1283,11 @@ impl Pet {
                 let next = !self.follow;
                 self.follow = next;
                 Ok(Action::Follow(next))
+            }
+            CMD_CLICK_WALK => {
+                let next = !self.click_walk;
+                self.click_walk = next;
+                Ok(Action::ClickWalk(next))
             }
             CMD_TOPMOST => {
                 // 重读一次而不是拿弹菜单前的快照：菜单是模态的，
@@ -1593,6 +1626,52 @@ impl Pet {
     /// 把转头冷却清零。只给自检用（否则测一次要真等 4 秒）。
     pub(crate) fn reset_look_cooldown(&mut self) {
         self.look_cd = Instant::now() - std::time::Duration::from_secs(60);
+    }
+
+    /// 朝屏幕上的 x 走（或跑）过去——「点哪走哪」。返回是否真的开始。
+    ///
+    /// 规则：距离不到**一个肥鱼宽**就不动（那种距离走过去像抽筋）；
+    /// 走哪一段按权重抽（目前 `move_float` 6 / `move_crab` 4）。
+    pub(crate) fn walk_to(&mut self, x: i32) -> bool {
+        if self.action_playing {
+            return false;
+        }
+        let width = self.current_width().max(80);
+        let dx = x - self.anchor_x;
+        if dx.abs() <= width {
+            return false;
+        }
+        let total: u32 = CLIPS
+            .iter()
+            .filter(|c| c.walk.is_some())
+            .map(|c| c.weight)
+            .sum();
+        if total == 0 {
+            return false;
+        }
+        let mut pick = self.rng.range(0.0, total as f32);
+        let mut spec = None;
+        for c in CLIPS.iter().filter(|c| c.walk.is_some()) {
+            pick -= c.weight as f32;
+            if pick <= 0.0 {
+                spec = Some(c);
+                break;
+            }
+        }
+        let Some(spec) = spec else {
+            return false;
+        };
+        let dir = if dx < 0 { -1.0 } else { 1.0 };
+        let started = self.begin_walk_full(spec, Some(dir), Some(dx.abs() as f32));
+        if started {
+            self.action_playing = true;
+        }
+        started
+    }
+
+    /// 开/关「点哪走哪」。`--click-walk` 与菜单项用。
+    pub fn set_click_walk(&mut self, on: bool) {
+        self.click_walk = on;
     }
 
     /// 参数表里这段的说明。`--showcase` 与自检用。

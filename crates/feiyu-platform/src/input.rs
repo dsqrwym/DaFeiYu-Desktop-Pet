@@ -9,8 +9,19 @@
 
 use windows::Win32::Foundation::POINT;
 use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetLastInputInfo, LASTINPUTINFO, VK_LBUTTON,
+};
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+/// 鼠标左键现在是按着的吗。
+///
+/// 用于「点桌面某个位置让它走过去」：点桌面**不会**产生我们窗口的消息，
+/// 只能靠轮询看按键状态。按 8ms 一拍算，人手一次点击 ≥ 30ms，不会漏。
+pub fn left_button_down() -> bool {
+    // SAFETY: 只读全局按键状态，无参数。
+    (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16 & 0x8000) != 0
+}
 
 /// 鼠标当前在哪（屏幕像素）。取不到就返回 `None`。
 ///
