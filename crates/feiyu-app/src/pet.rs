@@ -110,12 +110,45 @@ const ACTION_GAP_MAX: f32 = 15.0;
 /// 权重照原版的 categories=20；二期补 `turn`/`move` 时按原比例追加即可。
 const ACTION_POOL: &[(&str, u32)] = &[("stretch", 20), ("mirror", 20)];
 
-/// 会**带着位移**的待机动作：抽中就去走一段。
+/// 一段「会走路」的素材，连同它自己的参数。
 ///
-/// `moves` 三段里只取两段：`move_run`（原地左转奔跑）脚步很快，配上现在的
-/// 平移速度会很滑稽；先上大闸步和漂浮踏步。
-/// 权重按原版 moves=5 的比例拉开：漂浮 6、 snippy 4。
-const MOVE_POOL: &[(&str, u32)] = &[("move_float", 6), ("move_crab", 4)];
+/// 素材是画家一段一段画的，每段的起势、收势、朝向都不一样——统一处理就会
+/// 出现用户报的那两件事：「人先向右移动，一秒后才开始迈腿」（前摇）和
+/// 「素材朝左、人却往右走」（朝向）。所以每段自己带参数，抽中那段就按那段来。
+struct MoveClip {
+    id: &'static str,
+    /// 权重（照原版 moves 的比例）。
+    weight: u32,
+    /// **真正在迈步**的帧区间（已跳过开头的起势和结尾的收势，逐帧量出来的）。
+    lo: u32,
+    hi: u32,
+    /// 素材本身朝哪边：`Some(true)` 朝左、`Some(false)` 朝右、`None` 方向不明显。
+    ///
+    /// 朝左的段就只能往左走（不做水平翻转）；方向不明显的那段两边都行。
+    faces_left: Option<bool>,
+}
+
+/// 会带着位移的待机动作。
+///
+/// `move_run`（原地左转奔跑）暂时不进池：脚步很快，配上现在的平移速度会很滑稽。
+const MOVE_CLIPS: &[MoveClip] = &[
+    // 逐帧量过：0~17 帧是站着，18 帧起进入踏步循环；205 帧后开始收势。
+    MoveClip {
+        id: "move_float",
+        weight: 6,
+        lo: 18,
+        hi: 205,
+        faces_left: None,
+    },
+    // 0~8 帧几乎不动，40 帧才真正侧身迈步（这才是用户看到的「一秒后才开始走」）。
+    MoveClip {
+        id: "move_crab",
+        weight: 4,
+        lo: 40,
+        hi: 205,
+        faces_left: Some(true),
+    },
+];
 
 /// 自己走一趟走多远（屏幕像素）。
 ///
@@ -329,8 +362,8 @@ impl Pet {
         let available: Vec<&str> = manifest.ids().collect();
         let combined: Vec<(&str, u32)> = ACTION_POOL
             .iter()
-            .chain(MOVE_POOL.iter())
             .copied()
+            .chain(MOVE_CLIPS.iter().map(|c| (c.id, c.weight)))
             .collect();
         let pool = Pool::new(combined).retained(&available);
 
@@ -633,11 +666,22 @@ impl Pet {
             && self.brain.elapsed() >= self.next_action_at
         {
             if let Some(id) = self.pool.pick(&mut self.rng) {
-                self.action_playing = true;
-                self.play(id)?;
-                // `move_*` 是带位移的：开一段路，演完一段素材就走完。
-                if MOVE_POOL.iter().any(|(m, _)| *m == id) {
-                    self.begin_walk();
+                match MOVE_CLIPS.iter().find(|c| c.id == id) {
+                    // 走路段：按它自己的参数来（朝向 + 迈步区间）。
+                    Some(clip) => {
+                        if self.try_begin_walk(clip) {
+                            self.action_playing = true;
+                        } else {
+                            // 那个方向已经贴墙：这段走不了，回待机等下一次抽签。
+                            self.action_playing = false;
+                            self.play("idle")?;
+                            self.schedule_next_action();
+                        }
+                    }
+                    None => {
+                        self.action_playing = true;
+                        self.play(id)?;
+                    }
                 }
             } else {
                 // 池子空（素材缺段）：往后顺延，别每帧都重试。
@@ -1139,42 +1183,74 @@ impl Pet {
         Ok(())
     }
 
-    /// 开始自己走一段：随机选一边，距离 120~420px，被工作区边界夹住。
+    /// 按这段素材自己的参数走一趟：**朝向、迈步区间都不看统一规则**。
     ///
-    /// 速度 = 距离 ÷ 这一段素材的帧数：**一段素材正好配一段路**。
-    /// 两边都贴墙（工作区比窗口还窄这种退化情形下）就干脆不走。
-    fn begin_walk(&mut self) {
+    /// 返回 `false` 表示这段走不了（一般是那个方向已经贴墙，或者素材不在）——
+    /// 调用方应把动画退回待机，而不是让它在原地比划。
+    fn try_begin_walk(&mut self, clip: &'static MoveClip) -> bool {
+        if self.manifest.require(clip.id).is_err() {
+            return false;
+        }
         let Ok(entry) = self.manifest.require(&self.current) else {
-            return;
+            return false;
         };
         let limits = self.limits_for(entry);
         let here = self.anchor_x as f32;
         let room_left = here - limits.x.0;
         let room_right = limits.x.1 - here;
-        let dir = match (room_left > 8.0, room_right > 8.0) {
-            (true, true) => {
-                if self.rng.unit() < 0.5 {
-                    -1.0
-                } else {
-                    1.0
+        // 素材朝哪边就往哪边走；做不了水平翻转，所以不拗着来。
+        // 方向不明显的段（原地踏步）两边都行，贴墙的一边自动排除。
+        let dir = match clip.faces_left {
+            Some(true) => {
+                if room_left <= 24.0 {
+                    return false;
                 }
+                -1.0
             }
-            (true, false) => -1.0,
-            (false, true) => 1.0,
-            (false, false) => return,
+            Some(false) => {
+                if room_right <= 24.0 {
+                    return false;
+                }
+                1.0
+            }
+            None => match (room_left > 24.0, room_right > 24.0) {
+                (true, true) => {
+                    if self.rng.unit() < 0.5 {
+                        -1.0
+                    } else {
+                        1.0
+                    }
+                }
+                (true, false) => -1.0,
+                (false, true) => 1.0,
+                (false, false) => return false,
+            },
         };
         let room = if dir < 0.0 { room_left } else { room_right };
         let want = self.rng.range(WALK_MIN_PX, WALK_MAX_PX).min(room);
-        // 贴着墙就别扭了：剩不到一行字宽就别走。
         if want < 24.0 {
-            return;
+            return false;
         }
-        let frames = self.current_count().max(1) as f32;
+
+        if self.play(clip.id).is_err() {
+            return false;
+        }
+        // 从「真正在迈步」的那一帧开始循环，跳过开头的起势——
+        // 这就是用户看到的「先移动、一秒后才开始走」的那个一秒。
+        let last = self.current_count().saturating_sub(1);
+        let lo = clip.lo.min(last);
+        let hi = clip.hi.min(last).max(lo);
+        self.loop_span = Some((lo, hi));
+        self.frame = lo;
+        let _ = self.draw_frame();
+
+        let frames = (hi - lo + 1).max(1) as f32;
         self.walk = Some(Walk {
             left: want,
             dir,
             per_frame: want / frames,
         });
+        true
     }
 
     /// 推进一步位移。走完就把 `walk` 清掉（动画仍由 `step_frames` 收尾）。
@@ -1197,21 +1273,18 @@ impl Pet {
         Ok(())
     }
 
-    /// 强制走一段。**只给自检用**：真实走路靠待机池抽签。
-    pub(crate) fn start_wander(&mut self) -> bool {
-        let Some(id) = MOVE_POOL
-            .iter()
-            .map(|(m, _)| *m)
-            .find(|m| self.manifest.require(m).is_ok())
-        else {
+    /// 让指定的走路段走一趟。**只给自检用**：真实走路靠待机池抽签。
+    ///
+    /// 逐段验：每段都得跳过自己的前摇、朝素材自己的方向走。
+    pub(crate) fn wander_with(&mut self, id: &str) -> bool {
+        let Some(clip) = MOVE_CLIPS.iter().find(|c| c.id == id) else {
             return false;
         };
-        if self.play(id).is_err() {
-            return false;
+        let started = self.try_begin_walk(clip);
+        if started {
+            self.action_playing = true;
         }
-        self.action_playing = true;
-        self.begin_walk();
-        self.walk.is_some()
+        started
     }
 
     /// 按睡眠编排的当前阶段重算循环区间。

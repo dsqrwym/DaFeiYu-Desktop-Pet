@@ -692,23 +692,30 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         went_idle && pet.current() == "idle",
     );
 
-    // ---- 自己走一段：抽到 move_* 时窗口真的会挪，一段素材演完就停 ----
-    let started = pet.start_wander();
-    let before_walk = pet.rect();
-    let walked_idle = pet.advance_frames(245)?;
-    let after_walk = pet.rect();
-    let dx = after_walk.0 - before_walk.0;
-    r.check(
-        &format!("自己走一段（横向 {dx}px，落地仍在工作区内）"),
-        started && dx.abs() >= 40 && after_walk.2 <= pet.area().2 && after_walk.0 >= pet.area().0,
-    );
-    r.check(
-        &format!(
-            "一段素材演完就停下回待机（{}，回待机 = {walked_idle}）",
-            pet.current()
-        ),
-        walked_idle && pet.current() == "idle",
-    );
+    // ---- 走路段**逐段**验：每段都要「跳过自己的前摇」且「朝素材自己的方向走」----
+    // 用户报的两个毛病都在这里：
+    // * 人先动、一秒后才开始迈腿 → 循环起点必须在真正迈步的帧（不能从 0 开始）；
+    // * 素材朝左人却往右走 → 方向由素材自己决定，不是随机。
+    for (id, expect_left) in [("move_float", None), ("move_crab", Some(true))] {
+        pet.back_to_home()?;
+        let started = pet.wander_with(id);
+        let span = pet.loop_span();
+        let before = pet.rect();
+        let _ = pet.advance_frames(200)?;
+        let after = pet.rect();
+        let dx = after.0 - before.0;
+        let dir_ok = match expect_left {
+            Some(true) => dx < 0,
+            _ => dx.abs() >= 40,
+        };
+        r.check(
+            &format!(
+                "{id}：从第 {} 帧起走（区间 {span:?}），横向 {dx}px",
+                span.map_or(0, |(lo, _)| lo)
+            ),
+            started && span.is_some_and(|(lo, hi)| lo >= 18 && hi >= 200) && dir_ok,
+        );
+    }
 
     drop(pet);
     Ok(())
