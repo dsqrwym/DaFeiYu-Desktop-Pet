@@ -121,26 +121,29 @@ const INPUT_FRESH_MS: u32 = 700;
 
 /// 接缝两侧的平均像素差超过这个值，就不硬切，改成几帧淡过去。
 ///
-/// 标尺是素材自己（`target/seam_probe.ps1` 逐对比整段，整帧灰度、每 8 像素采一点）：
+/// 这个度量是预乘 BGRA、每 16 字节采样（`FEIYU_SEAM_TRACE=1` 直接打出读数）。
+/// 标尺是素材自己：自然一帧的差在 **1.5 ~ 4.1** 之间（看哪一段），
+/// 而三段循环的接缝实测是：
 ///
-/// | 动画 | 相邻帧均值 / 峰值 | 循环接缝 | 比接缝更大的自然步 |
-/// |---|---|---|---|
-/// | idle（240 → 0） | 4.14 / 17.11 | 15.43 | 3 步 |
-/// | drag（110 → 35） | 4.49 / 36.72 | 14.86 | 10 步 |
-/// | sleep（127 → 76） | 2.12 / 8.50 | 6.22 | — |
+/// | 接缝 | 读数 | 自然一帧 |
+/// |---|---|---|
+/// | sleep 156 → 104 | 5.11 | ~1.5 |
+/// | idle 240 → 0 | 13.54 | ~4.1 |
+/// | drag 110 → 35 | ~15（整帧灰度口径 14.86） | ~4.5 |
 ///
-/// 本常量比较的是**预乘 BGRA 每 16 字节采样**，读数与上面那张表差在个位数以内
-/// （实测同一段：idle 13.54、sleep 8.10）。
+/// 所以 3.0 意味着**现在这三段每次回绕都会淡**——这是有意的：素材里根本
+/// 没有无缝的循环点（见 `core/sleep.rs` 的位移曲线）。阈值留着是为了
+/// 将来碰到真正首尾一致的新素材时不至于白忙一场。
 ///
-/// 阈值取 6.0 而不是「比峰值还大」：接缝只要比「正常一帧」大就会看成跳一下；
-/// 而淡入本身几乎不要钱，宁可多淡不可漏淡。
-const SEAM_DISSOLVE_MAD: f32 = 6.0;
+/// 上一版阈值取 6.0，直接把 sleep 的 5.11 漏掉了（自检：淡 0 次 / 硬切 133 次）。
+const SEAM_DISSOLVE_MAD: f32 = 3.0;
 
 /// 接缝淡入用几帧。6 帧 ≈ 250ms：每步只走接缝的 1/6，
-/// sleep 的 8.10 变成 1.35/帧，落回素材自身的噪声里（睡眠段相邻帧平均 2.12）。
+/// sleep 的 5.11 变成 0.85/帧，落回素材自身的噪声里（睡眠段自然一帧 ~1.5）。
 ///
-/// 代价是这 6 拍里**帧号不动**；接缝落在「Z 刚长满 → Z 还没冒」，
-/// 身体姿势实测只差 4.32（自然一帧 2.2），所以看不出停顿。
+/// **淡入期间帧号照常往前跑**：以前为了让混合两端都是固定图而把帧停住 6 拍，
+/// 用户看到的正是「卡一下」；现在旧帧的残影在动的画面上一边推进一边淡掉
+/// （电影里的交叉叠化就是这么做的），循环周期也就刚好是区间长度，不多走时间。
 const SEAM_DISSOLVE_FRAMES: u32 = 6;
 
 type Anim = AnimReader<BufReader<File>>;
@@ -169,6 +172,9 @@ pub enum Action {
 /// 身体尤其在一路单调地慢慢起身（见 `core/sleep.rs` 的位移曲线），
 /// 任何时间段都会差着一两像素。所以接缝不硬切，用几帧把旧画面淡成新画面
 /// ——每一步只走接缝的 1/6，眼睛归成「正常在动」。
+///
+/// `from` 是接缝前那一帧的快照，新帧则**照常逐帧推进**：
+/// 画面上是「旧帧残影渐隐 + 新动画渐显」，不是停下来做一次 morph。
 struct Dissolve {
     /// 接缝前一帧的像素（预乘 BGRA，和 `LayeredWindow::draw` 吃的一样）。
     from: Vec<u8>,
@@ -486,6 +492,8 @@ impl Pet {
     }
 
     /// 是否正在淡化循环接缝。自检用：它不生效的话回绕又会变成硬切。
+    ///
+    /// 淡入**不冻结帧号**，所以这个标志为真的那些拍里帧号仍在前进。
     pub fn seam_dissolving(&self) -> bool {
         self.dissolve.is_some()
     }
@@ -853,11 +861,10 @@ impl Pet {
             .frame(idx)
             .with_context(|| format!("解 {current} 第 {idx} 帧失败"))?;
         match dissolve {
-            // 接缝淡入：把上一轮刚放完的那帧和这一帧按进度混合。
+            // 接缝淡入：把接缝前那一帧和**当前正在推进的新帧**按进度混合。
             //
-            // `done == 0` 这一拍也要走这里（混合比例 0 = 纯旧帧）：接缝那一下
-            // 必须先画出「刚过去的那帧」，否则顺序会变成「硬切到新帧 → 再弹回旧帧」，
-            // 比不淡还跳。
+            // 旧帧只在这里出现（作为残影），画面上每一步都在动：
+            // 停住帧号做过一版，用户看到的就是「卡一下」。
             Some(d) => {
                 let (num, den) = d.t();
                 blend_frame(&d.from, pixels, num, den, &mut d.out);
@@ -1114,11 +1121,9 @@ impl Pet {
     /// 没有被限定区间时就是普通的整段循环；被限定（睡觉）时只在段内转，
     /// 段播完再问一次睡眠编排要不要换段——这是「睡着后不再自己醒来」的实现点。
     fn advance_frame(&mut self, step: u32, count: u32) {
-        // 正在淡接缝：帧号先停住，把淡入推进一步就完事。
-        // 这几帧画面上是「旧帧 → 新帧」的混合，两端都不变才能算出稳定的过渡。
-        if self.step_dissolve() {
-            return;
-        }
+        // 淡入只推进进度，**不拦帧号**：帧照常往前走，旧帧的残影逐拍淡掉。
+        // 把帧停住做过一版，用户直接看到了「卡一下」。
+        self.tick_dissolve();
         let Some((lo, hi)) = self.loop_span else {
             let next = (self.frame + step) % count;
             if next < self.frame {
@@ -1166,17 +1171,16 @@ impl Pet {
         }
     }
 
-    /// 推进一拍接缝淡入。返回 `true` 表示这一拍帧号不动。
-    fn step_dissolve(&mut self) -> bool {
+    /// 推进一拍接缝淡入。帧号归帧号，这里只管进度。
+    fn tick_dissolve(&mut self) {
         let Some(d) = self.dissolve.as_mut() else {
-            return false;
+            return;
         };
         d.done += 1;
         if d.done >= d.total {
-            // 淡完了：最后一帧就是新帧本身（`draw_frame` 会原样画出来）。
+            // 淡完了：之后画的就是新帧本身（`draw_frame` 会原样画出来）。
             self.dissolve = None;
         }
-        true
     }
 
     /// 段尾要接回段首时调一次：接缝够硬就准备淡过去。
@@ -1194,25 +1198,32 @@ impl Pet {
         let Some(next) = self.snapshot_frame(to) else {
             return;
         };
-        if seam_mad(&prev, &next) < SEAM_DISSOLVE_MAD {
-            return;
-        }
-        // 取证开关：接缝是不是真的被淡过去了。只盯屏幕的话，
-        // 「接缝落在素材自己也有的大步里」时根本分不出到底有没有淡。
+        let mad = seam_mad(&prev, &next);
+        // 取证开关：不管淡不淡都先把接缝读数打出来。只打「淡了」的话，
+        // 没淡（阈值没进）情况下日志里什么都看不到，就会误以为接缝是好的。
         if std::env::var_os("FEIYU_SEAM_TRACE").is_some() {
             eprintln!(
-                "接缝 {} → {}（{}）：mad {:.2}，{} 帧淡过去",
+                "接缝 {} → {}（{}）：mad {:.2}，{}",
                 from,
                 to,
                 self.current,
-                seam_mad(&prev, &next),
-                SEAM_DISSOLVE_FRAMES
+                mad,
+                if mad >= SEAM_DISSOLVE_MAD {
+                    format!("{} 帧淡过去", SEAM_DISSOLVE_FRAMES)
+                } else {
+                    "硬切".to_owned()
+                }
             );
+        }
+        if mad < SEAM_DISSOLVE_MAD {
+            return;
         }
         self.dissolve = Some(Dissolve {
             from: prev,
             out: next,
-            done: 0,
+            // 从 1/6 起淡，不从 0/6：`t = 0` 等于再把旧帧画一遍，
+            // 白占一拍（旧帧刚画过），而且新段的第一帧会被整拍跳过。
+            done: 1,
             total: SEAM_DISSOLVE_FRAMES,
         });
     }

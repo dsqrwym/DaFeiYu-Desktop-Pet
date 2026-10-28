@@ -520,11 +520,11 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     );
 
     let span_falling = pet.loop_span();
-    // 入睡段 0~127：一步步推到段尾，看它换段时会不会把帧号拨回去。
-    pet.advance_frames(127)?;
+    // 入睡段 0~156：一步步推到段尾，看它换段时会不会把帧号拨回去。
+    pet.advance_frames(156)?;
     r.check(
         &format!("入睡段演到最后一帧（第 {} 帧）", pet.frame()),
-        pet.frame() == 127,
+        pet.frame() == 156,
     );
     pet.advance_frames(1)?;
     let span_asleep = pet.loop_span();
@@ -534,18 +534,19 @@ fn check_interaction(r: &mut Report) -> Result<()> {
             pet.frame()
         ),
         // 入睡段就停在打呼段的上界：换段时帧号一步都不用回退。
-        span_falling == Some((0, 127)) && span_asleep == Some((76, 127)) && pet.frame() == 127,
+        span_falling == Some((0, 156)) && span_asleep == Some((104, 156)) && pet.frame() == 156,
     );
-    // 打呼段必须停在「身体开始起身」之前。
-    // 身体从 76 帧起一直在慢慢往上起，127 是它回到起点姿势的那一刻；
-    // 循环到 174（位移已经 10.8）就会看到「起身一点又坐回去」。
+    // 打呼段的两端都必须有气泡，而且必须止于身体起身之前。
+    // 逐帧数过：气泡在 78~173 之间存在，174 之后一个都没有；身体 176 起开始起身。
+    // 下界取 104（已经有 2~3 个）而不是 76（还没气泡），
+    // 就是为了不让用户看到「气泡整体消失 → 卡一下 → 从零重新长出来」。
     r.check(
         &format!(
-            "打呼段 {}~{} 止于起身之前（实测 176 开始起）",
+            "打呼段 {}~{} 两端都有气泡、且止于起身之前（气泡 78~173，176 起起身）",
             span_asleep.map_or(0, |(lo, _)| lo),
             span_asleep.map_or(0, |(_, hi)| hi)
         ),
-        span_asleep.is_some_and(|(lo, hi)| lo <= 76 && hi <= 130),
+        span_asleep.is_some_and(|(lo, hi)| lo >= 100 && hi <= 173),
     );
 
     // 关键一条：睡着后无论过多久，都不能演到帧 210+ 那段「睁眼醒来」。
@@ -558,6 +559,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     let mut faded = 0u32;
     let mut hard_cut = 0u32;
     let mut faded_frames = 0u32;
+    let mut stalled = 0u32;
     let mut prev = pet.frame();
     for _ in 0..7000 {
         pet.advance_frames(1)?;
@@ -580,6 +582,10 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         }
         if pet.seam_dissolving() {
             faded_frames += 1;
+            // 淡入不许冻住帧号——那正是用户看到的「卡一下」。
+            if f == prev {
+                stalled += 1;
+            }
         }
         prev = f;
     }
@@ -598,11 +604,8 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         hard_cut == 0 && faded == wraps && wraps > 0,
     );
     r.check(
-        &format!(
-            "淡入期间帧号停住不往前跑（共 {faded_frames} 帧，约 {:.0} 帧/次）",
-            faded_frames as f32 / wraps.max(1) as f32
-        ),
-        faded_frames > 0,
+        &format!("淡入期间帧号照常前进（{faded_frames} 拍在淡，冻帧 {stalled} 拍）",),
+        stalled == 0 && faded_frames > 0,
     );
 
     // 鼠标划过只推迟入睡，不许叫醒。
@@ -629,7 +632,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
             && pet.mood() == Some(Mood::Sleep),
     );
 
-    // 醒来段的长度随「点了多晚」变：睡在 76 帧醒来要演 165 帧，停在 127 则只需 114 帧。
+    // 醒来段的长度随「点了多晚」变：睡在 104 帧醒来要演 137 帧，停在 156 则只需 85 帧。
     // 演完就回待机，不留在睡眠区间里，也不走到 click_happy。
     let wake_len = 240 - wake_span.map_or(0, |(lo, _)| lo) + 1;
     let woke_up = pet.advance_frames(wake_len)?;
