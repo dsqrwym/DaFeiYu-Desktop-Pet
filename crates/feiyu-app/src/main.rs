@@ -92,6 +92,10 @@ struct Args {
     /// 「隐藏到托盘」走的那条路径（`--hide-now` 会补一个 500ms 拍子，
     /// 两者行为不完全一样，托盘问题必须用这条验）。
     hide_after: Option<u32>,
+    /// 逐段演示：每段播几秒，并把「该看到什么」打出来给人对照。
+    showcase: bool,
+    /// 帧率覆写（素材是 24fps；调低显得更像手绘，调高更跟手）。
+    fps: Option<f32>,
     /// 正常跑 n 秒就优雅退出。观察随机动作、入睡这类「要等才会发生」的行为时用。
     run: Option<u32>,
     /// 把入睡等待钉成固定秒数（默认随机 18~38 秒）。
@@ -120,6 +124,8 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         hide: None,
         hide_now: false,
         hide_after: None,
+        showcase: false,
+        fps: None,
         run: None,
         sleep_after: None,
         fling: None,
@@ -153,6 +159,15 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                         .context("--hide-after 缺少数秒")?
                         .parse()
                         .context("--hide-after 需要整数秒")?,
+                )
+            }
+            "--showcase" => out.showcase = true,
+            "--fps" => {
+                out.fps = Some(
+                    it.next()
+                        .context("--fps 缺少数值")?
+                        .parse()
+                        .context("--fps 需要数字")?,
                 )
             }
             "--hide" => {
@@ -229,6 +244,8 @@ fn print_help() {
          \x20 --hide <秒>      先跑 2 秒让动画推进，再藏进托盘挂 n 秒（量隐藏时的 CPU，不跑泵）\n\
          \x20 --hide-now       一启动就藏进托盘但照常跑泵（验证隐藏后托盘能不能点开）\n\
          \x20 --hide-after <秒> 跑 n 秒后从泵内部藏进托盘且不补定时器（等价于菜单里点隐藏）\n\
+         \x20 --showcase       逐段演示：每段播几秒，并把「该看到什么」打出来\n\
+         \x20 --fps <数值>     覆写帧率（默认用清单里的 24）\n\
          \x20 --run <秒>       正常跑 n 秒后优雅退出（观察随机动作、入睡这类慢行为）\n\
          \x20 --sleep-after <秒> 把入睡等待钉成固定值（默认随机 18~38 秒）\n\
          \x20 --fling <vx> <vy> 启动时给一个初速度（像素/秒，验证滑行与下落）\n\
@@ -345,12 +362,20 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     }
 
     // `--shots` 也要冻结状态机，否则截图过程里桌宠自己睡着，截到一半换段。
+    // `--showcase` 同理：逐段演示时不能被随机动作/入睡抢走。
     let forced = args
         .anim
         .clone()
-        .or_else(|| args.shots.as_ref().map(|_| "idle".to_owned()));
+        .or_else(|| args.shots.as_ref().map(|_| "idle".to_owned()))
+        .or_else(|| args.showcase.then(|| "idle".to_owned()));
     let mut pet = Pet::open(&dir, forced.as_deref())?;
     pet.show();
+    if let Some(fps) = args.fps {
+        pet.set_fps(fps);
+    }
+    if args.showcase {
+        return showcase(&mut pet);
+    }
     if let Some(secs) = args.sleep_after {
         pet.set_fixed_sleep_after(secs);
     }
@@ -497,6 +522,37 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
         bail!("窗口提前退出，没有截到图");
     }
     println!("退出（共提交 {} 帧）", pet.drawn());
+    Ok(())
+}
+
+/// `--showcase`：逐段播一遍，并把「该看到什么」打出来。
+///
+/// 存在的理由很具体：素材合不合适、区间切得对不对、朝向对不对，
+/// 只有人眼能定。每段播几秒（够看到一轮循环），然后换下一段。
+fn showcase(pet: &mut Pet) -> Result<()> {
+    const SHOWCASE_SECS: f32 = 4.0;
+    let available: Vec<String> = pet.ids().map(str::to_owned).collect();
+    println!(
+        "逐段演示，每段 {SHOWCASE_SECS:.0} 秒（共 {} 段）",
+        Pet::clip_table().len()
+    );
+    for (id, desc, span) in Pet::clip_table() {
+        if !available.iter().any(|a| a == id) {
+            continue;
+        }
+        println!("\n=== {id} ===");
+        println!("  应该看到：{desc}");
+        if let Some((lo, hi)) = span {
+            println!("  播放区间：第 {lo}~{hi} 帧（跳过前摇/收势）");
+        }
+        pet.play(id)?;
+        let started = std::time::Instant::now();
+        while started.elapsed().as_secs_f32() < SHOWCASE_SECS {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            pet.tick()?;
+        }
+    }
+    println!("\n演示完毕。");
     Ok(())
 }
 

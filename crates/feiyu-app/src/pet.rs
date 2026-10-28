@@ -111,6 +111,8 @@ const ACTION_GAP_MAX: f32 = 15.0;
 struct ClipSpec {
     /// 素材 id。
     id: &'static str,
+    /// 一句话说清「这段应该看到什么」。`--showcase` 会把它打出来给人对照。
+    desc: &'static str,
     /// 进待机池的权重；`0` = 不进池（由状态机或点击驱动）。
     weight: u32,
     /// 只播这一截（闭区间，已跳过前摇/收势）。`None` = 整段循环。
@@ -152,6 +154,7 @@ enum OnEnter {
 const CLIPS: &[ClipSpec] = &[
     ClipSpec {
         id: "idle",
+        desc: "站着呼吸，偶尔眨眼；它会一直循环，直到困了或被点醒",
         weight: 0,
         span: None,
         walk: None,
@@ -159,6 +162,7 @@ const CLIPS: &[ClipSpec] = &[
     },
     ClipSpec {
         id: "sleep",
+        desc: "站着 → 闭眼端下 → Z 气泡冒出来 → 睡着；点一下就慢慢起身醒来",
         weight: 0,
         span: None,
         walk: None,
@@ -166,6 +170,7 @@ const CLIPS: &[ClipSpec] = &[
     },
     ClipSpec {
         id: "drag",
+        desc: "被提起来悬空飘着（从第 35 帧起：前 35 帧人还站在地上）",
         weight: 0,
         span: Some((DRAG_LO, DRAG_HI)),
         walk: None,
@@ -173,6 +178,7 @@ const CLIPS: &[ClipSpec] = &[
     },
     ClipSpec {
         id: "click_happy",
+        desc: "被点一下：开心地晃，演一圈就回待机",
         weight: 0,
         span: None,
         walk: None,
@@ -180,6 +186,7 @@ const CLIPS: &[ClipSpec] = &[
     },
     ClipSpec {
         id: "click_pout",
+        desc: "连点三下：生气，演一圈就回待机",
         weight: 0,
         span: None,
         walk: None,
@@ -187,6 +194,7 @@ const CLIPS: &[ClipSpec] = &[
     },
     ClipSpec {
         id: "stretch",
+        desc: "待机小动作：伸懒腰，演一圈就回待机",
         weight: 20,
         span: None,
         walk: None,
@@ -194,13 +202,23 @@ const CLIPS: &[ClipSpec] = &[
     },
     ClipSpec {
         id: "mirror",
+        desc: "待机小动作：照镜子（抹抹脸），演一圈就回待机",
         weight: 20,
         span: None,
         walk: None,
         on_enter: OnEnter::Plain,
     },
     ClipSpec {
+        id: "turn",
+        desc: "原地转身：正面 → 侧面 → 背面 → 正面，位置不动",
+        weight: 5,
+        span: None,
+        walk: None,
+        on_enter: OnEnter::Plain,
+    },
+    ClipSpec {
         id: "move_float",
+        desc: "漂浮踏步：正面小碎步（演示时原地播；实际会带着走 120~420px）",
         weight: 6,
         span: Some((18, 205)),
         walk: Some(WalkSpec { faces_left: None }),
@@ -208,6 +226,8 @@ const CLIPS: &[ClipSpec] = &[
     },
     ClipSpec {
         id: "move_crab",
+        desc:
+            "螃蟹走路：侧身向左迈步（演示时原地播；实际朝哪边走就镜像成哪边，并带 120~420px 位移）",
         weight: 4,
         span: Some((40, 205)),
         walk: Some(WalkSpec {
@@ -390,6 +410,12 @@ pub struct Pet {
     action_playing: bool,
     /// 正在自己走一段（只有待机小动作里的 `move_*` 会起它）。
     walk: Option<Walk>,
+    /// 当前这一帧要不要水平镜像。
+    ///
+    /// 走路时用：素材只有一套朝向，往反方向走必须镜像，否则就是倒着走。
+    flip: bool,
+    /// 镜像用的缓冲（复用，免得每帧都申请一块）。
+    flip_buf: Vec<u8>,
     /// 正在播「醒来」那段演出。期间状态机不许把动画切走，
     /// 否则用户点一下看到的还是「突然站起来」。
     waking: bool,
@@ -399,6 +425,8 @@ pub struct Pet {
     hidden: bool,
     /// 调用方要求的定时器周期，隐藏时用来原样恢复。
     tick_ms: u32,
+    /// 帧率覆写（`--fps`）；`None` = 用清单里的。
+    fps_override: Option<f32>,
     /// 托盘图标。**必须声明在 `icon` 之前**：字段按声明顺序析构，
     /// 这样 `NIM_DELETE` 一定先于 `DestroyIcon`，托盘上不会留幽灵图标。
     tray: Option<TrayIcon>,
@@ -469,11 +497,14 @@ impl Pet {
             next_action_at: 0.0,
             action_playing: false,
             walk: None,
+            flip: false,
+            flip_buf: Vec::new(),
             waking: false,
             wake_roll: Instant::now(),
             fixed_sleep: None,
             hidden: false,
             tick_ms: 0,
+            fps_override: None,
             tray: None,
             icon: None,
         };
@@ -691,9 +722,31 @@ impl Pet {
         clip(id).and_then(|c| c.span)
     }
 
+    /// 角色锚点 x（不动窗口左沿、不受素材 origin 影响）。自检用。
+    pub(crate) fn anchor_x(&self) -> i32 {
+        self.anchor_x
+    }
+
+    /// 当前这一帧是不是镜像着画的。自检用。
+    pub(crate) fn flipped(&self) -> bool {
+        self.flip
+    }
+
+    /// 参数表：(id, 说明, 帧区间)。`--showcase` 用。
+    pub fn clip_table() -> Vec<(&'static str, &'static str, Option<(u32, u32)>)> {
+        CLIPS.iter().map(|c| (c.id, c.desc, c.span)).collect()
+    }
+
+    /// 覆写帧率。`--fps` 用；`None` 时用清单里的（24）。
+    pub fn set_fps(&mut self, fps: f32) {
+        if fps.is_finite() && fps > 0.0 {
+            self.fps_override = Some(fps.clamp(1.0, 120.0));
+        }
+    }
+
     /// 清单原始 fps。
     pub fn fps(&self) -> f32 {
-        self.manifest.fps
+        self.fps_override.unwrap_or(self.manifest.fps)
     }
 
     /// 切到 `id` 并立刻提交第一帧。尺寸变化时窗口会跟着变。
@@ -714,6 +767,7 @@ impl Pet {
         self.dissolve = None;
         // 换段就说明这条路不用走了（拖拽 / 点击 / 睡着都会走到这里）。
         self.walk = None;
+        self.flip = false;
         self.sleep_cycle = None;
         // 先摆位置再画：`UpdateLayeredWindow` 带尺寸时**保留左上角**，
         // 所以新尺寸的帧若是宽高变大的，必须先落位，否则会从旧左上角长出去。
@@ -818,7 +872,7 @@ impl Pet {
         }
 
         let anim_dt = dt.min(MAX_ANIM_DT);
-        self.acc += anim_dt * self.manifest.fps;
+        self.acc += anim_dt * self.fps();
         if self.acc < 1.0 {
             return Ok(());
         }
@@ -1029,15 +1083,23 @@ impl Pet {
             frame,
             drawn,
             dissolve,
+            flip,
+            flip_buf,
             ..
         } = self;
         let anim = anims
             .get_mut(current)
             .with_context(|| format!("动画 {current} 尚未加载"))?;
         let idx = *frame % anim.frame_count().max(1);
-        let pixels = anim
+        let raw = anim
             .frame(idx)
             .with_context(|| format!("解 {current} 第 {idx} 帧失败"))?;
+        // 走路往反方向时把这一帧水平镜像（素材只有一套朝向）。
+        let pixels: &[u8] = if *flip {
+            mirror_bgra(raw, entry.width() as usize, flip_buf)
+        } else {
+            raw
+        };
         match dissolve {
             // 接缝淡入：把接缝前那一帧和**当前正在推进的新帧**按进度混合。
             //
@@ -1277,6 +1339,12 @@ impl Pet {
     /// 返回 `false` 表示这段走不了（那个方向已经贴墙，或者素材不在）——
     /// 调用方应把动画退回待机，而不是让它在原地比划。
     fn begin_walk(&mut self, spec: &'static ClipSpec) -> bool {
+        self.begin_walk_with(spec, None)
+    }
+
+    /// 同上，但可以**指定方向**（`Some(-1.0)` 左 / `Some(1.0)` 右）。
+    /// 自检靠它验镜像：不能靠抽签碰运气。
+    fn begin_walk_with(&mut self, spec: &'static ClipSpec, forced: Option<f32>) -> bool {
         let Some(walk) = spec.walk.as_ref() else {
             return false;
         };
@@ -1287,22 +1355,15 @@ impl Pet {
         let here = self.anchor_x as f32;
         let room_left = here - limits.x.0;
         let room_right = limits.x.1 - here;
-        // 素材朝哪边就往哪边走；做不了水平翻转，所以不拗着来。
-        // 方向不明显的段（原地踏步）两边都行，贴墙的一边自动排除。
-        let dir = match walk.faces_left {
-            Some(true) => {
-                if room_left <= 24.0 {
-                    return false;
-                }
-                -1.0
+        // 两边都能走就掷硬币，贴墙的一边自动排除。
+        let dir = if let Some(d) = forced {
+            let room = if d < 0.0 { room_left } else { room_right };
+            if room <= 24.0 {
+                return false;
             }
-            Some(false) => {
-                if room_right <= 24.0 {
-                    return false;
-                }
-                1.0
-            }
-            None => match (room_left > 24.0, room_right > 24.0) {
+            d
+        } else {
+            match (room_left > 24.0, room_right > 24.0) {
                 (true, true) => {
                     if self.rng.unit() < 0.5 {
                         -1.0
@@ -1313,7 +1374,12 @@ impl Pet {
                 (true, false) => -1.0,
                 (false, true) => 1.0,
                 (false, false) => return false,
-            },
+            }
+        };
+        // 走的方跟素材朝相反时镜像它（否则就是倒退着走）。
+        let flip = match walk.faces_left {
+            Some(faces_left) => (dir < 0.0) != faces_left,
+            None => false,
         };
         let room = if dir < 0.0 { room_left } else { room_right };
         let want = self.rng.range(WALK_MIN_PX, WALK_MAX_PX).min(room);
@@ -1333,6 +1399,7 @@ impl Pet {
         };
         self.loop_span = Some((lo, hi));
         self.frame = lo;
+        self.flip = flip;
         let _ = self.draw_frame();
 
         let frames = (hi - lo + 1).max(1) as f32;
@@ -1376,6 +1443,23 @@ impl Pet {
             self.action_playing = true;
         }
         started
+    }
+
+    /// 指定方向走一段。自检用：要验「往反方向走时镜像」，不能靠抽签。
+    pub(crate) fn wander_dir(&mut self, id: &str, right: bool) -> bool {
+        let Some(spec) = clip(id) else {
+            return false;
+        };
+        let started = self.begin_walk_with(spec, Some(if right { 1.0 } else { -1.0 }));
+        if started {
+            self.action_playing = true;
+        }
+        started
+    }
+
+    /// 参数表里这段的说明。`--showcase` 与自检用。
+    pub(crate) fn clip_desc(id: &str) -> &'static str {
+        clip(id).map_or("", |c| c.desc)
     }
 
     /// 按睡眠编排的当前阶段重算循环区间。
@@ -1608,6 +1692,22 @@ fn window_pos(canvas_width: u16, entry: &AnimEntry, anchor_x: i32, feet_y: i32) 
     let x = anchor_x - canvas_width as i32 / 2 + entry.origin[0] as i32;
     let y = feet_y - entry.baseline as i32;
     (x, y)
+}
+
+/// 把一帧预乘 BGRA 水平镜像（行内倒过来）写进 `dst`，返回它。
+///
+/// 素材只画了一套朝向，往反方向走就靠这个：眼睛、头发、衣摆全都跟着翻，
+/// 比「倒着走」自然得多。
+fn mirror_bgra<'a>(src: &[u8], width: usize, dst: &'a mut Vec<u8>) -> &'a [u8] {
+    dst.clear();
+    dst.reserve(src.len());
+    let row = width.max(1) * 4;
+    for line in src.chunks_exact(row) {
+        for px in line.rchunks_exact(4) {
+            dst.extend_from_slice(px);
+        }
+    }
+    dst
 }
 
 /// 两帧的平均像素差。用来判断一个循环接缝硬不硬。

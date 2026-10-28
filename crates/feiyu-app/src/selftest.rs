@@ -692,28 +692,33 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         went_idle && pet.current() == "idle",
     );
 
-    // ---- 走路段**逐段**验：每段都要「跳过自己的前摇」且「朝素材自己的方向走」----
+    // ---- 走路段**逐段**验：跳过前摇 + 方向跟素材一致（反方向靠镜像）----
     // 用户报的两个毛病都在这里：
-    // * 人先动、一秒后才开始迈腿 → 循环起点必须在真正迈步的帧（不能从 0 开始）；
-    // * 素材朝左人却往右走 → 方向由素材自己决定，不是随机。
-    for (id, expect_left) in [("move_float", None), ("move_crab", Some(true))] {
+    // * 人先动、一秒后才开始迈腿 → 循环起点必须在真正迈步的帧；
+    // * 素材朝左人却向右走 → 往反方向走时必须水平镜像（`flipped()`）。
+    for id in ["move_float", "move_crab"] {
         pet.back_to_home()?;
         let started = pet.wander_with(id);
         let span = pet.loop_span();
-        let before = pet.rect();
+        let flip = pet.flipped();
+        let x0 = pet.anchor_x();
         let _ = pet.advance_frames(200)?;
-        let after = pet.rect();
-        let dx = after.0 - before.0;
-        let dir_ok = match expect_left {
-            Some(true) => dx < 0,
-            _ => dx.abs() >= 40,
+        let dx = pet.anchor_x() - x0;
+        // `move_crab` 素材朝左（faces_left = Some(true)）：往右走的时候必须镜像。
+        let flip_ok = if id == "move_crab" {
+            flip == (dx > 0)
+        } else {
+            true
         };
         r.check(
             &format!(
-                "{id}：从第 {} 帧起走（区间 {span:?}），横向 {dx}px",
+                "{id}：从第 {} 帧起走（区间 {span:?}），锚点 {dx:+}px，镜像 = {flip}",
                 span.map_or(0, |(lo, _)| lo)
             ),
-            started && span.is_some_and(|(lo, hi)| lo >= 18 && hi >= 200) && dir_ok,
+            started
+                && span.is_some_and(|(lo, hi)| lo >= 18 && hi >= 200)
+                && dx.abs() >= 40
+                && flip_ok,
         );
     }
 
@@ -733,6 +738,54 @@ fn check_interaction(r: &mut Report) -> Result<()> {
             bad.join(", ")
         ),
         bad.is_empty(),
+    );
+
+    // ---- 镜像：同一段素材往两个方向走，朝反方向时必须翻转 ----
+    // 用户报的「素材朝左、人却向右走」就是这里没翻转。
+    for (id, right, want_flip) in [("move_crab", true, true), ("move_crab", false, false)] {
+        pet.back_to_home()?;
+        let started = pet.wander_dir(id, right);
+        let flip = pet.flipped();
+        let x0 = pet.anchor_x();
+        let _ = pet.advance_frames(60)?;
+        let dx = pet.anchor_x() - x0;
+        r.check(
+            &format!(
+                "{id} 往{}走：镜像 = {flip}（期望 {want_flip}），锚点 {dx:+}px",
+                if right { "右" } else { "左" }
+            ),
+            started && flip == want_flip && (dx > 0) == right,
+        );
+    }
+
+    // ---- 参数表里每段都要有说明（`--showcase` 靠它告诉人「该看到什么」）----
+    let mut no_desc = Vec::new();
+    for id in [
+        "idle",
+        "sleep",
+        "drag",
+        "click_happy",
+        "click_pout",
+        "stretch",
+        "mirror",
+        "turn",
+        "move_float",
+        "move_crab",
+    ] {
+        if Pet::clip_desc(id).is_empty() {
+            no_desc.push(id);
+        }
+    }
+    r.check(
+        &format!(
+            "参数表里每段都有说明（缺 {}）",
+            if no_desc.is_empty() {
+                "无".to_owned()
+            } else {
+                no_desc.join(",")
+            }
+        ),
+        no_desc.is_empty(),
     );
 
     drop(pet);
