@@ -103,52 +103,124 @@ const SLEEP_AFTER_MAX: f32 = 38.0;
 const ACTION_GAP_MIN: f32 = 8.0;
 const ACTION_GAP_MAX: f32 = 15.0;
 
-/// 待机时会随机播的小动作。
+/// 一段动画自己的参数——**驱动逻辑只认这张表**。
 ///
-/// 只列**确实打包进来了**的段：原版 `categories.小动作` 有 18 段，
-/// 我们只打包了 3 段，其中 `sleep` 已归睡觉姿态，剩 `stretch` 和 `mirror`。
-/// 权重照原版的 categories=20；二期补 `turn`/`move` 时按原比例追加即可。
-const ACTION_POOL: &[(&str, u32)] = &[("stretch", 20), ("mirror", 20)];
-
-/// 一段「会走路」的素材，连同它自己的参数。
-///
-/// 素材是画家一段一段画的，每段的起势、收势、朝向都不一样——统一处理就会
-/// 出现用户报的那两件事：「人先向右移动，一秒后才开始迈腿」（前摇）和
-/// 「素材朝左、人却往右走」（朝向）。所以每段自己带参数，抽中那段就按那段来。
-struct MoveClip {
+/// 素材是画家一段段画的，每段的起势、收势、朝向都不一样：统一处理就会出现
+/// 「人先动、一秒后才迈腿」（前摇没跳）和「素材朝左、人却往右走」（朝向没跟素材）。
+/// 加新素材 = 加一条记录 + 跑自检，不用改驱动逻辑。
+struct ClipSpec {
+    /// 素材 id。
     id: &'static str,
-    /// 权重（照原版 moves 的比例）。
+    /// 进待机池的权重；`0` = 不进池（由状态机或点击驱动）。
     weight: u32,
-    /// **真正在迈步**的帧区间（已跳过开头的起势和结尾的收势，逐帧量出来的）。
-    lo: u32,
-    hi: u32,
+    /// 只播这一截（闭区间，已跳过前摇/收势）。`None` = 整段循环。
+    span: Option<(u32, u32)>,
+    /// 这段要**带着位移**播（抽中它就去走一段）。
+    walk: Option<WalkSpec>,
+    /// 切到这段时要做的事。
+    on_enter: OnEnter,
+}
+
+/// 走路段自己的参数。
+struct WalkSpec {
     /// 素材本身朝哪边：`Some(true)` 朝左、`Some(false)` 朝右、`None` 方向不明显。
     ///
-    /// 朝左的段就只能往左走（不做水平翻转）；方向不明显的那段两边都行。
+    /// 不做水平翻转，所以朝左的段就只能往左走；方向不明显的段两边都行。
     faces_left: Option<bool>,
 }
 
-/// 会带着位移的待机动作。
+/// 切进某段时要做的收尾。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnEnter {
+    /// 什么都不用做（小动作、点击反馈）。
+    Plain,
+    /// 回到待机：重抽入睡时间与下次小动作。
+    Idle,
+    /// 起睡眠编排（三段式，见 `core/sleep.rs`）。
+    Sleep,
+}
+
+/// 全部动画的参数表。
 ///
-/// `move_run`（原地左转奔跑）暂时不进池：脚步很快，配上现在的平移速度会很滑稽。
-const MOVE_CLIPS: &[MoveClip] = &[
-    // 逐帧量过：0~17 帧是站着，18 帧起进入踏步循环；205 帧后开始收势。
-    MoveClip {
+/// 帧区间都是**逐帧量出来的**（`--dump` + 逐帧差），别凭印象改：
+///
+/// | 段 | 区间 | 依据 |
+/// |---|---|---|
+/// | `drag` | 35~110 | 前 35 帧人还站在地上 |
+/// | `move_float` | 18~205 | 0~17 帧站着，18 帧起踏步；205 后收势 |
+/// | `move_crab` | 40~205 | 前 8 帧不动，40 帧才侧身迈步；**朝左** |
+const CLIPS: &[ClipSpec] = &[
+    ClipSpec {
+        id: "idle",
+        weight: 0,
+        span: None,
+        walk: None,
+        on_enter: OnEnter::Idle,
+    },
+    ClipSpec {
+        id: "sleep",
+        weight: 0,
+        span: None,
+        walk: None,
+        on_enter: OnEnter::Sleep,
+    },
+    ClipSpec {
+        id: "drag",
+        weight: 0,
+        span: Some((DRAG_LO, DRAG_HI)),
+        walk: None,
+        on_enter: OnEnter::Plain,
+    },
+    ClipSpec {
+        id: "click_happy",
+        weight: 0,
+        span: None,
+        walk: None,
+        on_enter: OnEnter::Plain,
+    },
+    ClipSpec {
+        id: "click_pout",
+        weight: 0,
+        span: None,
+        walk: None,
+        on_enter: OnEnter::Plain,
+    },
+    ClipSpec {
+        id: "stretch",
+        weight: 20,
+        span: None,
+        walk: None,
+        on_enter: OnEnter::Plain,
+    },
+    ClipSpec {
+        id: "mirror",
+        weight: 20,
+        span: None,
+        walk: None,
+        on_enter: OnEnter::Plain,
+    },
+    ClipSpec {
         id: "move_float",
         weight: 6,
-        lo: 18,
-        hi: 205,
-        faces_left: None,
+        span: Some((18, 205)),
+        walk: Some(WalkSpec { faces_left: None }),
+        on_enter: OnEnter::Plain,
     },
-    // 0~8 帧几乎不动，40 帧才真正侧身迈步（这才是用户看到的「一秒后才开始走」）。
-    MoveClip {
+    ClipSpec {
         id: "move_crab",
         weight: 4,
-        lo: 40,
-        hi: 205,
-        faces_left: Some(true),
+        span: Some((40, 205)),
+        walk: Some(WalkSpec {
+            faces_left: Some(true),
+        }),
+        on_enter: OnEnter::Plain,
     },
 ];
+
+/// 查某段的参数。不在表里的段（未打包 / 强制模式）按整段循环处理。
+fn clip(id: &str) -> Option<&'static ClipSpec> {
+    CLIPS.iter().find(|c| c.id == id)
+}
 
 /// 自己走一趟走多远（屏幕像素）。
 ///
@@ -360,10 +432,11 @@ impl Pet {
         // 池子要在 `manifest` 被 move 进 `pet` 之前建：字段按声明顺序求值，
         // 写到 `manifest` 之后就拿不到它了。
         let available: Vec<&str> = manifest.ids().collect();
-        let combined: Vec<(&str, u32)> = ACTION_POOL
+        // 池子就是参数表里 `weight > 0` 的那些段。
+        let combined: Vec<(&str, u32)> = CLIPS
             .iter()
-            .copied()
-            .chain(MOVE_CLIPS.iter().map(|c| (c.id, c.weight)))
+            .filter(|c| c.weight > 0)
+            .map(|c| (c.id, c.weight))
             .collect();
         let pool = Pool::new(combined).retained(&available);
 
@@ -613,6 +686,11 @@ impl Pet {
         self.next_action_at = 0.0;
     }
 
+    /// 参数表里这段的帧区间。自检用：逐段核对「有没有跳过前摇」。
+    pub(crate) fn clip_span(id: &str) -> Option<(u32, u32)> {
+        clip(id).and_then(|c| c.span)
+    }
+
     /// 清单原始 fps。
     pub fn fps(&self) -> f32 {
         self.manifest.fps
@@ -666,19 +744,18 @@ impl Pet {
             && self.brain.elapsed() >= self.next_action_at
         {
             if let Some(id) = self.pool.pick(&mut self.rng) {
-                match MOVE_CLIPS.iter().find(|c| c.id == id) {
-                    // 走路段：按它自己的参数来（朝向 + 迈步区间）。
-                    Some(clip) => {
-                        if self.try_begin_walk(clip) {
+                // 带位移的段（参数表里 `walk` 不为空）：走不了就退回待机。
+                match clip(id) {
+                    Some(spec) if spec.walk.is_some() => {
+                        if self.begin_walk(spec) {
                             self.action_playing = true;
                         } else {
-                            // 那个方向已经贴墙：这段走不了，回待机等下一次抽签。
                             self.action_playing = false;
                             self.play("idle")?;
                             self.schedule_next_action();
                         }
                     }
-                    None => {
+                    _ => {
                         self.action_playing = true;
                         self.play(id)?;
                     }
@@ -1154,44 +1231,56 @@ impl Pet {
         self.next_action_at = now + self.rng.range(ACTION_GAP_MIN, ACTION_GAP_MAX);
     }
 
-    /// 换段之后的收尾。
+    /// 换段之后的收尾——**全部照参数表来**，这里不再认任何具体 id。
     ///
-    /// 三件事只有这里知道：
-    /// * 落到 `sleep` 上要起睡眠编排（它从帧 0 演，但只演到冒出 Z）；
-    /// * 落到 `drag` 上要跳掉素材开头那段「还站在地上」的画面；
-    /// * 回到 `idle` 要换一个新的入睡时间。
+    /// 三件事都变成了数据：
+    /// * `on_enter`：回待机要重抽入睡时间，`sleep` 要起睡眠编排；
+    /// * `span`：`drag` 要跳掉开头「还站在地上」的 35 帧；
+    /// * 其余段什么都不用做（整段循环）。
     fn after_switch(&mut self, id: &str) -> Result<()> {
         // 任何真正的姿态切换都结束「待机小动作」这场戏。
         self.action_playing = false;
-        if id == "drag" {
-            // 只播悬空段：素材前 35 帧人还站在地上，用户报的「拖一两秒才漂浮」就是它。
-            self.loop_span = Some((DRAG_LO, DRAG_HI));
-            self.frame = DRAG_LO;
-            return self.draw_frame();
+        let Some(spec) = clip(id) else {
+            return Ok(());
+        };
+        match spec.on_enter {
+            OnEnter::Sleep => {
+                self.sleep_cycle = Some(SleepCycle::new());
+                self.apply_sleep_span();
+            }
+            OnEnter::Idle => {
+                let delay = self.next_sleep_delay();
+                self.brain.set_sleep_after(delay);
+                self.schedule_next_action();
+            }
+            OnEnter::Plain => {}
         }
-        if id == "sleep" {
-            self.sleep_cycle = Some(SleepCycle::new());
-            self.apply_sleep_span();
-            self.frame = self.loop_span.map_or(0, |(lo, _)| lo);
-            return self.draw_frame();
+        if let Some((lo, hi)) = spec.span {
+            // 睡眠段自己会设区间（分三截），不要盖掉。
+            if spec.on_enter != OnEnter::Sleep {
+                self.loop_span = Some((lo, hi));
+            }
         }
-        if id == "idle" {
-            let delay = self.next_sleep_delay();
-            self.brain.set_sleep_after(delay);
-            self.schedule_next_action();
+        // 有区间就把帧号摆到段首并重画（`drag` 直接就是悬空那一帧）。
+        if let Some((lo, _)) = self
+            .loop_span
+            .filter(|_| spec.span.is_some() || spec.on_enter == OnEnter::Sleep)
+        {
+            self.frame = lo;
+            return self.draw_frame();
         }
         Ok(())
     }
 
-    /// 按这段素材自己的参数走一趟：**朝向、迈步区间都不看统一规则**。
+    /// 按这段素材自己的参数走一趟：朝向、迈步区间都来自参数表。
     ///
-    /// 返回 `false` 表示这段走不了（一般是那个方向已经贴墙，或者素材不在）——
+    /// 返回 `false` 表示这段走不了（那个方向已经贴墙，或者素材不在）——
     /// 调用方应把动画退回待机，而不是让它在原地比划。
-    fn try_begin_walk(&mut self, clip: &'static MoveClip) -> bool {
-        if self.manifest.require(clip.id).is_err() {
+    fn begin_walk(&mut self, spec: &'static ClipSpec) -> bool {
+        let Some(walk) = spec.walk.as_ref() else {
             return false;
-        }
-        let Ok(entry) = self.manifest.require(&self.current) else {
+        };
+        let Ok(entry) = self.manifest.require(spec.id) else {
             return false;
         };
         let limits = self.limits_for(entry);
@@ -1200,7 +1289,7 @@ impl Pet {
         let room_right = limits.x.1 - here;
         // 素材朝哪边就往哪边走；做不了水平翻转，所以不拗着来。
         // 方向不明显的段（原地踏步）两边都行，贴墙的一边自动排除。
-        let dir = match clip.faces_left {
+        let dir = match walk.faces_left {
             Some(true) => {
                 if room_left <= 24.0 {
                     return false;
@@ -1232,14 +1321,16 @@ impl Pet {
             return false;
         }
 
-        if self.play(clip.id).is_err() {
+        if self.play(spec.id).is_err() {
             return false;
         }
         // 从「真正在迈步」的那一帧开始循环，跳过开头的起势——
         // 这就是用户看到的「先移动、一秒后才开始走」的那个一秒。
         let last = self.current_count().saturating_sub(1);
-        let lo = clip.lo.min(last);
-        let hi = clip.hi.min(last).max(lo);
+        let (lo, hi) = match spec.span {
+            Some((a, b)) => (a.min(last), b.min(last).max(a.min(last))),
+            None => (0, last),
+        };
         self.loop_span = Some((lo, hi));
         self.frame = lo;
         let _ = self.draw_frame();
@@ -1277,10 +1368,10 @@ impl Pet {
     ///
     /// 逐段验：每段都得跳过自己的前摇、朝素材自己的方向走。
     pub(crate) fn wander_with(&mut self, id: &str) -> bool {
-        let Some(clip) = MOVE_CLIPS.iter().find(|c| c.id == id) else {
+        let Some(spec) = clip(id) else {
             return false;
         };
-        let started = self.try_begin_walk(clip);
+        let started = self.begin_walk(spec);
         if started {
             self.action_playing = true;
         }

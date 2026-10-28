@@ -717,6 +717,24 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         );
     }
 
+    // ---- 参数表自身：带区间的段都得「跳过前摇」且装得下整个动作 ----
+    // 这条就是用户要求的「每段动画都验一遍」：以后加新素材，表里写错区间会当场报。
+    let mut bad: Vec<String> = Vec::new();
+    for id in ["drag", "move_float", "move_crab"] {
+        match Pet::clip_span(id) {
+            Some((lo, hi)) if lo >= 1 && hi > lo + 60 => {}
+            other => bad.push(format!("{id}={other:?}")),
+        }
+    }
+    r.check(
+        &format!(
+            "参数表里的区间都跳过了前摇（drag / move_float / move_crab{}{}）",
+            if bad.is_empty() { "" } else { "，异常：" },
+            bad.join(", ")
+        ),
+        bad.is_empty(),
+    );
+
     drop(pet);
     Ok(())
 }
