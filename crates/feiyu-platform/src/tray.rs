@@ -66,7 +66,9 @@ impl TrayIcon {
     /// 本函数**不持有**这个 `HICON`；传进来的句柄必须比托盘图标的寿命更长。
     pub fn set_icon(&self, icon: HICON) -> Result<()> {
         let mut data = data_for(self.hwnd, "");
-        data.uFlags = NIF_ICON;
+        // 把 `NIF_MESSAGE` 一并带上：换图标同时重新声明回调配对，
+        // 免得某些 shell 版本把这条记录的回调字段当成「未提供」而改掉。
+        data.uFlags = NIF_ICON | NIF_MESSAGE;
         data.hIcon = icon;
         // SAFETY: data 是完整的 NOTIFYICONDATAW，hIcon 在调用期间有效。
         if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {

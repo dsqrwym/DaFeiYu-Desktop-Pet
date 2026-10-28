@@ -438,6 +438,19 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         pet.mood() == Some(Mood::Happy),
     );
 
+    // 点击反应是**一次性**的：演完一圈就回待机。
+    // 不收回的话 `click_happy` 会一直循环（用户：「被点击后的动画一直在重复」）。
+    let click_anim = pet.current().to_owned();
+    let went_back = pet.advance_frames(245)?;
+    r.check(
+        &format!(
+            "{click_anim} 只演一圈就回待机（{}，心情 {:?}，回待机 = {went_back}）",
+            pet.current(),
+            pet.mood()
+        ),
+        went_back && pet.current() == "idle" && pet.mood() == Some(Mood::Idle),
+    );
+
     // 移出阈值：进入被拖拽姿态；松手回到待机。
     pet.on_event(Event::MouseDown { x: 10, y: 10 })?;
     let (ml, mt, _, _) = pet.rect();

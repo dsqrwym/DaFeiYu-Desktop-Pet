@@ -30,6 +30,14 @@ use feiyu_platform::{CommandId, Event, Icon, LayeredWindow, Menu, TrayIcon};
 /// 脚底距工作区底边的空隙（像素）。
 const BOTTOM_GAP: i32 = 4;
 
+/// 藏进托盘后的慢拍子（毫秒）。
+///
+/// **不能停成 0**：托盘回调是 shell 用同步投递发给窗口的，事件进了队列要等
+/// 下一条被取出的消息才会被排空；定时器一停，那条 `TrayLeftClick` 就永远躺在
+/// 队列里（用户：「菜单隐藏后点托盘图标没反应」）。1 秒一拍既几乎不耗 CPU
+/// （实测隐藏 10 秒增量 0.0000s），又不至于让点击看起来没反应。
+const HIDDEN_TICK_MS: u32 = 1000;
+
 /// 单帧推进的时间上限：卡顿后不要一次跳过几十帧。
 const MAX_ANIM_DT: f32 = 0.1;
 
@@ -387,7 +395,9 @@ impl Pet {
             }
         }
         self.win.hide();
-        self.win.set_tick(0);
+        // 定时器不能完全停成 0：托盘回调这类事件进了队列要有人把泵叫醒才会被排空。
+        // 1 秒一拍，CPU 量不出来（实测 10 秒增量 0.0000s）。
+        self.win.set_tick(HIDDEN_TICK_MS);
     }
 
     /// 从托盘唤出。
@@ -741,7 +751,14 @@ impl Pet {
         if self.brain.mood() == Mood::Sleep {
             return self.wake_up();
         }
-        self.stimulate(Stimulus::Click)
+        self.stimulate(Stimulus::Click)?;
+        // 开心 / 生气是**一次性反应**，不是一种常态：标记成「演一圈」的模式，
+        // 播完一圈由 `step_frames` 收回待机。不标的话 `click_happy` 会一直循环
+        // ——用户看到的「点一下之后动画一直在重复」就是它。
+        if matches!(self.brain.mood(), Mood::Happy | Mood::Pout) {
+            self.action_playing = true;
+        }
+        Ok(())
     }
 
     /// 开始一次「醒来」：从**当前帧**接着演到最后一帧，播完回待机。
@@ -1109,6 +1126,12 @@ impl Pet {
         if self.waking {
             // 醒来那段播完：由状态机回到待机，不走 `click_happy`。
             self.waking = false;
+            self.stimulate(Stimulus::Awaken)?;
+            return Ok(true);
+        }
+        // 点击反馈（开心 / 生气）只演一遍：一圈播完就把心情交回待机。
+        // 素材里这两段都是 10 秒的循环片段，不收回就会一直重复播。
+        if matches!(self.brain.mood(), Mood::Happy | Mood::Pout) {
             self.stimulate(Stimulus::Awaken)?;
             return Ok(true);
         }

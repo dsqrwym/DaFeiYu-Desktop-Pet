@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use windows::core::PCWSTR;
+use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
     WPARAM,
@@ -26,11 +26,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
-    HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MSG,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, GetClassNameW, GetCursorPos,
+    GetMessageW, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MSG,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
     WM_APP, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP,
     WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
@@ -38,6 +38,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::{Error, Result};
+
+/// 动画定时器的 id（`SetTimer` 用）。
+const ANIM_TIMER: usize = 1;
+
+/// 唤醒定时器 id：**只把消息泵从等待里叫醒**，不产生 `Event::Tick`。
+///
+/// 为什么需要：托盘回调是 shell 用**同步投递**（`SendMessage`）发给窗口的，
+/// `wndproc` 把事件压进队列的那一刻，`GetMessageW` / `MsgWaitForMultipleObjects`
+/// 还在里面睡着——同步投递会被它们内部处理掉、但**不会让等待返回**，
+/// 于是队列里的 `TrayLeftClick` 要等下一条消息才会被处理。
+/// 平时动画定时器 8ms 一拍根本看不出；一隐藏（定时器停掉）就永远躺在队列里，
+/// 用户看到的就是「点了托盘图标没反应」。
+///
+/// 只在隐藏时开（可见时有动画定时器，不需要），间隔 300ms：
+/// 托盘点击最多迟 300ms，实测隐藏 CPU 仍然量不出来。
+const WAKE_TIMER: usize = 2;
+/// 隐藏期间的唤醒间隔（毫秒）。
+const WAKE_TIMER_MS: u32 = 300;
 
 /// 托盘图标的回调消息（`NOTIFYICONDATAW.uCallbackMessage`）。
 ///
@@ -204,7 +222,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = unsafe { GetCursorPos(&mut pt) };
             push(Event::RightClick { x: pt.x, y: pt.y });
         }
-        WM_TIMER => push(Event::Tick),
+        WM_TIMER => {
+            // 动画定时器产 Tick；唤醒定时器只负责把泵叫醒。
+            if wparam.0 == ANIM_TIMER {
+                push(Event::Tick);
+            }
+        }
         TRAY_MESSAGE => {
             // 没开 NOTIFYICON_VERSION_4：lparam 低字就是鼠标消息，
             // 坐标得自己取（v4 才会把坐标塞进 wparam）。
@@ -501,9 +524,23 @@ impl LayeredWindow {
         // SAFETY: 定时器 id 固定为 1，回调走 WM_TIMER。
         unsafe {
             if ms == 0 {
-                let _ = KillTimer(Some(self.hwnd), 1);
+                let _ = KillTimer(Some(self.hwnd), ANIM_TIMER);
             } else {
-                let _ = SetTimer(Some(self.hwnd), 1, ms, None);
+                let _ = SetTimer(Some(self.hwnd), ANIM_TIMER, ms, None);
+            }
+        }
+    }
+
+    /// 隐藏期间专用的「叫醒泵」定时器：只唤醒，不产生任何事件。
+    ///
+    /// 详见 [`WAKE_TIMER`] 的注释——没有它，隐藏后托盘点击会被积在队列里。
+    pub fn set_wake_timer(&self, on: bool) {
+        // SAFETY: 句柄有效，timer id 与动画定时器错开。
+        unsafe {
+            if on {
+                let _ = SetTimer(Some(self.hwnd), WAKE_TIMER, WAKE_TIMER_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), WAKE_TIMER);
             }
         }
     }
@@ -612,8 +649,29 @@ impl Drop for LayeredWindow {
 /// 只按类名找、不限定窗口名：本项目只有一个窗口类，且它带 `WS_EX_TOOLWINDOW`，
 /// 不会在 Alt+Tab 里露面，不会和别的程序撞名。
 pub fn find_window() -> Option<HWND> {
-    // SAFETY: 只读查找，不传窗口名（PCWSTR::null）。
-    unsafe { FindWindowW(window_class(), PCWSTR::null()) }.ok()
+    // **不能用 `FindWindowW`**：实测对本进程这类 `WS_EX_NOACTIVATE` 的分层窗口
+    // 它会返回 0（同一个类名，`EnumWindows` 却能找到）。它坏了的话，第二份进程
+    // 会以为「没人在跑」然后静默退出——用户看到的就是「再点一次 exe 没反应」。
+    let mut found: Option<HWND> = None;
+    // SAFETY: 回调只写 found，不碰其他状态。
+    unsafe {
+        let _ = EnumWindows(Some(enum_find), LPARAM(&mut found as *mut _ as isize));
+    }
+    found
+}
+
+/// [`find_window`] 的枚举回调：只认本窗口类名的第一个窗口。
+unsafe extern "system" fn enum_find(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: lparam 是 find_window 传进来的 `&mut Option<HWND>`，调用期间有效。
+    let slot = unsafe { &mut *(lparam.0 as *mut Option<HWND>) };
+    let mut buf = [0u16; 64];
+    // SAFETY: buf 是栈上定长缓冲。
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "FeiYuPetWindow" {
+        *slot = Some(hwnd);
+        return BOOL(0); // 找到了，停
+    }
+    BOOL(1)
 }
 
 /// 请已经在跑的那个实例把自己唤出来。
@@ -636,6 +694,7 @@ pub fn quit() {
 ///
 /// 回调里可以安全调用 [`LayeredWindow`] 的方法——事件出队后才回调，
 /// 不会持锁进入用户代码。
+///
 pub fn pump(mut on_event: impl FnMut(Event)) -> Result<()> {
     let mut msg = MSG::default();
     loop {
@@ -655,6 +714,8 @@ pub fn pump(mut on_event: impl FnMut(Event)) -> Result<()> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // 每取到一条消息就把队列排空：托盘回调这类**同步投递**产生的事件
+        // 就是靠这一步（或者靠隐藏期间的唤醒定时器）被处理的。
         loop {
             let ev = with_state(|s| s.queue.pop_front()).flatten();
             match ev {
