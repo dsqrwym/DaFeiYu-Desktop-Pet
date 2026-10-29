@@ -89,15 +89,27 @@ powershell -ExecutionPolicy Bypass -File tools/package.ps1 -AnimDir assets/h264
 | 运行方式 | DSH 插件：浏览器 overlay 或 Electron 透明窗 | 原生 Win32 分层窗口 |
 | 依赖 | DSH + Node；桌面模式首次下载 Electron 约 104MB | 无，解压就能跑 |
 | 磁盘 | webm 51.8MB + Electron 约 104MB 下载 | **71.1MB**（H.264 + 掩码 + 两个 exe）；旧 `.fishanim` 包 583.1MB |
-| 内存 | 没在本机装 DSH 实测 | 旧 `.fishanim` 包 10.5MB RSS / 2.4MB 私有 / 4 线程；H.264 包未单独复测 |
-| CPU | 没实测 | 旧包可见时约 0.3%~2.8% 单核（12 核整机 0.1%~0.25%），隐藏 0% |
+| 内存 | 没在本机装 DSH 实测 | H.264 包可见 55.0MB RSS / 39.8MB 私有 / 40 线程；旧 `.fishanim` 包 10.5MB / 2.4MB / 4 线程 |
+| CPU | 没实测 | H.264 包可见约 7.9% 单核（12 核整机 0.66%）；旧 `.fishanim` 包 0.3%~2.8% 单核 |
 | 单帧 | — | H.264 约 0.24ms（解码 + 掩码）；旧 `.fishanim` 0.265ms |
 
 磁盘现在和原版同一量级（71MB vs webm 51.8MB + Electron 约 104MB）。
 旧 `.fishanim` 包 583MB 保留作对照，它换来的是“不依赖 Media Foundation、逐帧随机访问最直接”。
 原版的内存我没有实测，不写估数；能确定的是 Electron/Chromium 的底噪远不止 10MB。
 
-CPU 波动是因为窗口被遮挡时 DWM 会跳过合成；60 秒采样的历史值在 1.4%~1.7% 单核。
+### H.264 包的实测（单独一组，不和旧包混）
+
+用 `dist/feiyu/feiyu.exe --run 45`，5 秒预热后取 30 秒窗口：
+
+- 可见：RSS **55.0MB**、私有 **39.8MB**、**40 线程**、CPU **7.91% 单核**（12 核整机 0.66%）；
+- 隐藏：RSS **39.7MB**、私有 **22.1MB**、19 线程、CPU **0%**；
+- 全量 `--showcase`：**100/100 段**、退出码 0、墙钟 **16.7 分钟**。
+
+H.264 包比旧 `.fishanim` 包多占约 5 倍内存、线程数也明显更多——这是 Media Foundation
+解码器/线程池的代价；CPU 折到 12 核整机只有 0.66%，但单核读数确实比旧包高。
+旧包的 10.5MB / 4 线程 / 0.3%~2.8% 是另一套数字，不要和这一组平均。
+
+CPU 波动是因为窗口被遮挡时 DWM 会跳过合成；旧包 60 秒采样的历史值在 1.4%~1.7% 单核。
 
 ## 功能
 
@@ -115,6 +127,14 @@ cargo test --workspace --release          # 110
 
 `selftest` 真的开窗口、真的提交位图、真的抓屏，覆盖透明、命中测试、菜单结构、托盘、
 脚底对齐、睡眠帧区间、打字联动。`cargo test` 只测纯逻辑。
+
+全量演示：
+
+```powershell
+.\dist\feiyu\feiyu-cli.exe --showcase
+```
+
+100 段各播完整一圈，约 16.7 分钟；本次实际跑完 100/100，退出码 0。
 
 常用诊断：
 
