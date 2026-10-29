@@ -3,13 +3,18 @@
 # feiyu.exe is the GUI build (double-click, no console); feiyu-cli.exe is the console
 # build used for --selftest / --list / --showcase and other diagnostics.
 # config.json is a copy of config.example.json; edit it and restart to tune behavior.
+# -AnimDir selects the packed assets (assets/anim for .fishanim, assets/h264 for
+# .fishvid + .fishmask); the output layout is always assets/anim so the exe default
+# directory does not change.
 # ASCII only: Windows PowerShell 5.1 reads BOM-less files as ANSI.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File tools/package.ps1
+#   powershell -ExecutionPolicy Bypass -File tools/package.ps1 -AnimDir assets/h264
 #   powershell -ExecutionPolicy Bypass -File tools/package.ps1 -Zip
 param(
     [string]$Out = 'dist\feiyu',
+    [string]$AnimDir = 'assets\anim',
     [switch]$Zip
 )
 
@@ -22,9 +27,9 @@ try {
     cargo build --release -p feiyu-app
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
-    $manifest = Join-Path $root 'assets\anim\manifest.json'
+    $manifest = Join-Path $root (Join-Path $AnimDir 'manifest.json')
     if (-not (Test-Path $manifest)) {
-        throw 'assets/anim/manifest.json not found; run pack-anim first (see README)'
+        throw "$AnimDir/manifest.json not found; run pack-anim first"
     }
 
     Write-Host "[2/4] prepare $Out"
@@ -43,7 +48,7 @@ try {
     Write-Host '[3/4] copy exe + assets'
     Copy-Item (Join-Path $root 'target\release\feiyu.exe') $Out
     Copy-Item (Join-Path $root 'target\release\feiyu-cli.exe') $Out
-    Copy-Item -Recurse (Join-Path $root 'assets\anim') (Join-Path $Out 'assets\anim')
+    Copy-Item -Recurse (Join-Path $root $AnimDir) (Join-Path $Out 'assets\anim')
     foreach ($f in 'README.md', 'NOTICE.md', 'LICENSE') {
         if (Test-Path (Join-Path $root $f)) { Copy-Item (Join-Path $root $f) $Out }
     }

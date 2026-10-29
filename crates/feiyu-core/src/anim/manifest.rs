@@ -8,7 +8,7 @@
 //! 因此画布中的落脚行 = `origin_y + baseline`，切换动画时只要保持这一行不动，
 //! 角色的脚就不会跳。
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -39,6 +39,18 @@ pub struct Canvas {
     pub height: u16,
 }
 
+/// 一段动画的存储方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub enum ClipCodec {
+    /// 旧的 `.fishanim`：预乘 BGRA + zstd。
+    #[default]
+    #[serde(rename = "fishanim")]
+    FishAnim,
+    /// H.264 颜色 + 独立 `.fishmask`。
+    #[serde(rename = "h264")]
+    H264,
+}
+
 /// 一段动画。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnimEntry {
@@ -48,6 +60,12 @@ pub struct AnimEntry {
     pub name: String,
     /// 相对清单所在目录的文件名。
     pub file: String,
+    /// 存储方式；缺省等于旧 `.fishanim`。
+    #[serde(default)]
+    pub codec: ClipCodec,
+    /// H.264 条目必填：同目录下的 `.fishmask` 文件名。
+    #[serde(default)]
+    pub mask: Option<String>,
     /// 裁切后的帧尺寸 `[宽, 高]`。
     pub size: [u16; 2],
     /// 裁切原点 `[x, y]`，相对原画布。
@@ -79,6 +97,16 @@ impl AnimEntry {
     /// 清单磁盘位置 → 动画文件磁盘位置。
     pub fn path_in(&self, dir: &Path) -> PathBuf {
         dir.join(&self.file)
+    }
+
+    /// 清单磁盘位置 → 掩码文件磁盘位置；`.fishanim` 条目返回 `None`。
+    pub fn mask_path_in(&self, dir: &Path) -> Option<PathBuf> {
+        self.mask.as_deref().map(|m| dir.join(m))
+    }
+
+    /// 是否是 H.264 + 独立掩码。
+    pub fn is_video(&self) -> bool {
+        self.codec == ClipCodec::H264
     }
 }
 
@@ -125,6 +153,34 @@ impl Manifest {
             if a.size[0] == 0 || a.size[1] == 0 {
                 return Err(AnimError::Manifest(format!("{} 的帧尺寸为 0", a.id)));
             }
+            if !is_plain_file_name(&a.file) {
+                return Err(AnimError::Manifest(format!(
+                    "{} 的文件名必须是同目录下的普通文件名: {}",
+                    a.id, a.file
+                )));
+            }
+            match (a.codec, a.mask.as_deref()) {
+                (ClipCodec::H264, Some(mask)) if is_plain_file_name(mask) => {}
+                (ClipCodec::H264, Some(mask)) => {
+                    return Err(AnimError::Manifest(format!(
+                        "{} 的 mask 必须是同目录下的普通文件名: {mask}",
+                        a.id
+                    )));
+                }
+                (ClipCodec::H264, None) => {
+                    return Err(AnimError::Manifest(format!(
+                        "{} 是 h264，但缺少 mask",
+                        a.id
+                    )));
+                }
+                (ClipCodec::FishAnim, Some(_)) => {
+                    return Err(AnimError::Manifest(format!(
+                        "{} 是 fishanim，不应该带 mask",
+                        a.id
+                    )));
+                }
+                (ClipCodec::FishAnim, None) => {}
+            }
             if a.frames == 0 {
                 return Err(AnimError::Manifest(format!("{} 没有帧", a.id)));
             }
@@ -163,6 +219,15 @@ impl Manifest {
     }
 }
 
+/// 只允许 `dir.join(name)` 里的普通文件名，避免 `../` 或绝对路径把读取带出素材目录。
+fn is_plain_file_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +257,8 @@ mod tests {
         let idle = m.require("idle").expect("idle 存在");
         assert_eq!(idle.width(), 211);
         assert_eq!(idle.height(), 241);
+        assert_eq!(idle.codec, ClipCodec::FishAnim, "缺 codec 默认是 fishanim");
+        assert!(idle.mask.is_none());
         // 落脚行 = origin_y + baseline，这是切动画时对齐的唯一依据。
         assert_eq!(idle.feet_row(), 287);
         assert_eq!(m.require("sleep").unwrap().feet_row(), 290);
@@ -199,6 +266,60 @@ mod tests {
             idle.path_in(Path::new("assets/anim")).to_string_lossy(),
             "assets/anim\\idle.fishanim"
         );
+    }
+
+    const VIDEO: &str = r#"{
+        "format": 1,
+        "canvas": { "width": 544, "height": 306 },
+        "native_height": 306,
+        "fps": 24,
+        "animations": [
+            { "id": "eat", "name": "吃西瓜", "codec": "h264",
+              "file": "eat.fishvid", "mask": "eat.fishmask",
+              "size": [201, 239], "origin": [172, 47], "baseline": 234,
+              "frames": 241, "bytes": 700000 }
+        ]
+    }"#;
+
+    #[test]
+    fn parses_h264_entry_and_mask_path() {
+        let m = Manifest::from_json(VIDEO).expect("解析 h264 清单");
+        let eat = m.require("eat").unwrap();
+        assert!(eat.is_video());
+        assert_eq!(eat.codec, ClipCodec::H264);
+        assert_eq!(
+            eat.path_in(Path::new("assets/anim")),
+            Path::new("assets/anim").join("eat.fishvid")
+        );
+        assert_eq!(
+            eat.mask_path_in(Path::new("assets/anim")).unwrap(),
+            Path::new("assets/anim").join("eat.fishmask")
+        );
+    }
+
+    #[test]
+    fn h264_requires_mask() {
+        let bad = VIDEO.replace(r#", "mask": "eat.fishmask""#, "");
+        match Manifest::from_json(&bad) {
+            Err(AnimError::Manifest(msg)) => assert!(msg.contains("mask"), "{msg}"),
+            other => panic!("期望缺 mask 报错，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_path_escape_in_file_or_mask() {
+        let bad_file = VIDEO.replace(r#"file": "eat.fishvid"#, r#"file": "../eat.fishvid"#);
+        match Manifest::from_json(&bad_file) {
+            Err(AnimError::Manifest(msg)) => assert!(msg.contains("普通文件名"), "{msg}"),
+            other => panic!("期望拒绝路径逃逸，实际 {other:?}"),
+        }
+        let bad_mask = VIDEO.replace(r#"mask": "eat.fishmask"#, r#"mask": "../eat.fishmask"#);
+        match Manifest::from_json(&bad_mask) {
+            Err(AnimError::Manifest(msg)) => {
+                assert!(msg.contains("mask") && msg.contains("普通文件名"))
+            }
+            other => panic!("期望拒绝 mask 路径逃逸，实际 {other:?}"),
+        }
     }
 
     #[test]

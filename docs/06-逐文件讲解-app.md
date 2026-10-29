@@ -10,6 +10,7 @@ crates/feiyu-app/src/
 ├── bin/feiyu-cli.rs  console 入口（诊断）
 ├── pet/
 │   ├── mod.rs       Pet 结构体、open、tick、事件、渲染、托盘、几何
+│   ├── frame_source.rs  帧源抽象：fishanim / h264 + mask
 │   ├── clips.rs     动画参数表 / 分类 / 随机池
 │   ├── menu.rs      右键菜单与点播
 │   ├── walk.rs      走路
@@ -163,11 +164,12 @@ pump(|ev| {
 
 # 二、`pet/`：一只桌宠的全部状态
 
-拆之前是一个约 2700 行的 `pet.rs`。现在按“改什么的时候要一起改”拆成 8 个文件：
+拆之前是一个约 2700 行的 `pet.rs`。现在按“改什么的时候要一起改”拆成 9 个文件：
 
 | 文件 | 管什么 | 什么时候动它 |
 |---|---|---|
 | `mod.rs` | `Pet` 字段、`open`、`tick`、事件、渲染、托盘、几何 | 改主循环或窗口行为 |
+| `frame_source.rs` | `FrameSource` trait、`FishAnimSource`、`VideoSource` | 换编码器或改帧来源 |
 | `clips.rs` | 每段的帧区间/朝向/步频、分类、随机池权重 | 加素材、调权重、修前摇 |
 | `menu.rs` | `Action`、菜单构建、命令派发、点播 | 加菜单项/改点播规则 |
 | `walk.rs` | `Walk` 和位移推进 | 调步频、贴墙、走路打断 |
@@ -186,7 +188,7 @@ pub struct Pet {
     win: LayeredWindow,              // 窗口
     manifest: Manifest,              // 清单
     cfg: Config,                     // 用户配置（只读）
-    anims: HashMap<String, Anim>,    // 已打开的动画（有上限）
+    anims: HashMap<String, Box<dyn FrameSource>>, // 已打开的动画（有上限）
     current: String, frame: u32, acc: f32,   // 当前动画与播放位置
     anchor_x: i32, feet_y: i32,      // 锚点（画布坐标）
     brain: Brain,                    // 心情状态机
@@ -230,6 +232,18 @@ pet.draw_frame()?;
 - 池子要在 `manifest` 被 move 进 `Pet` 之前建（字段按声明顺序求值）；
 - `cfg` 在 `open` 之前读好，`Pet` 只读不写；改配置要重启。
 - 先抽入睡时间、排随机动作，再画第一帧。
+
+`ensure_loaded` 不再直接打开 `AnimReader`，而是交给 `frame_source::open(dir, entry, fps)`：
+
+```rust
+match entry.codec {
+    FishAnim => Box::new(FishAnimSource::open(...)),
+    H264 => Box::new(VideoSource::open(video, mask, entry, fps)),
+}
+```
+
+`VideoSource` 用 Media Foundation 解颜色，再按 `.fishmask` 的 1 bit 把透明像素清零；
+输出的仍是预乘 BGRA，所以 `draw_frame`、接缝、镜像完全不知道编码器换了。
 
 ## 2.3 `tick`：每 8ms 的决策顺序
 

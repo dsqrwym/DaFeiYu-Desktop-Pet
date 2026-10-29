@@ -30,6 +30,7 @@ pub mod screen;
 pub mod shot;
 pub mod tray;
 pub mod typing;
+pub mod video;
 pub mod window;
 
 pub use console::prepare_console;
@@ -41,6 +42,7 @@ pub use menu::{CommandId, Menu};
 pub use screen::primary_work_area;
 pub use tray::TrayIcon;
 pub use typing::{disable_typing, enable_typing, typing_installed, typing_keys};
+pub use video::VideoReader;
 pub use window::{find_window, pump, quit, wake, Event, LayeredWindow, TRAY_MESSAGE};
 
 /// 平台层错误。
@@ -54,6 +56,8 @@ pub enum Error {
     },
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
+    #[error("视频解码失败：{0}")]
+    Video(String),
 }
 
 impl Error {

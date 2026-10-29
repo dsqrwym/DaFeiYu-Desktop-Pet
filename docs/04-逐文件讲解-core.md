@@ -11,6 +11,7 @@ crates/feiyu-core/src/
 │   └── manifest.rs   manifest.json：id → 文件 + 几何
 ├── brain.rs          心情状态机
 ├── config.rs         用户参数（默认值 / JSON / 范围收敛）
+├── mask.rs           `.fishmask` 1-bit alpha 掩码
 ├── motion.rs         甩出后的滑行/下落/反弹
 ├── pool.rs           带权重的随机池
 ├── rng.rs            xorshift64 随机数（不引第三方）
@@ -195,6 +196,10 @@ self.r.read_exact(&mut self.staged)?;
 - `origin`：裁切帧左上角在 544×306 画布中的位置；
 - `baseline`：**帧内**脚底线；
 - `feet_row()` = `origin_y + baseline`：换算到画布坐标的脚底线。
+
+H.264 条目另外有 `codec: "h264"`、`file: "*.fishvid"`、`mask: "*.fishmask"`；
+旧 `.fishanim` 条目没有 `codec` 字段，反序列化时默认 `FishAnim`，所以旧清单不用改。
+`Manifest::validate` 会检查 `h264` 必须有 mask、文件名不能带 `../` 或绝对路径。
 
 ### 3.2 读入即校验
 
@@ -470,7 +475,29 @@ pub struct Config {
 
 ---
 
-## 10. 本章验收
+## 10. `mask.rs`：1-bit alpha 掩码
+
+H.264 颜色不携带 alpha；透明信息单独存成 `.fishmask`：
+
+```text
+0   8  "FISHMSK1"
+8   2  width   u16
+10  2  height  u16
+12  4  frames  u32
+16  ... zstd(逐帧 1-bit 掩码，frame-major，LSB-first)
+```
+
+- 每帧 `ceil(width×height/8)` 字节，alpha ≥ 128 记为 1；
+- 整份解压，`MaskSet::frame_bits(idx)` 随机读任意帧；
+- 241 帧的掩码压缩后约 85~110KB，解压后约 1.5MB；
+- `MaskSet::matches(w,h,frames)` 在打开视频时和清单对账。
+
+为什么不把 alpha 编进 H.264：H.264 的 alpha 也是有损的，硬透明边缘会出现光晕；
+1-bit 掩码是精确的。代价是内存里多一份位图，但只保留当前/预加载的 clip。
+
+---
+
+## 11. 本章验收
 
 - [ ] 能解释 `.fishanim` 为什么用“帧表 + 绝对偏移”；
 - [ ] 能说出差分的 `resume` 条件为什么必须比较“链号”；

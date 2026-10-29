@@ -16,7 +16,10 @@ pub mod pool;
 pub mod rng;
 pub mod sleep;
 
-pub use anim::{AnimEntry, AnimError, AnimHeader, AnimReader, Codec, FrameEntry, Manifest};
+pub use anim::{
+    AnimEntry, AnimError, AnimHeader, AnimReader, ClipCodec, Codec, FrameEntry, Manifest,
+    MaskError, MaskSet,
+};
 pub use brain::{Brain, Mood, Stimulus};
 pub use config::{Config, Typing as TypingConfig, Walk as WalkConfig};
 pub use motion::{fling_velocity, Limits, Motion};

@@ -13,13 +13,11 @@
 //! 窗口每帧跟着锚点走，所以滑行途中换动画也不会跳位。
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{ensure, Context, Result};
-use feiyu_core::anim::{AnimEntry, AnimReader, Manifest};
+use anyhow::{Context, Result};
+use feiyu_core::anim::{AnimEntry, Manifest};
 use feiyu_core::brain::{Brain, Mood, Stimulus};
 use feiyu_core::config::Config;
 use feiyu_core::motion::{fling_velocity, Limits, Motion};
@@ -30,6 +28,7 @@ use feiyu_platform::{Event, Icon, LayeredWindow, TrayIcon};
 
 mod clips;
 mod follow;
+mod frame_source;
 mod menu;
 mod pixels;
 mod sleep;
@@ -37,6 +36,8 @@ mod typing;
 mod walk;
 
 pub use menu::Action;
+
+use frame_source::FrameSource;
 
 use clips::{clip, pool_items, ClipSpec, OnEnter, CATEGORIES, CLICK_IDS, CLIPS};
 use pixels::{blend_frame, mirror_bgra, ordered, seam_mad};
@@ -113,8 +114,6 @@ const SEAM_DISSOLVE_MAD: f32 = 3.0;
 /// （电影里的交叉叠化就是这么做的），循环周期也就刚好是区间长度，不多走时间。
 const SEAM_DISSOLVE_FRAMES: u32 = 6;
 
-type Anim = AnimReader<BufReader<File>>;
-
 /// 循环接缝的淡入。
 ///
 /// 素材里**找不到**「回绕时一模一样」的两帧：整段是画家一口气演完的 10 秒，
@@ -150,7 +149,7 @@ pub struct Pet {
     /// 用户配置（启动时加载一次，之后只读）。
     cfg: Config,
     /// 已打开的动画。按需加载，没播过的段不占内存。
-    anims: HashMap<String, Anim>,
+    anims: HashMap<String, Box<dyn FrameSource>>,
     current: String,
     /// 当前帧号（对当前动画取模）。
     frame: u32,
@@ -477,8 +476,8 @@ impl Pet {
     ///
     /// 取 `self.frame` 而不是第 0 帧：托盘里那个小东西才是「被暂存的大肥鱼」。
     ///
-    /// 成本几乎为零：`draw_frame()` 刚刚解过这一帧，[`AnimReader`] 的 `pos` 缓存会
-    /// 直接命中、返回已有缓冲。**但如果 `frame` 和 `pos` 不同步，这里会退化成
+    /// 成本几乎为零：`draw_frame()` 刚刚解过这一帧，[`FrameSource`] 的缓存会
+    /// 直接命中、返回已有缓冲。**但如果 `frame` 和内部位置不同步，这里会退化成
     /// 「从最近的关键帧重解整条差分链」（最坏 16 帧、~2.5ms）**，所以调用点必须
     /// 在 [`Self::draw_frame`] 之后，不能先改 `frame` 再来取。
     fn icon_of_current_frame(&mut self) -> Result<Icon> {
@@ -1389,30 +1388,14 @@ impl Pet {
             return Ok(());
         }
         let entry = self.manifest.require(id)?.clone();
-        let path = entry.path_in(&self.dir);
         let started = Instant::now();
-        let anim = AnimReader::open(&path)
-            .with_context(|| format!("打不开动画 {}（id={id}）", path.display()))?;
-        // 取证开关：首次加载要读文件 + 解 zstd + 建差分索引，
+        let source = frame_source::open(&self.dir, &entry, self.manifest.fps)
+            .with_context(|| format!("打不开动画 {id}（codec={:?}）", entry.codec))?;
+        // 取证开关：首次加载要读文件 + 解 zstd / 建 MF 解码器，
         // 如果它贵到几百毫秒，“提起来不跟手”就不在拖拽逻辑而在这一行。
         if std::env::var_os("FEIYU_DRAG_TRACE").is_some() {
             eprintln!("加载 {id}：{:.1}ms", started.elapsed().as_secs_f64() * 1e3);
         }
-        let header = *anim.header();
-        ensure!(
-            header.width == entry.width() && header.height == entry.height(),
-            "清单与文件尺寸不符（{id}）：清单 {}×{}，文件 {}×{}；请重新生成 manifest",
-            entry.width(),
-            entry.height(),
-            header.width,
-            header.height
-        );
-        ensure!(
-            header.frame_count == entry.frames,
-            "清单与文件帧数不符（{id}）：清单 {}，文件 {}；请重新生成 manifest",
-            entry.frames,
-            header.frame_count
-        );
         // 素材现在有 100 段：菜单从头点到尾会把每段都打开一次。每个读取器为了
         // 顺序播放不重解差分链，都持有一份整帧缓冲（几十万字节）；一百份叠起来
         // 是几十 MB 的隐性内存。只留「当前 + 待切 + idle/drag 预热」这几份，
@@ -1422,7 +1405,7 @@ impl Pet {
             let keep = [self.current.as_str(), id, "idle", "drag"];
             self.anims.retain(|k, _| keep.contains(&k.as_str()));
         }
-        self.anims.insert(id.to_owned(), anim);
+        self.anims.insert(id.to_owned(), source);
         Ok(())
     }
 }

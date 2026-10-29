@@ -17,14 +17,13 @@ mod decode;
 mod mask;
 
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
-use feiyu_core::anim::format::{self, AnimHeader};
-use feiyu_core::anim::AnimReader;
+use feiyu_core::anim::{format, AnimHeader, AnimReader, MaskSet};
 
 /// 中文素材名 → ASCII 文件名。中文只留在 `manifest.json` 里做显示，
 /// 文件名一律 ASCII：避免 git、zip、`ffmpeg` 三处的中文路径隐患。
@@ -150,6 +149,10 @@ struct Opts {
     out: PathBuf,
     height: u32,
     fps: f32,
+    /// 输出格式：旧的 `.fishanim` 或多段 H.264 + `.fishmask`。
+    codec: PackCodec,
+    /// H.264 的 CRF。
+    crf: i32,
     level: i32,
     /// 帧间差分的关键帧间隔（0/1 = 不差分）。
     delta: u16,
@@ -168,6 +171,29 @@ struct Opts {
     verify: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackCodec {
+    FishAnim,
+    H264,
+}
+
+impl PackCodec {
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "fishanim" => Ok(Self::FishAnim),
+            "h264" => Ok(Self::H264),
+            other => bail!("--codec 只能是 fishanim 或 h264（收到 {other}）"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FishAnim => "fishanim",
+            Self::H264 => "h264",
+        }
+    }
+}
+
 impl Default for Opts {
     fn default() -> Self {
         Self {
@@ -175,6 +201,8 @@ impl Default for Opts {
             out: PathBuf::from("assets"),
             height: 306,
             fps: 24.0,
+            codec: PackCodec::FishAnim,
+            crf: 20,
             level: 3,
             delta: 16,
             dump: 0,
@@ -223,6 +251,9 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let opts = parse_args()?;
     if let Some(dir) = &opts.verify {
+        if opts.codec == PackCodec::H264 {
+            bail!("--verify 目前只支持 fishanim；h264 的完整解码由应用自检验证");
+        }
         return verify(dir);
     }
     fs::create_dir_all(&opts.out)
@@ -234,11 +265,13 @@ fn run() -> Result<()> {
     }
 
     println!(
-        "打包 {} 段素材 → {}（高 {}px / {}fps / zstd {} / 差分 {} / 量化 {} 位 / 阈值 {} / 羽化 {} / 裁切 {}）\n",
+        "打包 {} 段素材 → {}（高 {}px / {}fps / codec {} / h264 CRF {} / zstd {} / 差分 {} / 量化 {} 位 / 阈值 {} / 羽化 {} / 裁切 {}）\n",
         jobs.len(),
         opts.out.display(),
         opts.height,
         opts.fps,
+        opts.codec.label(),
+        opts.crf,
         opts.level,
         opts.delta,
         opts.quant,
@@ -270,6 +303,8 @@ fn parse_args() -> Result<Opts> {
             "--out" => opts.out = PathBuf::from(value()?),
             "--height" => opts.height = value()?.parse().context("--height 需要正整数")?,
             "--fps" => opts.fps = value()?.parse().context("--fps 需要数字")?,
+            "--codec" => opts.codec = PackCodec::parse(&value()?)?,
+            "--crf" => opts.crf = value()?.parse().context("--crf 需要 0~51")?,
             "--level" => opts.level = value()?.parse().context("--level 需要整数")?,
             "--delta" => opts.delta = value()?.parse().context("--delta 需要 0 或正整数")?,
             "--dump" => opts.dump = value()?.parse().context("--dump 需要正整数")?,
@@ -294,6 +329,9 @@ fn parse_args() -> Result<Opts> {
     if opts.height < 16 {
         bail!("--height 太小（最小 16）");
     }
+    if opts.codec == PackCodec::H264 && !(0..=51).contains(&opts.crf) {
+        bail!("--crf 必须在 0~51 之间");
+    }
     Ok(opts)
 }
 
@@ -305,6 +343,8 @@ fn print_help() {
          \x20 --out <目录>       输出目录（默认 assets）\n\
          \x20 --height <px>      渲染高度（默认 306）\n\
          \x20 --fps <n>          写入帧头的帧率（默认 24）\n\
+         \x20 --codec <name>     fishanim（默认）或 h264\n\
+         \x20 --crf <n>          h264 的 CRF（默认 20）\n\
          \x20 --level <n>        zstd 级别，0 = 不压缩（默认 3）\n\
          \x20 --delta <n>        帧间差分的关键帧间隔，0/1 = 关闭（默认 16）\n\
          \x20 --dump <n>         每隔 n 帧导出一张 PNG 抽检（默认 0 = 不导出）\n\
@@ -469,13 +509,18 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
 
     let frame_count = frames.len() as u32;
     let raw_bytes = frame_count as u64 * (frame_w as u64 * frame_h as u64 * 4);
-    let header = AnimHeader::new(frame_w as u16, frame_h as u16, opts.fps, baseline)
-        .with_origin(origin_x as u16, origin_y as u16);
-    let packed = format::encode_with(header, frames, opts.level, opts.delta)?;
-
-    let path = opts.out.join(format!("{slug}.fishanim"));
-    let mut out = BufWriter::new(File::create(&path)?);
-    format::write(&mut out, &packed)?;
+    let packed_bytes = match opts.codec {
+        PackCodec::FishAnim => {
+            let header = AnimHeader::new(frame_w as u16, frame_h as u16, opts.fps, baseline)
+                .with_origin(origin_x as u16, origin_y as u16);
+            let packed = format::encode_with(header, frames, opts.level, opts.delta)?;
+            let path = opts.out.join(format!("{slug}.fishanim"));
+            let mut out = BufWriter::new(File::create(&path)?);
+            format::write(&mut out, &packed)?;
+            fs::metadata(&path)?.len()
+        }
+        PackCodec::H264 => pack_h264(opts, slug, &frames, frame_w, frame_h)?,
+    };
 
     Ok(Row {
         slug: slug.to_string(),
@@ -484,7 +529,7 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
         height: frame_h,
         frames: frame_count,
         raw_bytes,
-        packed_bytes: fs::metadata(&path)?.len(),
+        packed_bytes,
         baseline,
         elapsed_ms: started.elapsed().as_millis(),
         bbox,
@@ -492,6 +537,91 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
         origin: (origin_x, origin_y),
         canvas: (width, height),
     })
+}
+
+/// H.264 颜色 + 1-bit 掩码：颜色走 ffmpeg/libx264，掩码由 core 的 MaskSet 写成。
+fn pack_h264(opts: &Opts, slug: &str, frames: &[Vec<u8>], w: u32, h: u32) -> Result<u64> {
+    ensure!(
+        w <= u16::MAX as u32 && h <= u16::MAX as u32,
+        "帧尺寸超出 u16：{w}×{h}"
+    );
+    let video_path = opts.out.join(format!("{slug}.fishvid"));
+    let mask_path = opts.out.join(format!("{slug}.fishmask"));
+
+    let alpha_frames: Vec<Vec<u8>> = frames
+        .iter()
+        .map(|f| f.chunks_exact(4).map(|p| p[3]).collect())
+        .collect();
+    let masks = MaskSet::from_alpha_frames(w as u16, h as u16, &alpha_frames)?;
+    masks.save(&mask_path)?;
+
+    let raw_path =
+        std::env::temp_dir().join(format!("feiyu-pack-{}-{slug}.bgra", std::process::id()));
+    {
+        let mut raw = BufWriter::new(File::create(&raw_path)?);
+        for frame in frames {
+            raw.write_all(frame)?;
+        }
+        raw.flush()?;
+    }
+
+    let even_w = w + (w % 2);
+    let even_h = h + (h % 2);
+    let gop = opts.fps.round().max(1.0) as u32;
+    let size = format!("{w}x{h}");
+    let fps = opts.fps.to_string();
+    let crf = opts.crf.to_string();
+    let gop = gop.to_string();
+    let pad = format!("pad={even_w}:{even_h}:0:0:black,format=yuv420p");
+    let raw_arg = raw_path.to_string_lossy().into_owned();
+    let output = Command::new(&opts.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "rawvideo", "-pix_fmt", "bgra"])
+        .args(["-s", &size])
+        .args(["-framerate", &fps])
+        .args(["-i", &raw_arg])
+        .args([
+            "-vf",
+            &pad,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            &crf,
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            &fps,
+            "-g",
+            &gop,
+            "-keyint_min",
+            &gop,
+            "-sc_threshold",
+            "0",
+            "-an",
+            "-f",
+            "mp4",
+        ])
+        .arg(&video_path)
+        .output()
+        .with_context(|| format!("无法启动 ffmpeg（{}）", opts.ffmpeg))?;
+    let _ = fs::remove_file(&raw_path);
+    if !output.status.success() {
+        bail!(
+            "ffmpeg 编码 {slug} 失败：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let bytes = fs::metadata(&video_path)?.len() + fs::metadata(&mask_path)?.len();
+    println!(
+        "  {:<12} h264 颜色 {}  + 掩码 {}",
+        slug,
+        kib(fs::metadata(&video_path)?.len()),
+        kib(fs::metadata(&mask_path)?.len())
+    );
+    Ok(bytes)
 }
 
 /// 从画布帧里取出 `(x0, y0)` 起、`w × h` 的子矩形（逐行拷，保留预乘 BGRA）。
@@ -602,7 +732,13 @@ fn write_manifest(opts: &Opts, rows: &[Row]) -> Result<()> {
             "      \"name\": \"{}\",\n",
             json_escape(&row.name)
         ));
-        s.push_str(&format!("      \"file\": \"{}.fishanim\",\n", row.slug));
+        if opts.codec == PackCodec::H264 {
+            s.push_str("      \"codec\": \"h264\",\n");
+            s.push_str(&format!("      \"file\": \"{}.fishvid\",\n", row.slug));
+            s.push_str(&format!("      \"mask\": \"{}.fishmask\",\n", row.slug));
+        } else {
+            s.push_str(&format!("      \"file\": \"{}.fishanim\",\n", row.slug));
+        }
         s.push_str(&format!(
             "      \"size\": [{}, {}],\n      \"origin\": [{}, {}],\n",
             row.width, row.height, row.origin.0, row.origin.1

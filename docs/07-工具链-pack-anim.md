@@ -1,7 +1,7 @@
-# 07 工具链：`pack-anim`（webm → .fishanim）
+# 07 工具链：`pack-anim`（webm → .fishanim / .fishvid）
 
 `tools/pack-anim` 是一个独立的小程序：把上游 640×360 的透明 webm 变成运行时
-零转换成本的 `.fishanim`。它只依赖 `feiyu-core` 的格式定义，解码交给外部 ffmpeg。
+零转换成本的 `.fishanim`，或 H.264 颜色 + 1-bit 掩码。它只依赖 `feiyu-core` 的格式定义，解码交给外部 ffmpeg。
 
 ```
 crates/feiyu-core/src/anim/format.rs   ← 格式定义
@@ -180,6 +180,26 @@ let ground = bottoms.iter().enumerate()
 
 `id` 是稳定契约：状态机、随机池、菜单都用它，文件名可以随打包策略变化。
 
+### 6.1 H.264 模式：`.fishvid + .fishmask`
+
+```powershell
+cargo run -p pack-anim --release -- `
+  --src _upstream/dsh-pet/dsh-pet/assets/webm `
+  --out assets/h264 --codec h264 --crf 20
+```
+
+对每段写出：
+
+- `<slug>.fishvid`：颜色 H.264（MP4 内容，`.fishvid` 扩展名）；
+- `<slug>.fishmask`：1-bit alpha + zstd（见 `core/anim/mask.rs`）；
+- manifest 条目增加 `"codec": "h264"`、`"mask"`，`bytes` 是视频 + 掩码。
+
+编码命令显式写 `-framerate <fps> -r <fps>`。不写的话 ffmpeg 对 rawvideo 默认 25fps，
+而 manifest 是 24fps，seek 第 240 帧会提前 EOS——原型踩过一次。
+
+颜色尺寸补到偶数宽高；解码端裁回清单里的 `size`。CRF20 全量 100 段实测约 69.5MB 素材，
+打包后 71.1MB。
+
 ---
 
 ## 7. 中文名 → 文件名
@@ -205,7 +225,10 @@ let ground = bottoms.iter().enumerate()
 # 全量打包（约 3 分钟）
 cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim
 
-# 只自检：逐个解帧、倒序重取一遍，确认差分链从任意位置重算都一致
+# 生产格式：H.264 颜色 + 1-bit 掩码（全量约 2~3 分钟）
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20
+
+# 只自检（fishanim）：逐个解帧、倒序重取一遍，确认差分链从任意位置重算都一致
 cargo run -p pack-anim --release -- --verify assets/anim
 ```
 

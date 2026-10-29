@@ -11,23 +11,28 @@ DeepSeek 鲸鱼娘「大肥鱼」的 Windows 桌宠。素材和交互参考 dsh-
 
 ## 素材是怎么处理的
 
-上游给的是 106 段 VP9 + alpha 的 webm。直接播要带 libvpx，启动慢、发版也大，所以我
-写了个打包器，把 webm 转成自己的 `.fishanim`：预乘 BGRA + zstd，取一帧解一帧，
-解出来直接交给 `UpdateLayeredWindow`。
+上游给的是 106 段 VP9 的 webm。直接播要带 libvpx，启动慢、发版也大，所以我自己写打包器。
+现在有两种产物：
 
-这样运行时没有任何解码依赖，24fps 下单帧大约 0.27ms。代价是体积：100 段约 580MB，
-原始 webm 只有 52MB。
+- **生产格式**：H.264 颜色 `.fishvid` + 1-bit alpha `.fishmask`，100 段约 71MB；
+- **旧格式**：`.fishanim`，预乘 BGRA + zstd，100 段约 582MB，保留兼容和对照。
+
+H.264 颜色由 Media Foundation 解码，alpha 不交给视频编码，单独存 1 bit/像素，
+所以透明边缘没有被有损压缩糊掉。运行时仍然没有第三方解码器依赖。
+
+旧格式取一帧解一帧，单帧约 0.27ms；H.264 原型单帧约 0.24ms（解码 + 套掩码），
+两者都在 24fps 下很轻。
 
 ## 直接运行
 
-`dist/feiyu/` 是打好的包：
+`dist/feiyu/` 是打好的包（H.264 格式，约 71MB）：
 
 ```
 dist/feiyu/
   feiyu.exe       双击运行，没有控制台窗口
   feiyu-cli.exe   命令行诊断（--selftest / --list / --showcase）
   config.json     可调参数，改完重启生效
-  assets/anim/    100 段 .fishanim
+  assets/anim/    100 段 .fishvid + 100 段 .fishmask
 ```
 
 素材就在 exe 旁边，不需要装 Rust。两个 exe 各约 0.8MB（共约 1.6MB），图标已经嵌进资源段。
@@ -62,6 +67,9 @@ GUI 子系统又拿不到同步的命令行输出。所以 GUI 版负责日常�
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/fetch-assets.ps1
+# 生产格式：H.264 + 1-bit 掩码
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20
+# 旧格式（可选，保留兼容/对照）
 cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim
 cargo run -p feiyu-app --release
 ```
@@ -71,7 +79,7 @@ cargo run -p feiyu-app --release
 打发布包：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools/package.ps1
+powershell -ExecutionPolicy Bypass -File tools/package.ps1 -AnimDir assets/h264
 ```
 
 ## 和原版比
@@ -80,13 +88,14 @@ powershell -ExecutionPolicy Bypass -File tools/package.ps1
 |---|---|---|
 | 运行方式 | DSH 插件：浏览器 overlay 或 Electron 透明窗 | 原生 Win32 分层窗口 |
 | 依赖 | DSH + Node；桌面模式首次下载 Electron 约 104MB | 无，解压就能跑 |
-| 磁盘 | webm 51.8MB + Electron 约 104MB 下载 | 583.1MB（两个 exe 共 1.6MB + 动画 581.6MB） |
-| 内存 | 没在本机装 DSH 实测 | 10.5MB RSS / 2.4MB 私有 / 4 线程 |
-| CPU | 没实测 | 可见时约 0.3%~2.8% 单核（12 核整机 0.1%~0.25%），隐藏 0% |
-| 单帧 | — | 0.265ms（解码 0.191 + 提交 0.074） |
+| 磁盘 | webm 51.8MB + Electron 约 104MB 下载 | **71.1MB**（H.264 + 掩码 + 两个 exe）；旧 `.fishanim` 包 583.1MB |
+| 内存 | 没在本机装 DSH 实测 | 旧 `.fishanim` 包 10.5MB RSS / 2.4MB 私有 / 4 线程；H.264 包未单独复测 |
+| CPU | 没实测 | 旧包可见时约 0.3%~2.8% 单核（12 核整机 0.1%~0.25%），隐藏 0% |
+| 单帧 | — | H.264 约 0.24ms（解码 + 掩码）；旧 `.fishanim` 0.265ms |
 
-磁盘我们更大，原因就是前面说的“不带解码器”。原版的内存我没有实测，不写估数；
-能确定的是 Electron/Chromium 的底噪远不止 10MB。
+磁盘现在和原版同一量级（71MB vs webm 51.8MB + Electron 约 104MB）。
+旧 `.fishanim` 包 583MB 保留作对照，它换来的是“不依赖 Media Foundation、逐帧随机访问最直接”。
+原版的内存我没有实测，不写估数；能确定的是 Electron/Chromium 的底噪远不止 10MB。
 
 CPU 波动是因为窗口被遮挡时 DWM 会跳过合成；60 秒采样的历史值在 1.4%~1.7% 单核。
 
@@ -100,7 +109,7 @@ CPU 波动是因为窗口被遮挡时 DWM 会跳过合成；60 秒采样的历�
 ## 验证
 
 ```powershell
-cargo test --workspace --release          # 97
+cargo test --workspace --release          # 110
 .\target\release\feiyu-cli.exe --selftest # 94 项
 ```
 

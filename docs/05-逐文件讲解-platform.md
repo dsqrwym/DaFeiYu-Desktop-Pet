@@ -11,6 +11,7 @@ crates/feiyu-platform/src/
 ├── icon.rs      帧像素 → HICON（预乘→直通 alpha）
 ├── input.rs     最后一次键鼠输入、光标位置、左键状态
 ├── typing.rs    键盘原始输入计数（RIDEV_INPUTSINK）
+├── video.rs     H.264 解码（Media Foundation）
 ├── shot.rs      屏幕抓图 → BMP
 ├── screen.rs    主屏工作区
 ├── dpi.rs       DPI 感知
@@ -352,7 +353,28 @@ if u32::from(flags) & RI_KEY_BREAK == 0 { KEYS.fetch_add(1, Relaxed); }
 
 ---
 
-## 9. 本章验收
+## 9. `video.rs`：H.264 解码
+
+`VideoReader::open(path, width, height, fps, frame_count)` 打开 `.fishvid`（内容 MP4）：
+
+- 进程级 `MFStartup`，不反复初始化 COM；
+- `IMFSourceReader` 请求 `MFVideoFormat_RGB32`；
+- 从 native media type 读实际宽高和 `MF_MT_FRAME_RATE`；
+- 视频可补偶数宽高，解码后裁到清单 `size`；
+- 用 `MF_MT_DEFAULT_STRIDE` 判断 top-down/bottom-up；
+- 顺序播放只解一帧；跳帧从目标前两秒的 keyframe 起解；
+- 输出直通 BGRA、alpha=255；透明掩码由 app 层 `VideoSource` 套。
+
+**时间基的坑**：ffmpeg 对 rawvideo 默认输出 25fps，而清单写 24fps。
+`VideoReader` 不信清单，改用视频容器的 `MF_MT_FRAME_RATE` 换算 seek 时间；
+打包器也显式 `-framerate 24 -r 24`，两边都钉住。
+
+当前只实现 RGB32 输出；如果某个系统没有 RGB32 转换，会报清晰的解码错误，
+NV12 手写转换留作后续兼容项。
+
+---
+
+## 10. 本章验收
 
 - [ ] 能解释 `WS_EX_NOACTIVATE` 带来的三个坑（菜单、键盘、焦点）；
 - [ ] 能说出 `TrackPopupMenu` 三件套各自解决什么；
