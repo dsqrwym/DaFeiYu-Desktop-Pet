@@ -5,9 +5,18 @@
 DeepSeek 鲸鱼娘「大肥鱼」的 Windows 桌宠。素材和交互参考 dsh-pet，代码用 Rust 重写，
 直接开 Win32 分层窗口画像素，不跑 Electron，也不用开浏览器。
 
-上游 dsh-pet 是 DSH 的插件，余额、碎碎念、工作状态都靠 DSH 的事件。我把桌宠本身
-拆出来单独跑：100 段动画、待机/睡觉/拖拽/随机动作/右键点播。余额那 6 段没有打包；
-碎碎念和工作状态的动画保留，改成随机播放和打字时触发。
+## 上游项目
+
+这个仓库是独立重写，不是 fork：
+
+- **素材与交互主要上游**：[PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)。
+  动画素材来自它的 `dsh-pet/assets/webm/`；本项目取 100 段，余额那 6 段没有打包。
+- **另一份交互参考**：[1190fasheqi/dafeiyu-pet](https://github.com/1190fasheqi/dafeiyu-pet)。
+  它是 Python + PySide6 的三视图桌面宠物；这里只参考交互语义，没有使用它的代码或图片素材。
+
+dsh-pet 是 DSH 的插件，余额、碎碎念、工作状态原本都靠 DSH 事件。这里把桌宠本身拆出来
+单独跑：100 段动画、待机/睡觉/拖拽/随机动作/右键点播；碎碎念和工作状态改成随机播放和
+打字时触发。
 
 ## 素材是怎么处理的
 
@@ -23,12 +32,32 @@ H.264 颜色由 Media Foundation 解码，alpha 不交给视频编码，单独�
 旧格式取一帧解一帧，单帧约 0.27ms；H.264 原型单帧约 0.24ms（解码 + 套掩码），
 两者都在 24fps 下很轻。
 
-## 直接运行
+## 仓库里有什么
 
-`dist/feiyu/` 是打好的包（H.264 格式，约 71MB）：
+GitHub 仓库只提交源码和文档。动画素材、打包产物、上游 clone 和开发笔记都不入库：
+
+| 目录 | 为什么不在仓库里 |
+|---|---|
+| `assets/` | 由 `pack-anim` 生成（约 70MB），随 GitHub Release 分发 |
+| `dist/` | 由 `package.ps1` 生成；二进制只放在 Releases |
+| `_upstream/` | 由 `fetch-assets.ps1` 浅克隆上游，供本地打包 |
+| `target/` | Cargo 构建缓存 |
+| `_notes/` | 开发过程笔记，不是交付物 |
+| `config.json` | 本地运行配置，出厂值在代码里 |
+
+所以克隆仓库后不能直接双击运行，先下载 Release，或者按下面的源码步骤自己打包。
+
+## 直接运行（下载 Release）
+
+不需要 Rust。下载 **v0.1.0 H.264 包**：
+
+- [feiyu-h264-v0.1.0.zip](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/download/v0.1.0/feiyu-h264-v0.1.0.zip)（70.19MB）
+- [Release 页面](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/tag/v0.1.0)
+
+解压后进入 `feiyu/`：
 
 ```
-dist/feiyu/
+feiyu/
   feiyu.exe       双击运行，没有控制台窗口
   feiyu-cli.exe   命令行诊断（--selftest / --list / --showcase）
   config.json     可调参数，改完重启生效
@@ -42,14 +71,26 @@ GUI 子系统又拿不到同步的命令行输出。所以 GUI 版负责日常�
 两者跑的是同一份代码。
 
 ```powershell
-.\dist\feiyu\feiyu-cli.exe --selftest
-.\dist\feiyu\feiyu-cli.exe --list
-.\dist\feiyu\feiyu-cli.exe --config other.json
+.\feiyu-cli.exe --selftest
+.\feiyu-cli.exe --list
+.\feiyu-cli.exe --config other.json
+```
+
+校验下载包：
+
+```powershell
+Get-FileHash .\feiyu-h264-v0.1.0.zip -Algorithm SHA256
+```
+
+SHA256（GitHub Release 附件 digest 与本地构建一致）：
+
+```text
+2BEDDA4CAF4111C101796693986346F1AD96417AC72D91980902EE0E4D18CD20
 ```
 
 ## 想改参数
 
-`dist/feiyu/config.json` 是给用户改的，不用重新编译。没有这个文件就用出厂值；
+`feiyu/config.json` 是解压目录里给用户改的，不用重新编译。没有这个文件就用出厂值；
 写坏了会打一行告警、退回默认值，不会起不来。
 
 - `action_gap`：两次待机小动作之间隔多久（秒，区间内随机）
@@ -66,6 +107,8 @@ GUI 子系统又拿不到同步的命令行输出。所以 GUI 版负责日常�
 环境：Windows 10/11、Rust stable、VS 2022 C++ 生成工具（链接器），打包素材还需要 ffmpeg。
 
 ```powershell
+git clone https://github.com/dsqrwym/DaFeiYu-Desktop-Pet.git
+cd DaFeiYu-Desktop-Pet
 powershell -ExecutionPolicy Bypass -File tools/fetch-assets.ps1
 # 生产格式：H.264 + 1-bit 掩码
 cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20
@@ -73,6 +116,8 @@ cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm 
 cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim
 cargo run -p feiyu-app --release
 ```
+
+`fetch-assets.ps1` 会把上游浅克隆到 `_upstream/dsh-pet`；这个目录和 `assets/` 都不会进 Git。
 
 `cargo run` 默认优先 `assets/h264`（H.264），没有这个目录时才回退到 `assets/anim`（旧 `.fishanim`）；
 也可以用 `--dir` 显式指定。
@@ -87,10 +132,10 @@ powershell -ExecutionPolicy Bypass -File tools/package.ps1 -AnimDir assets/h264
 
 ## 和原版比
 
-| | 原版 dsh-pet | 这个版本 |
+| | 原版 [dsh-pet](https://github.com/PC2005-cloud/dsh-pet) | 这个版本 |
 |---|---|---|
 | 运行方式 | DSH 插件：浏览器 overlay 或 Electron 透明窗 | 原生 Win32 分层窗口 |
-| 依赖 | DSH + Node；桌面模式首次下载 Electron 约 104MB | 无，解压就能跑 |
+| 依赖 | DSH + Node；桌面模式首次下载 Electron 约 104MB | 无第三方运行时；H.264 用 Windows 自带 Media Foundation |
 | 磁盘 | webm 51.8MB + Electron 约 104MB 下载 | **71.1MB**（H.264 + 掩码 + 两个 exe）；旧 `.fishanim` 包 583.1MB |
 | 内存 | 没在本机装 DSH 实测 | H.264 包可见 55.0MB RSS / 39.8MB 私有 / 40 线程；旧 `.fishanim` 包 10.5MB / 2.4MB / 4 线程 |
 | CPU | 没实测 | H.264 包可见约 7.9% 单核（12 核整机 0.66%）；旧 `.fishanim` 包 0.3%~2.8% 单核 |
@@ -102,7 +147,7 @@ powershell -ExecutionPolicy Bypass -File tools/package.ps1 -AnimDir assets/h264
 
 ### H.264 包的实测（单独一组，不和旧包混）
 
-用 `dist/feiyu/feiyu.exe --run 45`，5 秒预热后取 30 秒窗口：
+用发布包里的 `feiyu.exe --run 45`，5 秒预热后取 30 秒窗口：
 
 - 可见：RSS **55.0MB**、私有 **39.8MB**、**40 线程**、CPU **7.91% 单核**（12 核整机 0.66%）；
 - 隐藏：RSS **39.7MB**、私有 **22.1MB**、19 线程、CPU **0%**；
@@ -124,6 +169,11 @@ CPU 波动是因为窗口被遮挡时 DWM 会跳过合成；旧包 60 秒采样�
 ## 验证
 
 ```powershell
+# 解压后的发布包
+.\feiyu-cli.exe --selftest # 94 项
+.\feiyu-cli.exe --showcase # 100/100，约 16.7 分钟
+
+# 源码构建后
 cargo test --workspace --release          # 113
 .\target\release\feiyu-cli.exe --selftest # 94 项
 ```
@@ -131,21 +181,21 @@ cargo test --workspace --release          # 113
 `selftest` 真的开窗口、真的提交位图、真的抓屏，覆盖透明、命中测试、菜单结构、托盘、
 脚底对齐、睡眠帧区间、打字联动。`cargo test` 只测纯逻辑。
 
-全量演示：
+全量演示（解压目录）：
 
 ```powershell
-.\dist\feiyu\feiyu-cli.exe --showcase
+.\feiyu-cli.exe --showcase
 ```
 
 100 段各播完整一圈，约 16.7 分钟；本次实际跑完 100/100，退出码 0。
 
-常用诊断：
+常用诊断（解压目录或源码的 `target/release/`）：
 
 ```powershell
-.\target\release\feiyu-cli.exe --list
-.\target\release\feiyu-cli.exe --showcase 移动
-.\target\release\feiyu-cli.exe --typing-probe 6
-.\target\release\feiyu-cli.exe --menu
+.\feiyu-cli.exe --list
+.\feiyu-cli.exe --showcase 移动
+.\feiyu-cli.exe --typing-probe 6
+.\feiyu-cli.exe --menu
 ```
 
 ## 文档

@@ -2,6 +2,8 @@
 #
 # 为什么需要：动画素材（100 段 webm，约 55MB）不入库，仓库只带打包工具。
 # 拉下来之后跑：
+#   cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20
+# 旧 .fishanim（可选，保留兼容/对照）：
 #   cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim
 #
 # 用法：
@@ -29,4 +31,4 @@ if (-not (Test-Path $webm)) {
 
 $count = (Get-ChildItem $webm -Filter *.webm | Measure-Object).Count
 Write-Host "完成：$webm（$count 段 webm）"
-Write-Host "下一步：cargo run -p pack-anim --release -- --src `"$webm`" --out assets/anim"
+Write-Host "下一步：cargo run -p pack-anim --release -- --src `"$webm`" --out assets/h264 --codec h264 --crf 20"
