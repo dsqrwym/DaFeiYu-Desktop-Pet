@@ -791,7 +791,8 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     // ---- 转向跟随：鼠标从「鱼身上」移到「一个鱼身宽以外」时转一次头 ----
     // 用户的两条要求：①鼠标在鱼旁边不转；②只有「离开了」才转，且只转一次。
     // 先把上一段走路演完（`poll_look` 在 `action_playing` 期间不抢戏）。
-    let _ = pet.advance_frames(220)?;
+    // 螃蟹步只有 1.2px/帧，800px 要走 600 多帧，所以这里推到 900。
+    let _ = pet.advance_frames(900)?;
     pet.back_to_home()?;
     pet.set_follow(true);
     pet.reset_look_cooldown();
@@ -802,11 +803,11 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     let again = pet.poll_look(far_x + 50); // 已经在外面了，不该再转
     r.check(
         &format!(
-            "鼠标移出鱼身宽后转头一次（{}，镜像 = {}）",
+            "鼠标移出鱼身宽后转头一次（{}，区间 {:?}）",
             pet.current(),
-            pet.flipped()
+            pet.loop_span()
         ),
-        !not_turned && turned && !again && pet.current() == "turn",
+        !not_turned && turned && !again && pet.current() == "idle",
     );
     pet.set_follow(false);
 
@@ -825,8 +826,11 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         ),
         !too_near && far,
     );
-    // 已经在走的时候不该重复开新的一段。
-    r.check(&format!("走路期间不重复起新的一段（{walked}）"), !walked);
+    // 已经在走的时候点新方向：应该**就地改向**（可打断），而不是被拒绝。
+    r.check(
+        &format!("走路期间点新方向能立即改向（{walked}，{}）", pet.current()),
+        walked,
+    );
 
     drop(pet);
     Ok(())

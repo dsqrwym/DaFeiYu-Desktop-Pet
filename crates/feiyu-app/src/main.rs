@@ -94,6 +94,8 @@ struct Args {
     hide_after: Option<u32>,
     /// 逐段演示：每段播几秒，并把「该看到什么」打出来给人对照。
     showcase: bool,
+    /// 逐帧核对：`(动画 id, 步长)`。屏幕上停在该帧，同时把帧号打出来。
+    scrub: Option<(String, u32)>,
     /// 跟随鼠标（**转向跟随**）：待机时鼠标离开「一个肥鱼宽」的范围就转头看它。
     follow: bool,
     /// 点哪走哪：点桌面（离鱼超过一个鱼身宽）就走过去。
@@ -129,6 +131,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         hide_now: false,
         hide_after: None,
         showcase: false,
+        scrub: None,
         follow: false,
         click_walk: false,
         fps: None,
@@ -168,6 +171,11 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                 )
             }
             "--showcase" => out.showcase = true,
+            "--scrub" => {
+                let id = it.next().context("--scrub 缺少动画 id")?.clone();
+                let step = it.next().and_then(|s| s.parse().ok()).unwrap_or(10);
+                out.scrub = Some((id, step));
+            }
             "--follow" => out.follow = true,
             "--click-walk" => out.click_walk = true,
             "--fps" => {
@@ -253,6 +261,7 @@ fn print_help() {
          \x20 --hide-now       一启动就藏进托盘但照常跑泵（验证隐藏后托盘能不能点开）\n\
          \x20 --hide-after <秒> 跑 n 秒后从泵内部藏进托盘且不补定时器（等价于菜单里点隐藏）\n\
          \x20 --showcase       逐段演示：每段播完整一圈，并把「该看到什么」打出来\n\
+         \x20 --scrub <id> [步长] 逐帧核对：停在该帧并打印帧号（默认每 10 帧）\n\
          \x20 --follow         跟随鼠标（转向）：鼠标离开一个鱼身宽就转头看它\n\
          \x20 --click-walk     点哪走哪：点桌面且距离超过一个鱼身宽就走过去\n\
          \x20 --fps <数值>     覆写帧率（默认用清单里的 24）\n\
@@ -391,6 +400,10 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
     }
     if args.showcase {
         return showcase(&mut pet);
+    }
+    if let Some((id, step)) = &args.scrub {
+        let (id, step) = (id.clone(), *step);
+        return scrub(&mut pet, &id, step);
     }
     if let Some(secs) = args.sleep_after {
         pet.set_fixed_sleep_after(secs);
@@ -538,6 +551,28 @@ fn run_pet(args: Args, dir: PathBuf) -> Result<()> {
         bail!("窗口提前退出，没有截到图");
     }
     println!("退出（共提交 {} 帧）", pet.drawn());
+    Ok(())
+}
+
+/// `--scrub <id> [步长]`：逐帧停住并打印帧号。
+///
+/// 为什么需要：要截「左看 → 回正」「右看 → 回正」这种子区间，
+/// 靠缩略图根本分不出哪几帧是左、哪几帧是右（`turn` 全程都在缓慢转）。
+/// 把人眼看到的那一帧的**帧号**报出来，才有得改。
+fn scrub(pet: &mut Pet, id: &str, step: u32) -> Result<()> {
+    pet.play(id)?;
+    let count = pet.frame_count().max(1);
+    let step = step.max(1);
+    println!("{id}：共 {count} 帧，每 {step} 帧停 1.2 秒（Ctrl+C 可中断）");
+    println!("请记下「看左 / 回正 / 看右 / 回正」各自的帧号");
+    let mut f = 0;
+    while f < count {
+        println!("第 {f} 帧");
+        pet.seek(f)?;
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        f += step;
+    }
+    println!("到底了（最后一帧是 {}）。", count - 1);
     Ok(())
 }
 

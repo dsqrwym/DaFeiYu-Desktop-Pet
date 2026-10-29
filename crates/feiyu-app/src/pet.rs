@@ -133,6 +133,11 @@ struct WalkSpec {
     ///
     /// 不做水平翻转，所以朝左的段就只能往左走；方向不明显的段两边都行。
     faces_left: Option<bool>,
+    /// **这段素材自己的移动速度**（像素/帧）。
+    ///
+    /// 必须按段给：侧身跳步和正面小碎步的步频不一样，用统一速度就会“滑步”。
+    /// `24fps` 下：`px_per_frame × 24` 就是每秒多少像素。
+    px_per_frame: f32,
 }
 
 /// 切进某段时要做的收尾。
@@ -238,20 +243,25 @@ const CLIPS: &[ClipSpec] = &[
     },
     ClipSpec {
         id: "move_float",
-        desc: "漂浮踏步：正面小碎步（演示时原地播；实际会带着走 120~420px）",
+        desc: "漂浮踏步：正面小碎步（演示时原地播；实际会带着走）",
         weight: 6,
         span: Some((18, 205)),
-        walk: Some(WalkSpec { faces_left: None }),
+        walk: Some(WalkSpec {
+            faces_left: None,
+            // 小碎步，腿走得快：约 62px/秒。
+            px_per_frame: 2.6,
+        }),
         on_enter: OnEnter::Plain,
     },
     ClipSpec {
         id: "move_crab",
-        desc:
-            "螃蟹走路：侧身向左迈步（演示时原地播；实际朝哪边走就镜像成哪边，并带 120~420px 位移）",
+        desc: "螃蟹走路：侧身向左迈步（演示时原地播；实际朝哪边走就镜像成哪边）",
         weight: 4,
         span: Some((40, 205)),
         walk: Some(WalkSpec {
             faces_left: Some(true),
+            // 横着挪，步幅小：约 29px/秒——和漂浮踏步（≈62）明显不一样。
+            px_per_frame: 1.2,
         }),
         on_enter: OnEnter::Plain,
     },
@@ -266,6 +276,17 @@ fn clip(id: &str) -> Option<&'static ClipSpec> {
 ///
 /// 没冷却的话鼠标在"一个肥鱼宽"的边界上抖一下，鱼就会一直扭头。
 const LOOK_COOLDOWN: f32 = 4.0;
+
+/// `idle` 素材里「看右 → 回正」的帧区间。
+///
+/// 逐帧量过轮廓中心（cx）：正面 cx≈108；**看右峰值 cx=120（第 102 帧）**，
+/// 到第 120 帧已经转回来（cx=110）——正好是一段完整回正。
+const LOOK_RIGHT: (u32, u32) = (72, 120);
+
+/// `idle` 素材里「看左 → 回正」的帧区间。
+///
+/// **看左谷值 cx=87（第 150~162 帧）**，第 210 帧已回到 cx=105。
+const LOOK_LEFT: (u32, u32) = (140, 210);
 
 /// 自己走一趟走多远（屏幕像素）。
 ///
@@ -376,8 +397,10 @@ struct Walk {
     left: f32,
     /// 方向：-1 往左，+1 往右。
     dir: f32,
-    /// 每帧走多少像素。
+    /// 每帧走多少像素（**由素材自己决定**，不是按距离算）。
     per_frame: f32,
+    /// 这段素材朝哪边（改方向时重新算镜像用）。
+    faces_left: Option<bool>,
     /// 已经走到哪（**浮点**累加，只在摆窗口时才取整）。
     ///
     /// 必须浮点：短距离时每帧才 0.4 像素，逐帧 `round()` 会被舍成 0，
@@ -1487,6 +1510,9 @@ impl Pet {
         if want < 24.0 {
             return false;
         }
+        // **速度由素材自己定**（`px_per_frame`），不是拿距离除帧数：
+        // 那段走得快就走得快、走得慢就慢，不会每段都一个速度。
+        let per_frame = walk.px_per_frame.max(0.05);
 
         if self.play(spec.id).is_err() {
             return false;
@@ -1503,11 +1529,11 @@ impl Pet {
         self.flip = flip;
         let _ = self.draw_frame();
 
-        let frames = (hi - lo + 1).max(1) as f32;
         self.walk = Some(Walk {
             left: want,
             dir,
-            per_frame: want / frames,
+            per_frame,
+            faces_left: walk.faces_left,
             x: self.anchor_x as f32,
         });
         true
@@ -1524,7 +1550,11 @@ impl Pet {
             return Ok(());
         };
         if done {
+            // 到站就立刻收：继续把这段走路素材播完会变成「原地踏步」。
             self.walk = None;
+            self.action_playing = false;
+            self.play("idle")?;
+            return Ok(());
         }
         let entry = self.manifest.require(&self.current)?.clone();
         let limits = self.limits_for(&entry);
@@ -1589,15 +1619,23 @@ impl Pet {
             .unwrap_or(200)
     }
 
-    /// 转头看一边：播一遍 `turn`（整段：正面→侧面→背面→正面）。
+    /// 转头看一边：从 `idle` 里截一段「看过去 → 回正」播一遍。
     ///
-    /// 素材默认先往一侧转；鼠标在左就镜像过去。演完由 `step_frames` 收回待机。
-    fn play_turn(&mut self, towards_left: bool) -> bool {
-        if self.play("turn").is_err() {
+    /// 不再整段播 `turn`（那是东张西望，10 秒且包含全身转动）；
+    /// 用的是 idle 素材里已经存在的左右看，播完自然回到正面。
+    fn play_look(&mut self, towards_left: bool) -> bool {
+        if self.play("idle").is_err() {
             return false;
         }
+        let (lo, hi) = if towards_left { LOOK_LEFT } else { LOOK_RIGHT };
+        let last = self.current_count().saturating_sub(1);
+        let lo = lo.min(last);
+        let hi = hi.min(last).max(lo);
+        self.loop_span = Some((lo, hi));
+        self.frame = lo;
+        // 这一段本身就是「看过去再回正」，不需要额外镜像。
+        self.flip = false;
         self.action_playing = true;
-        self.flip = towards_left;
         let _ = self.draw_frame();
         true
     }
@@ -1617,7 +1655,7 @@ impl Pet {
             && self.look_cd.elapsed().as_secs_f32() >= LOOK_COOLDOWN
         {
             self.look_cd = Instant::now();
-            turned = self.play_turn(dx < 0);
+            turned = self.play_look(dx < 0);
         }
         self.was_near = near;
         turned
@@ -1633,12 +1671,25 @@ impl Pet {
     /// 规则：距离不到**一个肥鱼宽**就不动（那种距离走过去像抽筋）；
     /// 走哪一段按权重抽（目前 `move_float` 6 / `move_crab` 4）。
     pub(crate) fn walk_to(&mut self, x: i32) -> bool {
-        if self.action_playing {
-            return false;
-        }
         let width = self.current_width().max(80);
         let dx = x - self.anchor_x;
         if dx.abs() <= width {
+            return false;
+        }
+        let dir = if dx < 0 { -1.0 } else { 1.0 };
+        // 已经在走：**就地改方向**（不切动画、不硬切），立即生效。
+        // 这就是「走到一半点新方向，能马上跟着新方向走」。
+        if let Some(w) = self.walk.as_mut() {
+            w.dir = dir;
+            w.left = dx.abs() as f32;
+            // 镜像要跟着新方向重算。
+            self.flip = match w.faces_left {
+                Some(faces_left) => (dir < 0.0) != faces_left,
+                None => false,
+            };
+            return true;
+        }
+        if self.action_playing {
             return false;
         }
         let total: u32 = CLIPS
@@ -1684,6 +1735,13 @@ impl Pet {
         self.current_count()
     }
 
+    /// 直接跳到某一帧并画出来。`--scrub` 用（逐帧看素材到底画了什么）。
+    pub fn seek(&mut self, frame: u32) -> Result<()> {
+        let count = self.current_count().max(1);
+        self.frame = frame % count;
+        self.draw_frame()
+    }
+
     /// 演示用：照参数表播这一段（带位移的会真的走一趟）。
     pub fn demo_clip(&mut self, id: &str) -> Result<()> {
         if clip(id).is_some_and(|c| c.walk.is_some()) && self.wander_with(id) {
@@ -1710,10 +1768,21 @@ impl Pet {
         let before = self.frame;
         self.advance_frame(step, count);
         // 带位移的小动作（`move_*`）：帧往前走，窗口也跟着挪。
+        // 走完的那一拍它会自己切回 idle，这里把“已收尾”告诉调用方。
+        let was_walking = self.walk.is_some();
         self.step_walk(step)?;
+        if was_walking && self.walk.is_none() {
+            return Ok(true);
+        }
         // `step` 最多两三帧（`MAX_ANIM_DT` 卡着），所以帧号变小只可能是回绕，
         // 不会漏跳一整圈。
         if !self.action_playing || self.frame >= before {
+            return Ok(false);
+        }
+        // **还在走路**：回绕只是把走路素材从头再播一遍，不算「演完了」。
+        // 路的终点由 `walk.left` 决定（速度现在按素材自己的 `px_per_frame` 走，
+        // 一段素材不一定能走完全程，得允许它循环）。
+        if self.walk.is_some() {
             return Ok(false);
         }
         self.action_playing = false;
