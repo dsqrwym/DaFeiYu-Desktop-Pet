@@ -277,16 +277,16 @@ fn clip(id: &str) -> Option<&'static ClipSpec> {
 /// 没冷却的话鼠标在"一个肥鱼宽"的边界上抖一下，鱼就会一直扭头。
 const LOOK_COOLDOWN: f32 = 4.0;
 
+/// `idle` 素材里「看左 → 回正」的帧区间（用户目视核对过的帧号）。
+///
+/// 66 开始往左看，102 开始回头，到 126 附近已经回到正面
+/// （126 也是下一段「看右」的起点）。
+const LOOK_LEFT: (u32, u32) = (66, 126);
+
 /// `idle` 素材里「看右 → 回正」的帧区间。
 ///
-/// 逐帧量过轮廓中心（cx）：正面 cx≈108；**看右峰值 cx=120（第 102 帧）**，
-/// 到第 120 帧已经转回来（cx=110）——正好是一段完整回正。
-const LOOK_RIGHT: (u32, u32) = (72, 120);
-
-/// `idle` 素材里「看左 → 回正」的帧区间。
-///
-/// **看左谷值 cx=87（第 150~162 帧）**，第 210 帧已回到 cx=105。
-const LOOK_LEFT: (u32, u32) = (140, 210);
+/// 126 开始往右看，168 开始回头，约 228 回到正面（cx≈107，和 0 帧一致）。
+const LOOK_RIGHT: (u32, u32) = (126, 228);
 
 /// 自己走一趟走多远（屏幕像素）。
 ///
@@ -1636,6 +1636,13 @@ impl Pet {
         // 这一段本身就是「看过去再回正」，不需要额外镜像。
         self.flip = false;
         self.action_playing = true;
+        // 取证开关：方向到底对不对（鼠标在左就该是「看左」）。
+        if std::env::var_os("FEIYU_EVENT_TRACE").is_some() {
+            println!(
+                "看向{}（第 {lo}~{hi} 帧）",
+                if towards_left { "左" } else { "右" }
+            );
+        }
         let _ = self.draw_frame();
         true
     }
@@ -1799,8 +1806,18 @@ impl Pet {
             self.stimulate(Stimulus::Awaken)?;
             return Ok(true);
         }
-        self.play("idle")?;
+        // 一次性片段（小动作 / 走路 / 看向一边）收尾后一律回完整待机。
+        // **不能直接 `play("idle")`**：id 没变时它会早退，`loop_span` 留着不走，
+        // 结果就是「那一段被无限循环」（用户报的「看向一边一直在循环」就是它）。
+        self.resume_idle()?;
         Ok(true)
+    }
+
+    /// 收回到完整 idle：清掉区间限制并重画。
+    fn resume_idle(&mut self) -> Result<()> {
+        self.loop_span = None;
+        self.play("idle")?;
+        self.draw_frame()
     }
 
     /// 推进 `step` 帧。

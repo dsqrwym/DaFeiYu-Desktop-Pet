@@ -809,6 +809,12 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         ),
         !not_turned && turned && !again && pet.current() == "idle",
     );
+    // 这一段播完必须真的回到**完整**待机：不许把「看向一边」无限循环。
+    let _ = pet.advance_frames(200)?;
+    r.check(
+        &format!("看向一边后回到完整待机（区间 {:?}）", pet.loop_span()),
+        pet.loop_span().is_none(),
+    );
     pet.set_follow(false);
 
     // ---- 点哪走哪：距差不到「一个鱼身宽」不动，超了就开走 ----
