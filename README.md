@@ -74,6 +74,9 @@ cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm 
 cargo run -p feiyu-app --release
 ```
 
+`cargo run` 默认优先 `assets/h264`（H.264），没有这个目录时才回退到 `assets/anim`（旧 `.fishanim`）；
+也可以用 `--dir` 显式指定。
+
 `cargo run` 默认跑 console 版（`default-run = "feiyu-cli"`），日志和退出码都在终端里。
 
 打发布包：
@@ -121,7 +124,7 @@ CPU 波动是因为窗口被遮挡时 DWM 会跳过合成；旧包 60 秒采样�
 ## 验证
 
 ```powershell
-cargo test --workspace --release          # 110
+cargo test --workspace --release          # 113
 .\target\release\feiyu-cli.exe --selftest # 94 项
 ```
 

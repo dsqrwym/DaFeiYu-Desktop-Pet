@@ -24,8 +24,10 @@ use feiyu_platform::{pump, quit, Event, SingleInstance};
 
 use crate::pet::{Action, Pet};
 
-/// 素材目录默认值（相对当前工作目录）。
+/// 旧素材目录（`.fishanim`），也是新目录不存在时的回退值。
 const DEFAULT_DIR: &str = "assets/anim";
+/// H.264 素材目录；源码直接运行时优先用它。
+const DEFAULT_H264_DIR: &str = "assets/h264";
 
 /// 计时器周期。8ms 足够驱动 24fps，空闲时不至于空转太凶。
 const TICK_MS: u32 = 8;
@@ -277,24 +279,31 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     Ok(out)
 }
 
-/// 素材目录：先看当前工作目录，再看 exe 旁边。
+/// 素材目录：先看当前工作目录，再看 exe 旁边；每处优先 H.264，回退旧格式。
 ///
 /// 打包成 `dist/feiyu/{feiyu.exe, assets/anim}` 后，从快捷方式或别的工作目录
-/// 启动也能找到素材；`cargo run` 仍然用仓库根下的 `assets/anim`。
+/// 启动也能找到素材；源码在仓库根跑 `cargo run` 时优先用 `assets/h264`，
+/// 只有它不存在时才回退到旧的 `assets/anim`。
 fn default_anim_dir() -> PathBuf {
-    let cwd = PathBuf::from(DEFAULT_DIR);
-    if cwd.join("manifest.json").is_file() {
-        return cwd;
+    if let Some(dir) = find_anim_dir(Path::new("")) {
+        return dir;
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let beside = parent.join(DEFAULT_DIR);
-            if beside.join("manifest.json").is_file() {
-                return beside;
+            if let Some(dir) = find_anim_dir(parent) {
+                return dir;
             }
         }
     }
-    cwd
+    PathBuf::from(DEFAULT_DIR)
+}
+
+/// 在一个根目录下按 `assets/h264` → `assets/anim` 的顺序找带清单的素材目录。
+fn find_anim_dir(root: &Path) -> Option<PathBuf> {
+    [DEFAULT_H264_DIR, DEFAULT_DIR]
+        .iter()
+        .map(|rel| root.join(rel))
+        .find(|dir| dir.join("manifest.json").is_file())
 }
 
 /// 加载用户配置。
@@ -338,7 +347,7 @@ fn load_config(explicit: Option<&Path>) -> Result<Config> {
 fn print_help() {
     println!(
         "feiyu —— 桌宠\n\n\
-         \x20 --dir <目录>      素材目录（含 manifest.json，默认 {DEFAULT_DIR}）\n\
+         \x20 --dir <目录>      素材目录（含 manifest.json，默认优先 assets/h264，回退 assets/anim）\n\
          \x20 --config <路径>   配置文件（默认找 exe 旁边或 CWD 的 config.json）\n\
          \x20 --anim <id>       强制只播这一段，忽略状态机\n\
          \x20 --dump <id> <目录> <步长>  把该段动画每步长帧导一张白底 BMP（判读素材内容用）\n\
@@ -1013,4 +1022,53 @@ fn shoot_all(pet: &mut Pet, dir: &Path) -> Result<()> {
         (ids.len() as f32) * (SHOT_PER_ANIM as f32) * 0.008
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "feiyu-cli-test-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_manifest(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("manifest.json"), b"{}").unwrap();
+    }
+
+    #[test]
+    fn prefers_h264_over_legacy_fishanim() {
+        let root = temp_root("prefer-h264");
+        write_manifest(&root.join("assets/h264"));
+        write_manifest(&root.join("assets/anim"));
+        assert_eq!(find_anim_dir(&root), Some(root.join("assets/h264")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn falls_back_to_fishanim_when_h264_missing() {
+        let root = temp_root("fallback-anim");
+        write_manifest(&root.join("assets/anim"));
+        assert_eq!(find_anim_dir(&root), Some(root.join("assets/anim")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn returns_none_when_no_manifest() {
+        let root = temp_root("empty");
+        assert_eq!(find_anim_dir(&root), None);
+        let _ = fs::remove_dir_all(&root);
+    }
 }
