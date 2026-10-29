@@ -809,11 +809,20 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         ),
         !not_turned && turned && !again && pet.current() == "idle",
     );
-    // 这一段播完必须真的回到**完整**待机：不许把「看向一边」无限循环。
-    let _ = pet.advance_frames(200)?;
+    // 这一段播完必须真的回到**完整**待机（不许把「看向一边」无限循环），
+    // 而且帧号要停在**段末**（那里是正面）：停段首的话紧接着又会再演一遍
+    // （用户报的「会播放两次」就是停在 126 造成的）。
+    let look_span = pet.loop_span();
+    let look_end = look_span.map_or(0, |(_, hi)| hi);
+    let look_len = look_span.map_or(0, |(lo, hi)| hi - lo + 1);
+    let _ = pet.advance_frames(look_len)?;
     r.check(
-        &format!("看向一边后回到完整待机（区间 {:?}）", pet.loop_span()),
-        pet.loop_span().is_none(),
+        &format!(
+            "看向一边后停在段末、回到完整待机（第 {} 帧，期望 {look_end}；区间 {:?}）",
+            pet.frame(),
+            pet.loop_span()
+        ),
+        pet.loop_span().is_none() && pet.frame() == look_end,
     );
     pet.set_follow(false);
 

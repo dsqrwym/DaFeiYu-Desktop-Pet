@@ -1809,14 +1809,20 @@ impl Pet {
         // 一次性片段（小动作 / 走路 / 看向一边）收尾后一律回完整待机。
         // **不能直接 `play("idle")`**：id 没变时它会早退，`loop_span` 留着不走，
         // 结果就是「那一段被无限循环」（用户报的「看向一边一直在循环」就是它）。
-        self.resume_idle()?;
+        //
+        // 回来时要落在**这段的末尾**而不是段首：落段首（66）等于紧接着又从头
+        // 再演一遍同一个左看——用户报的「会播放两次」就是这么来的。
+        let resume_at = self.loop_span.map_or(0, |(_, hi)| hi);
+        self.resume_idle_at(resume_at)?;
         Ok(true)
     }
 
-    /// 收回到完整 idle：清掉区间限制并重画。
-    fn resume_idle(&mut self) -> Result<()> {
+    /// 收回到完整 idle：清掉区间限制，并把帧号摆到 `frame` 再重画。
+    fn resume_idle_at(&mut self, frame: u32) -> Result<()> {
         self.loop_span = None;
         self.play("idle")?;
+        let count = self.current_count().max(1);
+        self.frame = frame % count;
         self.draw_frame()
     }
 
