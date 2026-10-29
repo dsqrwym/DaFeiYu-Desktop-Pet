@@ -12,13 +12,15 @@
 //! * 原生上下文菜单；
 //! * 托盘图标（帧像素现场画成 `HICON`，不依赖 `.ico` 资源）；
 //! * 窗口截图（自检取证用，产物是 BMP，零第三方依赖）；
-//! * 系统输入活动（最后一次键鼠操作是多久以前）。
+//! * 系统输入活动（最后一次键鼠操作是多久以前）；
+//! * 键盘原始输入计数（后台也能收到，用于「打字联动」）。
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(not(windows))]
 compile_error!("feiyu-platform 目前只实现了 Windows 后端");
 
+pub mod console;
 pub mod dpi;
 pub mod icon;
 pub mod input;
@@ -27,8 +29,10 @@ pub mod menu;
 pub mod screen;
 pub mod shot;
 pub mod tray;
+pub mod typing;
 pub mod window;
 
+pub use console::prepare_console;
 pub use dpi::enable_per_monitor_v2;
 pub use icon::Icon;
 pub use input::{cursor_pos, last_input_ms, left_button_down};
@@ -36,6 +40,7 @@ pub use instance::SingleInstance;
 pub use menu::{CommandId, Menu};
 pub use screen::primary_work_area;
 pub use tray::TrayIcon;
+pub use typing::{disable_typing, enable_typing, typing_installed, typing_keys};
 pub use window::{find_window, pump, quit, wake, Event, LayeredWindow, TRAY_MESSAGE};
 
 /// 平台层错误。

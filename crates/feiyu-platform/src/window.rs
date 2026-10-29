@@ -32,9 +32,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MSG,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
-    WM_APP, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    WM_APP, WM_DESTROY, WM_INPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::{Error, Result};
@@ -245,6 +245,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WAKE_MESSAGE => push(Event::Woken),
+        WM_INPUT => {
+            // 键盘原始输入：只数「按下」次数，喂给「打字联动」。
+            // 这条消息在窗口不在前台时也会到（登记时用了 RIDEV_INPUTSINK）。
+            crate::typing::handle_raw_input(lparam);
+        }
         WM_DESTROY => {
             push(Event::Quit);
             // SAFETY: 结束本线程消息循环。
@@ -266,7 +271,7 @@ struct Dib {
 
 impl Dib {
     fn new(width: i32, height: i32) -> Result<Self> {
-        let mut info = BITMAPINFO {
+        let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: width,
@@ -281,9 +286,8 @@ impl Dib {
         };
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: 传入合法的 BITMAPINFO 与接收指针；不共享文件映射。
-        let bitmap =
-            unsafe { CreateDIBSection(None, &mut info, DIB_RGB_COLORS, &mut bits, None, 0) }
-                .map_err(|e| Error::win32("CreateDIBSection", e))?;
+        let bitmap = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+            .map_err(|e| Error::win32("CreateDIBSection", e))?;
         Ok(Self {
             bitmap,
             bits: bits as *mut u8,
@@ -640,6 +644,8 @@ impl Drop for LayeredWindow {
             let _ = DeleteDC(self.mem_dc);
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
+        // 窗口没了，键盘原始输入的登记也一并撤掉（不在进程内留全局状态）。
+        crate::typing::disable_typing();
         let _ = STATE.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }

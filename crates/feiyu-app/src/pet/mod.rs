@@ -1,7 +1,7 @@
 //! 桌宠运行时：窗口 + 素材清单 + 状态机。
 //!
 //! 与 P1 的关键差别：动画不再写死 `idle`，而是由 [`Brain`] 按事件切换。
-//! 12 段动画的裁切尺寸各不相同（193×242 到 384×266），切换时靠清单里的几何信息把角色钉在原地：
+//! 100 段动画的裁切尺寸各不相同（193×242 到 500×280），切换时靠清单里的几何信息把角色钉在原地：
 //!
 //! * 纵向：`window_y = 屏幕脚底线 - baseline`。`baseline` 是**帧内**落脚行，
 //!   用它而不是 `origin_y + baseline`——后者是画布坐标，把两者搞混会让角色错位几百像素。
@@ -21,11 +21,27 @@ use std::time::Instant;
 use anyhow::{ensure, Context, Result};
 use feiyu_core::anim::{AnimEntry, AnimReader, Manifest};
 use feiyu_core::brain::{Brain, Mood, Stimulus};
+use feiyu_core::config::Config;
 use feiyu_core::motion::{fling_velocity, Limits, Motion};
 use feiyu_core::pool::Pool;
 use feiyu_core::rng::Rng;
-use feiyu_core::sleep::{span_to_frames, SleepCycle, SleepStage};
-use feiyu_platform::{CommandId, Event, Icon, LayeredWindow, Menu, TrayIcon};
+use feiyu_core::sleep::SleepCycle;
+use feiyu_platform::{Event, Icon, LayeredWindow, TrayIcon};
+
+mod clips;
+mod follow;
+mod menu;
+mod pixels;
+mod sleep;
+mod typing;
+mod walk;
+
+pub use menu::Action;
+
+use clips::{clip, pool_items, ClipSpec, OnEnter, CATEGORIES, CLICK_IDS, CLIPS};
+use pixels::{blend_frame, mirror_bgra, ordered, seam_mad};
+use sleep::{INPUT_FRESH_MS, WAKE_ROLL_CHANCE, WAKE_ROLL_EVERY};
+use walk::Walk;
 
 /// 脚底距工作区底边的空隙（像素）。
 const BOTTOM_GAP: i32 = 4;
@@ -51,23 +67,6 @@ const MAX_ANIM_DT: f32 = 0.1;
 /// （1~2 像素），不该挡住「提起」这个动作本身。
 const DRAG_THRESHOLD: i32 = 2;
 
-/// `drag` 素材里「已经离地」的那一段（闭区间，帧号）。
-///
-/// 用户报「拖一两秒才漂浮」，罪不在切换逻辑（自检实测切 drag 0.4ms），
-/// 而在素材本身：这段 10 秒的循环是从**站着**开始演的。用 `bbox` 逐帧量
-/// 包围盒（见 `_notes/PROGRESS.md`）得到的实测曲线：
-///
-/// * 0~20：底边贴着画布底部（y2=262），人还站在地上；
-/// * 25~30：正在升起（y2=248 → 239）；
-/// * 35~205：悬空（y2 在 233~251 之间起伏，头顶快贴画布上沿）；
-/// * 210 之后：落地。
-///
-/// 所以从第 35 帧进、在这个区间里循环，「提起来」就是按下即生效的。
-/// 段尾取 110 而不是 205：`110 → 35` 的接缝平均差 14.8，和素材自己
-/// 0.2 秒的变化量（7~13）同级——回绕看不出来；从 205 回 35 会一下跳 12 像素。
-const DRAG_LO: u32 = 35;
-const DRAG_HI: u32 = 110;
-
 /// 松手落地后，先保持被拖拽姿态这么久再回待机。
 ///
 /// 直接切回 idle 会显得「一到手就站好」，像被剪掉了一帧；
@@ -80,236 +79,12 @@ pub(crate) const LANDING_HOLD: f32 = 0.1;
 /// 太短又会在正常拖动时凑不够两个采样点。
 const TRAIL_WINDOW: f32 = 0.12;
 
-/// 右键菜单的命令 id（含义见 [`Pet::menu`]）。
-const CMD_HOME: CommandId = 1;
-const CMD_TOPMOST: CommandId = 2;
-const CMD_QUIT: CommandId = 3;
-const CMD_HIDE: CommandId = 4;
-/// 「跟随鼠标」（= 转向跟随）开关。
-const CMD_FOLLOW: CommandId = 5;
-/// 「点哪走哪」开关。
-const CMD_CLICK_WALK: CommandId = 6;
-
 /// 托盘图标的悬停提示。
 const TRAY_TIP: &str = "飞鱼";
 
-/// 入睡前要安静的时长范围（秒）。
-///
-/// 给一个区间而不是固定值：固定 25 秒会让「它什么时候睡」变成可预测的定时器。
-/// 每次回到待机都重新抽一次，于是每次入睡的等待都不一样。
-const SLEEP_AFTER_MIN: f32 = 18.0;
-const SLEEP_AFTER_MAX: f32 = 38.0;
-
-/// 两次自娱自乐之间的间隔（秒）。
-///
-/// 比入睡阈值短，清醒期间才看得到一会儿；又不至于太频繁——
-/// 一直在扭的桌宠会显得焦躁。
-const ACTION_GAP_MIN: f32 = 8.0;
-const ACTION_GAP_MAX: f32 = 15.0;
-
-/// 一段动画自己的参数——**驱动逻辑只认这张表**。
-///
-/// 素材是画家一段段画的，每段的起势、收势、朝向都不一样：统一处理就会出现
-/// 「人先动、一秒后才迈腿」（前摇没跳）和「素材朝左、人却往右走」（朝向没跟素材）。
-/// 加新素材 = 加一条记录 + 跑自检，不用改驱动逻辑。
-struct ClipSpec {
-    /// 素材 id。
-    id: &'static str,
-    /// 一句话说清「这段应该看到什么」。`--showcase` 会把它打出来给人对照。
-    desc: &'static str,
-    /// 进待机池的权重；`0` = 不进池（由状态机或点击驱动）。
-    weight: u32,
-    /// 只播这一截（闭区间，已跳过前摇/收势）。`None` = 整段循环。
-    span: Option<(u32, u32)>,
-    /// 这段要**带着位移**播（抽中它就去走一段）。
-    walk: Option<WalkSpec>,
-    /// 切到这段时要做的事。
-    on_enter: OnEnter,
-}
-
-/// 走路段自己的参数。
-struct WalkSpec {
-    /// 素材本身朝哪边：`Some(true)` 朝左、`Some(false)` 朝右、`None` 方向不明显。
-    ///
-    /// 不做水平翻转，所以朝左的段就只能往左走；方向不明显的段两边都行。
-    faces_left: Option<bool>,
-    /// **这段素材自己的移动速度**（像素/帧）。
-    ///
-    /// 必须按段给：侧身跳步和正面小碎步的步频不一样，用统一速度就会“滑步”。
-    /// `24fps` 下：`px_per_frame × 24` 就是每秒多少像素。
-    px_per_frame: f32,
-}
-
-/// 切进某段时要做的收尾。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OnEnter {
-    /// 什么都不用做（小动作、点击反馈）。
-    Plain,
-    /// 回到待机：重抽入睡时间与下次小动作。
-    Idle,
-    /// 起睡眠编排（三段式，见 `core/sleep.rs`）。
-    Sleep,
-}
-
-/// 全部动画的参数表。
-///
-/// 帧区间都是**逐帧量出来的**（`--dump` + 逐帧差），别凭印象改：
-///
-/// | 段 | 区间 | 依据 |
-/// |---|---|---|
-/// | `drag` | 35~110 | 前 35 帧人还站在地上 |
-/// | `move_float` | 18~205 | 0~17 帧站着，18 帧起踏步；205 后收势 |
-/// | `move_crab` | 40~205 | 前 8 帧不动，40 帧才侧身迈步；**朝左** |
-const CLIPS: &[ClipSpec] = &[
-    ClipSpec {
-        id: "idle",
-        desc: "站着呼吸，偶尔眨眼；它会一直循环，直到困了或被点醒",
-        weight: 0,
-        span: None,
-        walk: None,
-        on_enter: OnEnter::Idle,
-    },
-    ClipSpec {
-        id: "sleep",
-        desc: "站着 → 闭眼端下 → Z 气泡冒出来 → 睡着；点一下就慢慢起身醒来",
-        weight: 0,
-        span: None,
-        walk: None,
-        on_enter: OnEnter::Sleep,
-    },
-    ClipSpec {
-        id: "drag",
-        desc: "被提起来悬空飘着（从第 35 帧起：前 35 帧人还站在地上）",
-        weight: 0,
-        span: Some((DRAG_LO, DRAG_HI)),
-        walk: None,
-        on_enter: OnEnter::Plain,
-    },
-    ClipSpec {
-        id: "click_happy",
-        desc: "被点一下：开心地晃，演一圈就回待机",
-        weight: 0,
-        span: None,
-        walk: None,
-        on_enter: OnEnter::Plain,
-    },
-    ClipSpec {
-        id: "click_pout",
-        desc: "连点三下：生气，演一圈就回待机",
-        weight: 0,
-        span: None,
-        walk: None,
-        on_enter: OnEnter::Plain,
-    },
-    ClipSpec {
-        id: "stretch",
-        desc: "待机小动作：伸懒腰，演一圈就回待机",
-        weight: 20,
-        span: None,
-        walk: None,
-        on_enter: OnEnter::Plain,
-    },
-    ClipSpec {
-        id: "mirror",
-        desc: "待机小动作：照镜子（抹抹脸），演一圈就回待机",
-        weight: 20,
-        span: None,
-        walk: None,
-        on_enter: OnEnter::Plain,
-    },
-    ClipSpec {
-        id: "click_shy",
-        desc: "点击回应-害羞惊讶（暂未接：点击目前只给开心/生气），整段循环，位置不动",
-        weight: 0,
-        span: None,
-        walk: None,
-        on_enter: OnEnter::Plain,
-    },
-    ClipSpec {
-        id: "move_run",
-        desc: "原地左转奔跑（第 120 帧是趴在地上的，所以只演示、不用于走路）",
-        weight: 0,
-        span: None,
-        walk: None,
-        on_enter: OnEnter::Plain,
-    },
-    ClipSpec {
-        id: "turn",
-        desc: "原地转身：正面 → 侧面 → 背面 → 正面，位置不动",
-        weight: 5,
-        span: None,
-        walk: None,
-        on_enter: OnEnter::Plain,
-    },
-    ClipSpec {
-        id: "move_float",
-        desc: "漂浮踏步：正面小碎步（演示时原地播；实际会带着走）",
-        weight: 6,
-        span: Some((18, 205)),
-        walk: Some(WalkSpec {
-            faces_left: None,
-            // 小碎步，腿走得快：约 62px/秒。
-            px_per_frame: 2.6,
-        }),
-        on_enter: OnEnter::Plain,
-    },
-    ClipSpec {
-        id: "move_crab",
-        desc: "螃蟹走路：侧身向左迈步（演示时原地播；实际朝哪边走就镜像成哪边）",
-        weight: 4,
-        span: Some((40, 205)),
-        walk: Some(WalkSpec {
-            faces_left: Some(true),
-            // 横着挪，步幅小：约 29px/秒——和漂浮踏步（≈62）明显不一样。
-            px_per_frame: 1.2,
-        }),
-        on_enter: OnEnter::Plain,
-    },
-];
-
-/// 查某段的参数。不在表里的段（未打包 / 强制模式）按整段循环处理。
-fn clip(id: &str) -> Option<&'static ClipSpec> {
-    CLIPS.iter().find(|c| c.id == id)
-}
-
-/// 两次「转头看鼠标」之间的最小间隔（秒）。
-///
-/// 没冷却的话鼠标在"一个肥鱼宽"的边界上抖一下，鱼就会一直扭头。
-const LOOK_COOLDOWN: f32 = 4.0;
-
-/// `idle` 素材里「看左 → 回正」的帧区间（用户目视核对过的帧号）。
-///
-/// 66 开始往左看，102 开始回头，到 126 附近已经回到正面
-/// （126 也是下一段「看右」的起点）。
-const LOOK_LEFT: (u32, u32) = (66, 126);
-
-/// `idle` 素材里「看右 → 回正」的帧区间。
-///
-/// 126 开始往右看，168 开始回头，约 228 回到正面（cx≈107，和 0 帧一致）。
-const LOOK_RIGHT: (u32, u32) = (126, 228);
-
-/// 自己走一趟走多远（屏幕像素）。
-///
-/// 太短看不出在走，太长会一路撞到工作区边上；再长也会被边界夹住。
-const WALK_MIN_PX: f32 = 120.0;
-const WALK_MAX_PX: f32 = 420.0;
-
-/// 睡着时，系统有键鼠输入就按这个间隔掷一次「自然醒」的骰子（秒）。
-///
-/// 不按输入事件逐次掷：鼠标一动就是几十条消息，逐次掷会让它一秒不到就醒。
-/// 按秒掷才符合「你在电脑前坐了一阵，它被你弄醒了」的观感。
-const WAKE_ROLL_EVERY: f32 = 1.0;
-
-/// 每次掷骰醒来的概率。
-///
-/// 10% → 持续操作时平均十秒醒一次：既有「有几率」的随机感，
-/// 又不会让人敲一下键盘它就从床上掉下来。
-const WAKE_ROLL_CHANCE: f32 = 0.10;
-
-/// 最后一次键鼠操作在这个时间内（毫秒）算「人正在电脑前」。
-///
-/// 比 `WAKE_ROLL_EVERY` 略短：要的是「持续在动」，偶尔碰一下鼠标不算。
-const INPUT_FRESH_MS: u32 = 700;
+// 入睡间隔、随机动作间隔、打字联动、走路距离、分类权重都在 `core::config::Config` 里。
+// 这里只留“运行时行为参数”（拖拽阈值、接缝帧数等），那些不是产品配置，
+// 而是算法的一部分：改了就得重新验证手感/接缝，不适合让用户随手改。
 
 /// 接缝两侧的平均像素差超过这个值，就不硬切，改成几帧淡过去。
 ///
@@ -340,28 +115,6 @@ const SEAM_DISSOLVE_FRAMES: u32 = 6;
 
 type Anim = AnimReader<BufReader<File>>;
 
-/// 右键菜单选完之后要做什么。
-///
-/// 退出这动作留给 app 层执行：`feiyu-platform` 不该知道应用语义，
-/// `pet` 也不该自己去关消息循环。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    /// 什么都没选（点了别处或按了 Esc）。
-    None,
-    /// 角色已搬回屏幕底部中央。
-    Home,
-    /// 「总在最前」切换后的新状态。
-    Topmost(bool),
-    /// 「跟随鼠标」切换后的新状态。
-    Follow(bool),
-    /// 「点哪走哪」切换后的新状态。
-    ClickWalk(bool),
-    /// 隐藏状态切换后的新状态（`true` = 已藏进托盘）。
-    Hidden(bool),
-    /// 用户要退出。
-    Quit,
-}
-
 /// 循环接缝的淡入。
 ///
 /// 素材里**找不到**「回绕时一模一样」的两帧：整段是画家一口气演完的 10 秒，
@@ -388,32 +141,14 @@ impl Dissolve {
     }
 }
 
-/// 正在走的一段路。
-///
-/// 位移按**帧**推进（不是按秒）：这样它和动画片段天然同步——一段素材演完，
-/// 路也正好走完，不会出现「人已经到了还在原地踏步」。
-struct Walk {
-    /// 还剩多少像素没走。
-    left: f32,
-    /// 方向：-1 往左，+1 往右。
-    dir: f32,
-    /// 每帧走多少像素（**由素材自己决定**，不是按距离算）。
-    per_frame: f32,
-    /// 这段素材朝哪边（改方向时重新算镜像用）。
-    faces_left: Option<bool>,
-    /// 已经走到哪（**浮点**累加，只在摆窗口时才取整）。
-    ///
-    /// 必须浮点：短距离时每帧才 0.4 像素，逐帧 `round()` 会被舍成 0，
-    /// 结果就是「原地踏步、窗口不动」。
-    x: f32,
-}
-
 /// 一只桌宠的全部运行时状态。
 pub struct Pet {
     win: LayeredWindow,
     /// 素材目录（`manifest.json` 所在处）。
     dir: PathBuf,
     manifest: Manifest,
+    /// 用户配置（启动时加载一次，之后只读）。
+    cfg: Config,
     /// 已打开的动画。按需加载，没播过的段不占内存。
     anims: HashMap<String, Anim>,
     current: String,
@@ -475,6 +210,8 @@ pub struct Pet {
     look_cd: Instant,
     /// 点桌面就让鱼走过去（菜单开关，默认关）。
     click_walk: bool,
+    /// 打字联动（菜单开关，默认开）：敲键盘时按热度陪一段工作动画。
+    typing_enabled: bool,
     /// 上一拍左键是不是按着的（做「按下」沿检测）。
     lb_down: bool,
     /// 当前这一帧要不要水平镜像。
@@ -488,6 +225,12 @@ pub struct Pet {
     waking: bool,
     /// 上次掷「自然醒」骰子的时刻。
     wake_roll: Instant,
+    /// 打字热度：按键累加、随时间衰减（见 `note_typing`）。
+    typing_heat: f32,
+    /// 下次允许因打字触发工作动画的时刻。
+    typing_next: Instant,
+    /// 触发概率（自检会钉成 1.0 / 0.0）。
+    typing_chance: f32,
     /// 是否被藏进托盘。
     hidden: bool,
     /// 调用方要求的定时器周期，隐藏时用来原样恢复。
@@ -503,7 +246,10 @@ pub struct Pet {
 
 impl Pet {
     /// 打开素材目录并建窗口。`forced` 指定则只播这一段、忽略状态机。
-    pub fn open(dir: impl AsRef<Path>, forced: Option<&str>) -> Result<Self> {
+    ///
+    /// `cfg` 是用户参数（入睡/动作间隔、打字联动、走路距离、分类权重）。
+    /// 传 [`Config::default`] 就是出厂设置。
+    pub fn open(dir: impl AsRef<Path>, forced: Option<&str>, cfg: Config) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let manifest = Manifest::load(dir.join("manifest.json"))
             .with_context(|| format!("读不了素材清单 {}", dir.join("manifest.json").display()))?;
@@ -523,22 +269,25 @@ impl Pet {
         let (x, y) = window_pos(manifest.canvas.width, &entry, anchor_x, feet_y);
         let win = LayeredWindow::create(entry.width() as u32, entry.height() as u32, x, y, "飞鱼")
             .context("创建分层窗口失败")?;
+        // 打字联动：登记键盘原始输入（窗口不在前台也能收到）。
+        // 失败只丢这一个功能，不能因此连桌宠都起不来。
+        if let Err(e) = feiyu_platform::enable_typing(win.hwnd()) {
+            eprintln!("键盘输入登记失败（打字联动不可用，其余照常）：{e:#}");
+        }
 
         // 池子要在 `manifest` 被 move 进 `pet` 之前建：字段按声明顺序求值，
-        // 写到 `manifest` 之后就拿不到它了。
+        // 写到 `manifest` 之后就拿不到它。
         let available: Vec<&str> = manifest.ids().collect();
-        // 池子就是参数表里 `weight > 0` 的那些段。
-        let combined: Vec<(&str, u32)> = CLIPS
-            .iter()
-            .filter(|c| c.weight > 0)
-            .map(|c| (c.id, c.weight))
-            .collect();
-        let pool = Pool::new(combined).retained(&available);
+        let pool = Pool::new(pool_items(&cfg)).retained(&available);
+        // 在把 `cfg` move 进结构体之前取好初始值。
+        let typing_enabled = cfg.typing.enabled;
+        let typing_chance = cfg.typing.chance;
 
         let mut pet = Self {
             win,
             dir,
             manifest,
+            cfg,
             anims: HashMap::new(),
             current: first,
             frame: 0,
@@ -569,11 +318,16 @@ impl Pet {
             // 初始就当成「很久以前」：否则刚启动的 4 秒内第一次转头会被冷却拦下。
             look_cd: Instant::now() - std::time::Duration::from_secs(60),
             click_walk: false,
+            typing_enabled,
             lb_down: false,
             flip: false,
             flip_buf: Vec::new(),
             waking: false,
             wake_roll: Instant::now(),
+            typing_heat: 0.0,
+            // 启动时不设冷却：用户如果立刻就开敲，第一次热度到线就能掷一次。
+            typing_next: Instant::now(),
+            typing_chance,
             fixed_sleep: None,
             hidden: false,
             tick_ms: 0,
@@ -942,6 +696,13 @@ impl Pet {
             }
         }
 
+        // 打字联动：用户一直在敲键盘时，偶尔切一段「工作状态」动画陪他一起忙。
+        // 按键计数每拍都取走（不攒着）；热度只在真闲着时累积（见 `note_typing`）。
+        if self.forced.is_none() {
+            let keys = feiyu_platform::typing_keys();
+            self.note_typing(keys, dt, now)?;
+        }
+
         // 松手后的滑行/下落。先算运动再推进帧：位置是这一帧的最终结果，
         // 顺序反了会让迟一帧的落点闪到边界外。
         if let Some(mut motion) = self.motion.take() {
@@ -1073,41 +834,6 @@ impl Pet {
             self.action_playing = true;
         }
         Ok(())
-    }
-
-    /// 开始一次「醒来」：从**当前帧**接着演到最后一帧，播完回待机。
-    ///
-    /// 不直接 `stimulate(Click)`：那会切到 `click_happy`，观众看到的是
-    /// 鱼从躺着一下跳到站着笑，像被剪了一帧。素材里本来就有睁眼起身的过程，
-    /// 不花额外成本就能把它演完。
-    ///
-    /// 也不能从固定的第 170 帧起播（旧实现）：睡着时 Z 正挂在中间，一下跳到
-    /// Z 已经消失的 170，画面差实测 11.7——比循环接缝还大一倍，用户说的「闪一下」
-    /// 就是它。从当前帧往后演，Z 会在 149~173 自己飘散掉，一帧都没跳过。
-    ///
-    /// 睡到一半（`Falling`，还闭着眼往下沉）被点则直接醒：那时跳到起身段反而突兀。
-    fn wake_up(&mut self) -> Result<()> {
-        if self.waking || self.brain.mood() != Mood::Sleep {
-            return Ok(());
-        }
-        // 当前帧换成比例：`span_to_frames` 的 round 是精确的，传进去多少换回来还是多少。
-        let count = self.current_count();
-        let from = match count.checked_sub(1) {
-            Some(last) if last > 0 => self.frame.min(last) as f32 / last as f32,
-            _ => 0.0,
-        };
-        match self.sleep_cycle.as_mut() {
-            Some(cycle) if cycle.stage() == SleepStage::Asleep => cycle.start_waking(from),
-            _ => return self.stimulate(Stimulus::Awaken),
-        }
-        self.apply_sleep_span();
-        // 正在淡接缝时被点醒：淡入的两端已经不相关了，直接收掉。
-        self.dissolve = None;
-        self.frame = self.loop_span.map_or(0, |(lo, _)| lo);
-        self.waking = true;
-        // 复用「播完一圈就收尾」那条路：醒来段不回绕，一落到段尾就交回 `step_frames`。
-        self.action_playing = true;
-        self.draw_frame()
     }
 
     /// 用最近的拖拽采样估一个松手速度，并清空采样。
@@ -1248,86 +974,6 @@ impl Pet {
         self.limits_for(entry)
     }
 
-    /// 在屏幕坐标 `(x, y)` 弹出右键菜单，返回应该做什么。
-    ///
-    /// 桌宠自身的右键和托盘图标的右键**共用同一张菜单**：两边的动作完全一样，
-    /// 只有第一项随「当前藏没藏」换文案。分开维护两张表，只会让两边慢慢长歪。
-    pub fn menu(&mut self, x: i32, y: i32) -> Result<Action> {
-        let menu = self.build_menu()?;
-        let Some(cmd) = menu.show_at(self.win.hwnd(), x, y)? else {
-            return Ok(Action::None);
-        };
-        self.dispatch(cmd)
-    }
-
-    /// 菜单项数（自检用：只核对内容没被写坏，不弹出来）。
-    pub fn menu_items(&self) -> Result<usize> {
-        Ok(self.build_menu()?.items())
-    }
-
-    /// 菜单首项文案：藏着时是「唤出」，显示着时是「隐藏」。
-    pub fn hide_label(&self) -> &'static str {
-        if self.hidden {
-            "唤出桌宠"
-        } else {
-            "隐藏到托盘"
-        }
-    }
-
-    fn build_menu(&self) -> Result<Menu> {
-        let topmost = self.win.is_topmost();
-        let mut menu = Menu::new()?;
-        menu.command(CMD_HIDE, self.hide_label())
-            .command(CMD_HOME, "回到屏幕底部")
-            .check(CMD_FOLLOW, "跟随鼠标", self.follow)
-            .check(CMD_CLICK_WALK, "点哪走哪", self.click_walk)
-            .check(CMD_TOPMOST, "总在最前", topmost)
-            .separator()
-            .command(CMD_QUIT, "退出");
-        Ok(menu)
-    }
-
-    fn dispatch(&mut self, cmd: CommandId) -> Result<Action> {
-        match cmd {
-            CMD_HIDE => {
-                let next = !self.hidden;
-                if next {
-                    self.hide();
-                } else {
-                    self.unhide();
-                }
-                Ok(Action::Hidden(next))
-            }
-            CMD_HOME => {
-                self.back_to_home()?;
-                Ok(Action::Home)
-            }
-            CMD_FOLLOW => {
-                let next = !self.follow;
-                self.follow = next;
-                Ok(Action::Follow(next))
-            }
-            CMD_CLICK_WALK => {
-                let next = !self.click_walk;
-                self.click_walk = next;
-                Ok(Action::ClickWalk(next))
-            }
-            CMD_TOPMOST => {
-                // 重读一次而不是拿弹菜单前的快照：菜单是模态的，
-                // 中间可能已经改过了。
-                let next = !self.win.is_topmost();
-                self.win.set_topmost(next);
-                Ok(Action::Topmost(next))
-            }
-            CMD_QUIT => Ok(Action::Quit),
-            other => {
-                // 菜单里没有这一项：不静默吞掉，留条线索。
-                eprintln!("未知菜单命令 {other}，已忽略");
-                Ok(Action::None)
-            }
-        }
-    }
-
     /// 给一个初速度让它自己滑/落。
     ///
     /// 只给调试模式（`--fling`）用：真机拖拽走 [`Self::on_button_up`]，
@@ -1392,7 +1038,8 @@ impl Pet {
         if let Some(secs) = self.fixed_sleep {
             return secs;
         }
-        self.rng.range(SLEEP_AFTER_MIN, SLEEP_AFTER_MAX)
+        self.rng
+            .range(self.cfg.sleep_after.0, self.cfg.sleep_after.1)
     }
 
     /// 安排下一次自娱自乐。
@@ -1401,7 +1048,7 @@ impl Pet {
     /// 存绝对值就自然跟着顺延，不用在清零处到处补一行。
     fn schedule_next_action(&mut self) {
         let now = self.brain.elapsed();
-        self.next_action_at = now + self.rng.range(ACTION_GAP_MIN, ACTION_GAP_MAX);
+        self.next_action_at = now + self.rng.range(self.cfg.action_gap.0, self.cfg.action_gap.1);
     }
 
     /// 换段之后的收尾——**全部照参数表来**，这里不再认任何具体 id。
@@ -1445,288 +1092,6 @@ impl Pet {
         Ok(())
     }
 
-    /// 按这段素材自己的参数走一趟：朝向、迈步区间都来自参数表。
-    ///
-    /// 返回 `false` 表示这段走不了（那个方向已经贴墙，或者素材不在）——
-    /// 调用方应把动画退回待机，而不是让它在原地比划。
-    fn begin_walk(&mut self, spec: &'static ClipSpec) -> bool {
-        self.begin_walk_with(spec, None)
-    }
-
-    /// 同上，但可以**指定方向**（`Some(-1.0)` 左 / `Some(1.0)` 右）。
-    /// 自检靠它验镜像：不能靠抽签碰运气。
-    fn begin_walk_with(&mut self, spec: &'static ClipSpec, forced: Option<f32>) -> bool {
-        self.begin_walk_full(spec, forced, None)
-    }
-
-    /// 同上，但可以把距离也钉住（跟随鼠标时要“走多远就多远”）。
-    fn begin_walk_full(
-        &mut self,
-        spec: &'static ClipSpec,
-        forced: Option<f32>,
-        distance: Option<f32>,
-    ) -> bool {
-        let Some(walk) = spec.walk.as_ref() else {
-            return false;
-        };
-        let Ok(entry) = self.manifest.require(spec.id) else {
-            return false;
-        };
-        let limits = self.limits_for(entry);
-        let here = self.anchor_x as f32;
-        let room_left = here - limits.x.0;
-        let room_right = limits.x.1 - here;
-        // 两边都能走就掷硬币，贴墙的一边自动排除。
-        let dir = if let Some(d) = forced {
-            let room = if d < 0.0 { room_left } else { room_right };
-            if room <= 24.0 {
-                return false;
-            }
-            d
-        } else {
-            match (room_left > 24.0, room_right > 24.0) {
-                (true, true) => {
-                    if self.rng.unit() < 0.5 {
-                        -1.0
-                    } else {
-                        1.0
-                    }
-                }
-                (true, false) => -1.0,
-                (false, true) => 1.0,
-                (false, false) => return false,
-            }
-        };
-        // 走的方跟素材朝相反时镜像它（否则就是倒退着走）。
-        let flip = match walk.faces_left {
-            Some(faces_left) => (dir < 0.0) != faces_left,
-            None => false,
-        };
-        let room = if dir < 0.0 { room_left } else { room_right };
-        let want = match distance {
-            Some(d) => d.clamp(24.0, WALK_MAX_PX * 2.0).min(room),
-            None => self.rng.range(WALK_MIN_PX, WALK_MAX_PX).min(room),
-        };
-        if want < 24.0 {
-            return false;
-        }
-        // **速度由素材自己定**（`px_per_frame`），不是拿距离除帧数：
-        // 那段走得快就走得快、走得慢就慢，不会每段都一个速度。
-        let per_frame = walk.px_per_frame.max(0.05);
-
-        if self.play(spec.id).is_err() {
-            return false;
-        }
-        // 从「真正在迈步」的那一帧开始循环，跳过开头的起势——
-        // 这就是用户看到的「先移动、一秒后才开始走」的那个一秒。
-        let last = self.current_count().saturating_sub(1);
-        let (lo, hi) = match spec.span {
-            Some((a, b)) => (a.min(last), b.min(last).max(a.min(last))),
-            None => (0, last),
-        };
-        self.loop_span = Some((lo, hi));
-        self.frame = lo;
-        self.flip = flip;
-        let _ = self.draw_frame();
-
-        self.walk = Some(Walk {
-            left: want,
-            dir,
-            per_frame,
-            faces_left: walk.faces_left,
-            x: self.anchor_x as f32,
-        });
-        true
-    }
-
-    /// 推进一步位移。走完就把 `walk` 清掉（动画仍由 `step_frames` 收尾）。
-    fn step_walk(&mut self, step: u32) -> Result<()> {
-        let Some((x, done)) = self.walk.as_mut().map(|w| {
-            let s = (w.per_frame * step as f32).min(w.left);
-            w.left -= s;
-            w.x += w.dir * s;
-            (w.x, w.left <= 0.0)
-        }) else {
-            return Ok(());
-        };
-        if done {
-            // 到站就立刻收：继续把这段走路素材播完会变成「原地踏步」。
-            self.walk = None;
-            self.action_playing = false;
-            self.play("idle")?;
-            return Ok(());
-        }
-        let entry = self.manifest.require(&self.current)?.clone();
-        let limits = self.limits_for(&entry);
-        // 浮点累加后的位置取整再夹边界：短距离（每帧不到 1px）也能慢慢挪。
-        self.anchor_x = x.clamp(limits.x.0, limits.x.1).round() as i32;
-        self.place_window(&entry);
-        Ok(())
-    }
-
-    /// 让指定的走路段走一趟。**只给自检用**：真实走路靠待机池抽签。
-    ///
-    /// 逐段验：每段都得跳过自己的前摇、朝素材自己的方向走。
-    pub(crate) fn wander_with(&mut self, id: &str) -> bool {
-        let Some(spec) = clip(id) else {
-            return false;
-        };
-        let started = self.begin_walk(spec);
-        if started {
-            self.action_playing = true;
-        }
-        started
-    }
-
-    /// 指定方向走一段。自检用：要验「往反方向走时镜像」，不能靠抽签。
-    pub(crate) fn wander_dir(&mut self, id: &str, right: bool) -> bool {
-        let Some(spec) = clip(id) else {
-            return false;
-        };
-        let started = self.begin_walk_with(spec, Some(if right { 1.0 } else { -1.0 }));
-        if started {
-            self.action_playing = true;
-        }
-        started
-    }
-
-    /// 朝屏幕上的某个 x 走过去。返回是否真的开始走。
-    ///
-    /// 暂时没入口：`--follow` 按用户要求改成了**转向跟随**（转头看，不挪步）。
-    /// 留着这个方法，将来要「走到鼠标旁边」时接线即可。
-    #[allow(dead_code)]
-    fn walk_toward(&mut self, x: i32) -> bool {
-        let dx = (x - self.anchor_x) as f32;
-        // 已经在它旁边了就别再挪：鼠标停在鱼身上时不该一直抖。
-        if dx.abs() < 60.0 {
-            return false;
-        }
-        let Some(spec) = CLIPS.iter().find(|c| c.walk.is_some()) else {
-            return false;
-        };
-        let started = self.begin_walk_full(spec, Some(dx.signum()), Some(dx.abs()));
-        if started {
-            self.action_playing = true;
-        }
-        started
-    }
-
-    /// 当前动画的帧宽（判断「一个肥鱼宽」的范围用）。
-    fn current_width(&self) -> i32 {
-        self.manifest
-            .require(&self.current)
-            .map(|e| e.width() as i32)
-            .unwrap_or(200)
-    }
-
-    /// 转头看一边：从 `idle` 里截一段「看过去 → 回正」播一遍。
-    ///
-    /// 不再整段播 `turn`（那是东张西望，10 秒且包含全身转动）；
-    /// 用的是 idle 素材里已经存在的左右看，播完自然回到正面。
-    fn play_look(&mut self, towards_left: bool) -> bool {
-        if self.play("idle").is_err() {
-            return false;
-        }
-        let (lo, hi) = if towards_left { LOOK_LEFT } else { LOOK_RIGHT };
-        let last = self.current_count().saturating_sub(1);
-        let lo = lo.min(last);
-        let hi = hi.min(last).max(lo);
-        self.loop_span = Some((lo, hi));
-        self.frame = lo;
-        // 这一段本身就是「看过去再回正」，不需要额外镜像。
-        self.flip = false;
-        self.action_playing = true;
-        // 取证开关：方向到底对不对（鼠标在左就该是「看左」）。
-        if std::env::var_os("FEIYU_EVENT_TRACE").is_some() {
-            println!(
-                "看向{}（第 {lo}~{hi} 帧）",
-                if towards_left { "左" } else { "右" }
-            );
-        }
-        let _ = self.draw_frame();
-        true
-    }
-
-    /// 用给定的鼠标 x 跑一次「转向跟随」判定，返回是否转头了。
-    ///
-    /// `tick` 用真实光标调它；自检用假坐标调它——鼠标没法在测试里"移开"。
-    pub(crate) fn poll_look(&mut self, cursor_x: i32) -> bool {
-        let width = self.current_width().max(80);
-        let dx = cursor_x - self.anchor_x;
-        let near = dx.abs() <= width;
-        // 只在「刚离开」那一拍、而且它在待机时才转头。
-        let mut turned = false;
-        if self.was_near
-            && !near
-            && !self.action_playing
-            && self.look_cd.elapsed().as_secs_f32() >= LOOK_COOLDOWN
-        {
-            self.look_cd = Instant::now();
-            turned = self.play_look(dx < 0);
-        }
-        self.was_near = near;
-        turned
-    }
-
-    /// 把转头冷却清零。只给自检用（否则测一次要真等 4 秒）。
-    pub(crate) fn reset_look_cooldown(&mut self) {
-        self.look_cd = Instant::now() - std::time::Duration::from_secs(60);
-    }
-
-    /// 朝屏幕上的 x 走（或跑）过去——「点哪走哪」。返回是否真的开始。
-    ///
-    /// 规则：距离不到**一个肥鱼宽**就不动（那种距离走过去像抽筋）；
-    /// 走哪一段按权重抽（目前 `move_float` 6 / `move_crab` 4）。
-    pub(crate) fn walk_to(&mut self, x: i32) -> bool {
-        let width = self.current_width().max(80);
-        let dx = x - self.anchor_x;
-        if dx.abs() <= width {
-            return false;
-        }
-        let dir = if dx < 0 { -1.0 } else { 1.0 };
-        // 已经在走：**就地改方向**（不切动画、不硬切），立即生效。
-        // 这就是「走到一半点新方向，能马上跟着新方向走」。
-        if let Some(w) = self.walk.as_mut() {
-            w.dir = dir;
-            w.left = dx.abs() as f32;
-            // 镜像要跟着新方向重算。
-            self.flip = match w.faces_left {
-                Some(faces_left) => (dir < 0.0) != faces_left,
-                None => false,
-            };
-            return true;
-        }
-        if self.action_playing {
-            return false;
-        }
-        let total: u32 = CLIPS
-            .iter()
-            .filter(|c| c.walk.is_some())
-            .map(|c| c.weight)
-            .sum();
-        if total == 0 {
-            return false;
-        }
-        let mut pick = self.rng.range(0.0, total as f32);
-        let mut spec = None;
-        for c in CLIPS.iter().filter(|c| c.walk.is_some()) {
-            pick -= c.weight as f32;
-            if pick <= 0.0 {
-                spec = Some(c);
-                break;
-            }
-        }
-        let Some(spec) = spec else {
-            return false;
-        };
-        let dir = if dx < 0 { -1.0 } else { 1.0 };
-        let started = self.begin_walk_full(spec, Some(dir), Some(dx.abs() as f32));
-        if started {
-            self.action_playing = true;
-        }
-        started
-    }
-
     /// 开/关「点哪走哪」。`--click-walk` 与菜单项用。
     pub fn set_click_walk(&mut self, on: bool) {
         self.click_walk = on;
@@ -1735,6 +1100,11 @@ impl Pet {
     /// 参数表里这段的说明。`--showcase` 与自检用。
     pub(crate) fn clip_desc(id: &str) -> &'static str {
         clip(id).map_or("", |c| c.desc)
+    }
+
+    /// 清单里的中文名（`--showcase` 打印用）。
+    pub fn name_of(&self, id: &str) -> Option<&str> {
+        self.manifest.get(id).map(|a| a.name.as_str())
     }
 
     /// 当前动画总帧数。`--showcase` 按它算「播完整一圈要几秒」。
@@ -1754,16 +1124,17 @@ impl Pet {
         if clip(id).is_some_and(|c| c.walk.is_some()) && self.wander_with(id) {
             return Ok(());
         }
-        self.play(id)
-    }
-
-    /// 按睡眠编排的当前阶段重算循环区间。
-    fn apply_sleep_span(&mut self) {
-        let Some(cycle) = self.sleep_cycle.as_ref() else {
-            return;
-        };
-        let count = self.current_count();
-        self.loop_span = Some(span_to_frames(cycle.span(), count));
+        self.play(id)?;
+        // `drag` 这类有帧区间的段，演示也照参数表来（不跳前摇就看不到「一提就悬空」）。
+        // `sleep` 例外：它靠 `after_switch` 分三段编排，演示就要整段看完。
+        if id != "sleep" {
+            if let Some((lo, hi)) = Pet::clip_span(id) {
+                self.loop_span = Some((lo, hi));
+                self.frame = lo;
+                self.draw_frame()?;
+            }
+        }
+        Ok(())
     }
 
     /// 推进 `step` 帧，并处理「待机小动作播完一圈」。
@@ -1951,11 +1322,52 @@ impl Pet {
             return Ok(());
         }
         if self.brain.stimulus(s) {
-            let id = self.brain.anim_id();
+            // 「开心」不是一个固定段：原版点击回应是 5 段等概率抽一段，
+            // 状态机只给出「该开心了」这个语义，具体画面在这里抽。
+            let id = if self.brain.mood() == Mood::Happy {
+                self.pick_click()
+            } else {
+                self.brain.anim_id()
+            };
             self.play(id)?;
             self.after_switch(id)?;
         }
         Ok(())
+    }
+
+    /// 点击池里现存的段（缺素材的自动不列）。
+    fn click_pool(&self) -> Vec<&'static str> {
+        CLICK_IDS
+            .iter()
+            .copied()
+            .filter(|id| self.manifest.get(id).is_some())
+            .collect()
+    }
+
+    /// 从 5 段点击回应里抽一段，不连着抽同一个。
+    fn pick_click(&mut self) -> &'static str {
+        let available = self.click_pool();
+        if available.is_empty() {
+            return "click_happy";
+        }
+        let mut at = self.rng.below(available.len() as u32) as usize;
+        if available[at] == self.current && available.len() > 1 {
+            at = (at + 1) % available.len();
+        }
+        available[at]
+    }
+
+    /// 连抽 `n` 次点击回应（只抽不播，也不做「不连抽同一个」的修正）。
+    /// 自检用：确认 5 段都在池子里。
+    pub(crate) fn sample_click_ids(&mut self, n: u32) -> Vec<&'static str> {
+        let available = self.click_pool();
+        if available.is_empty() {
+            return Vec::new();
+        }
+        let len = available.len() as u32;
+        (0..n)
+            .map(|_| available[self.rng.below(len) as usize])
+            .collect()
     }
 
     /// 拖拽结束后，按当前动画的 origin/baseline 把锚点对回实际窗口位置，
@@ -2001,6 +1413,15 @@ impl Pet {
             entry.frames,
             header.frame_count
         );
+        // 素材现在有 100 段：菜单从头点到尾会把每段都打开一次。每个读取器为了
+        // 顺序播放不重解差分链，都持有一份整帧缓冲（几十万字节）；一百份叠起来
+        // 是几十 MB 的隐性内存。只留「当前 + 待切 + idle/drag 预热」这几份，
+        // 其余丢掉——真要重播时重开一次只要十几毫秒。
+        const ANIM_CACHE: usize = 6;
+        if self.anims.len() >= ANIM_CACHE {
+            let keep = [self.current.as_str(), id, "idle", "drag"];
+            self.anims.retain(|k, _| keep.contains(&k.as_str()));
+        }
         self.anims.insert(id.to_owned(), anim);
         Ok(())
     }
@@ -2016,68 +1437,136 @@ fn window_pos(canvas_width: u16, entry: &AnimEntry, anchor_x: i32, feet_y: i32) 
     (x, y)
 }
 
-/// 把一帧预乘 BGRA 水平镜像（行内倒过来）写进 `dst`，返回它。
-///
-/// 素材只画了一套朝向，往反方向走就靠这个：眼睛、头发、衣摆全都跟着翻，
-/// 比「倒着走」自然得多。
-fn mirror_bgra<'a>(src: &[u8], width: usize, dst: &'a mut Vec<u8>) -> &'a [u8] {
-    dst.clear();
-    dst.reserve(src.len());
-    let row = width.max(1) * 4;
-    for line in src.chunks_exact(row) {
-        for px in line.rchunks_exact(4) {
-            dst.extend_from_slice(px);
-        }
-    }
-    dst
-}
-
-/// 两帧的平均像素差。用来判断一个循环接缝硬不硬。
-///
-/// 每 16 个字节采一个样（一行 384 像素 = 1536 字节，即一行采 96 点），
-/// 二十四万多个采样点，四百 KB 的帧算一遍不到 0.1ms——只在接缝处跑一次。
-fn seam_mad(a: &[u8], b: &[u8]) -> f32 {
-    let (mut sum, mut n) = (0u64, 0u64);
-    for (x, y) in a.iter().zip(b).step_by(16) {
-        sum += u64::from((*x).abs_diff(*y));
-        n += 1;
-    }
-    if n == 0 {
-        0.0
-    } else {
-        sum as f32 / n as f32
-    }
-}
-
-/// 把 `from` 和 `to` 按 `num/den` 线性混合，写进 `out`。
-///
-/// 帧像素是**预乘** BGRA，逐通道线性插值就是正确的那种混合（预乘之后
-/// 透明度已经乘进颜色里，插值不会出现半透明边缘发黑）。
-fn blend_frame(from: &[u8], to: &[u8], num: u32, den: u32, out: &mut Vec<u8>) {
-    let den = den.max(1);
-    let num = num.min(den);
-    out.clear();
-    out.extend(to.iter().enumerate().map(|(i, b)| {
-        // 长度不一致时（换了素材还没重画）就以新帧为准，不越界。
-        let a = u32::from(from.get(i).copied().unwrap_or(*b));
-        let b = u32::from(*b);
-        ((a * (den - num) + b * num) / den) as u8
-    }));
-}
-
-/// 保证区间左小右大；退化（窗口比工作区还大）时压成中点。
-fn ordered(lo: f32, hi: f32) -> (f32, f32) {
-    if lo <= hi {
-        (lo, hi)
-    } else {
-        let mid = (lo + hi) / 2.0;
-        (mid, mid)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 分类表是菜单和随机池的唯一数据源：id 重复会让同一段素材在菜单里出现两次，
+    /// 而命令 id 是按序号算的——重复之后每一项都会错位到别人的动画。
+    #[test]
+    fn category_ids_are_unique() {
+        let mut seen: Vec<&str> = Vec::new();
+        for id in CATEGORIES.iter().flat_map(|c| c.clips.iter().copied()) {
+            assert!(!seen.contains(&id), "分类表里 {id} 重复了");
+            seen.push(id);
+        }
+        // 三个系统状态不进菜单/池（按钮会播错语义）。
+        for system in ["idle", "sleep", "drag"] {
+            assert!(!seen.contains(&system), "{system} 不该出现在分类表里");
+        }
+        // 100 段里去掉这三个，正好 97 段可点播。
+        assert_eq!(seen.len(), 97, "可点播段数不对");
+    }
+
+    /// 权重口径：turn 5 + move 5 + 分类 90（20+20+16+14+10+10）= 100。
+    ///
+    /// 其中「工作状态 10」是本项目自加的：原版由 DSH 会话事件触发，
+    /// 不接 DSH 之后改成随机 + 打字联动，否则 6 段素材永远看不到。
+    #[test]
+    fn category_weights_match_upstream() {
+        let total: u32 = CATEGORIES.iter().map(|c| c.weight).sum();
+        assert_eq!(total, 100, "分类权重合计应为 100");
+        for c in CATEGORIES.iter().filter(|c| c.weight > 0) {
+            assert!(!c.clips.is_empty(), "{} 有权重但没素材", c.label);
+        }
+    }
+
+    /// 点击池就是分类表里的「点击回应」，两处不能各写一份。
+    #[test]
+    fn click_pool_matches_category() {
+        let cat = CATEGORIES
+            .iter()
+            .find(|c| c.label == "点击回应")
+            .expect("缺点击回应分类");
+        assert_eq!(cat.clips, CLICK_IDS);
+        assert_eq!(CLICK_IDS.len(), 5, "原版点击回应一共 5 段");
+    }
+
+    /// 池子只装分类里 weight > 0 的段，而且每个权重都算得出来（不为 0）。
+    #[test]
+    fn pool_items_have_positive_weights() {
+        let items = pool_items(&Config::default());
+        assert!(!items.is_empty());
+        for (id, w) in &items {
+            assert!(*w > 0, "{id} 的权重被取整抹平了");
+            assert!(!["idle", "sleep", "drag"].contains(id), "{id} 不该进池");
+        }
+        let ids: Vec<&str> = items.iter().map(|(id, _)| *id).collect();
+        // 97 段可点播里，点击回应（5）与说话（3）不进随机链。
+        assert_eq!(ids.len(), 89, "进随机池的段数不对，查 CATEGORIES");
+    }
+
+    /// 随机池的分布：89 段都能被抽到，且分类占比接近原版权重。
+    ///
+    /// 只测「非空」是不够的：权重表写错（比如某类合计变了）时池子照样非空，
+    /// 但实际抽出来的东西会偏——这条把比例也钉住。
+    #[test]
+    fn pool_sampling_covers_every_clip() {
+        let pool = Pool::new(pool_items(&Config::default()));
+        let mut rng = Rng::new(20261029);
+        let mut seen = std::collections::HashSet::new();
+        let mut by_cat = std::collections::HashMap::new();
+        let cat_of = |id: &str| {
+            CATEGORIES
+                .iter()
+                .find(|c| c.clips.contains(&id))
+                .map(|c| c.label)
+                .unwrap_or("?")
+        };
+        const N: u32 = 50_000;
+        for _ in 0..N {
+            let id = pool.pick(&mut rng).expect("池子非空");
+            seen.insert(id);
+            *by_cat.entry(cat_of(id)).or_insert(0u32) += 1;
+        }
+        assert_eq!(seen.len(), 89, "有段素材一次都没被抽到");
+        for (label, want) in [
+            ("转向", 5.0),
+            ("移动", 5.0),
+            ("小动作", 20.0),
+            ("玩耍", 20.0),
+            ("吃什么", 16.0),
+            ("时节", 14.0),
+            ("文字", 10.0),
+            ("工作状态", 10.0),
+        ] {
+            let got = *by_cat.get(label).unwrap_or(&0) as f32 / N as f32 * 100.0;
+            assert!(
+                (got - want).abs() < 1.0,
+                "{label} 权重 {got:.1}，期望 {want:.1}"
+            );
+        }
+    }
+
+    /// 配置里的分类权重为 0 时，整类都不进随机池；菜单仍然保留。
+    #[test]
+    fn config_can_remove_a_category_from_pool() {
+        let mut cfg = Config::default();
+        cfg.category_weights.insert("玩耍".to_owned(), 0);
+        let ids: Vec<&str> = pool_items(&cfg).into_iter().map(|(id, _)| id).collect();
+        let play = CATEGORIES
+            .iter()
+            .find(|c| c.label == "玩耍")
+            .expect("缺玩耍分类");
+        for id in play.clips {
+            assert!(!ids.contains(id), "{id} 不该再进池");
+        }
+        assert!(ids.contains(&"hum"), "别的分类不该被连坐");
+    }
+
+    /// 移动段（带位移）必须都能查到参数，否则点播会“原地比划”。
+    #[test]
+    fn every_move_has_walk_spec() {
+        let move_cat = CATEGORIES
+            .iter()
+            .find(|c| c.label == "移动")
+            .expect("缺移动分类");
+        for id in move_cat.clips {
+            let spec = clip(id).unwrap_or_else(|| panic!("{id} 缺参数表记录"));
+            assert!(spec.walk.is_some(), "{id} 没写 walk 参数");
+            assert!(spec.span.is_some(), "{id} 没写帧区间");
+        }
+    }
 
     /// 混合的两端必须精确落在原帧上：`t=0` 是接缝前那帧，`t=1` 是新帧。
     /// 任一端偏一点，接缝处就还是能看到一下跳。

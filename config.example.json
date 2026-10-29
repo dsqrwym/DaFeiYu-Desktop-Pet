@@ -1,0 +1,27 @@
+{
+  "action_gap": [8, 15],
+  "sleep_after": [18, 38],
+  "typing": {
+    "enabled": true,
+    "chance": 0.35,
+    "warmup_keys": 12,
+    "decay_per_sec": 2,
+    "cooldown": [45, 90]
+  },
+  "walk": {
+    "min_px": 120,
+    "max_px": 420
+  },
+  "category_weights": {
+    "转向": 5,
+    "移动": 5,
+    "小动作": 20,
+    "玩耍": 20,
+    "吃什么": 16,
+    "时节": 14,
+    "文字": 10,
+    "点击回应": 0,
+    "说话": 0,
+    "工作状态": 10
+  }
+}

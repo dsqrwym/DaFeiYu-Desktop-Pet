@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/feiyu-core", "crates/feiyu-platform", "crates/feiyu-app", "tools/pack-anim"]
+members = ["crates/feiyu-core", "crates/feiyu-platform", "crates/feiyu-app", "tools/pack-anim", "tools/mf-probe"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,9 +21,12 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_LibraryLoader",
+    "Win32_System_Console",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

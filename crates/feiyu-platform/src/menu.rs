@@ -14,10 +14,11 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowThreadProcessId, PostMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    TrackPopupMenuEx, GWL_EXSTYLE, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL, WS_EX_NOACTIVATE,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetForegroundWindow, GetMenuItemCount,
+    GetMenuStringW, GetSubMenu, GetWindowLongPtrW, GetWindowThreadProcessId, PostMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenuEx, GWL_EXSTYLE, HMENU, MENU_ITEM_FLAGS,
+    MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_NULL, WS_EX_NOACTIVATE,
 };
 
 use crate::{Error, Result};
@@ -63,6 +64,31 @@ impl Menu {
         self
     }
 
+    /// 追加一个子菜单，`build` 里填它的项。
+    ///
+    /// 层级不做限制，但实际只用到「动作 → 分类 → 具体动画」三层。
+    ///
+    /// 所有权要点：子菜单句柄交给父菜单后，父 `DestroyMenu` 会连同子菜单一起销毁。
+    /// 所以这里必须 `mem::forget` 掉子菜单的守卫——否则它析构时先销毁一次，
+    /// 父菜单析构时再销毁同一个句柄，是未定义行为（实测会弹菜单崩）。
+    pub fn submenu(&mut self, label: &str, build: impl FnOnce(&mut Menu)) -> Result<&mut Self> {
+        let mut sub = Menu::new()?;
+        build(&mut sub);
+        let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: wide 在调用期间有效；子菜单句柄由 sub 独占且随后转交父菜单。
+        unsafe {
+            let _ = AppendMenuW(
+                self.handle,
+                MF_POPUP,
+                sub.handle.0 as usize,
+                PCWSTR(wide.as_ptr()),
+            );
+        }
+        std::mem::forget(sub);
+        self.items += 1;
+        Ok(self)
+    }
+
     /// 追加分隔线。
     pub fn separator(&mut self) -> &mut Self {
         // SAFETY: 分隔线不需要文字与 id，传空指针是文档允许的写法。
@@ -76,6 +102,50 @@ impl Menu {
     /// 已追加的项数（分隔线也计入）。
     pub fn items(&self) -> usize {
         self.items
+    }
+
+    /// **Win32 实际**顶层项数（自检用）。
+    ///
+    /// 与 [`Self::items`] 分开：后者是我们自己数的一本账，前者问系统。
+    /// 两者不一致就说明 AppendMenuW 失败过（比如句柄用错），而那类失败
+    /// 在代码里是「忽略返回值」的，不主动查就永远发现不了。
+    pub fn api_items(&self) -> usize {
+        Self::count_of(self.handle)
+    }
+
+    /// 任意菜单句柄的项数（含子菜单——子菜单不归调用方所有，不能包成 `Menu`，
+    /// 否则 Drop 会把它销毁两次）。
+    pub fn count_of(hmenu: HMENU) -> usize {
+        // SAFETY: 句柄由调用方保证有效（直接来自本模块的 GetAll）。
+        let n = unsafe { GetMenuItemCount(Some(hmenu)) };
+        n.max(0) as usize
+    }
+
+    /// 本菜单第 `pos` 项的文字（自检用）。
+    pub fn label(&self, pos: i32) -> String {
+        Self::label_of(self.handle, pos)
+    }
+
+    /// 任意菜单句柄第 `pos` 项的文字（自检用：确认分类标题没写空）。
+    pub fn label_of(hmenu: HMENU, pos: i32) -> String {
+        let mut buf = [0u16; 128];
+        // SAFETY: buf 足够大；GetMenuStringW 返回实际拷入的字符数。
+        // 必须带 `MF_BYPOSITION`：不带时 `pos` 会被当成命令 id，
+        // 于是传 6 拿到的是「点哪走哪」（CMD_CLICK_WALK），而不是第 7 项。
+        let n = unsafe { GetMenuStringW(hmenu, pos as u32, Some(&mut buf[..]), MF_BYPOSITION) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    /// 第 `pos` 项的子菜单（不是子菜单就返回 `None`）。自检用。
+    pub fn api_submenu(&self, pos: i32) -> Option<HMENU> {
+        Self::submenu_of(self.handle, pos)
+    }
+
+    /// 任意菜单句柄第 `pos` 项的子菜单。
+    pub fn submenu_of(hmenu: HMENU, pos: i32) -> Option<HMENU> {
+        // SAFETY: 同上；GetSubMenu 对越界/非子菜单返回 NULL。
+        let h = unsafe { GetSubMenu(hmenu, pos) };
+        (!h.0.is_null()).then_some(h)
     }
 
     /// 在屏幕坐标 `(x, y)` 弹出并等待选择。

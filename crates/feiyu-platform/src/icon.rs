@@ -71,7 +71,7 @@ impl Icon {
     fn from_pixels(px: &[u8], size: u32) -> Result<Self> {
         let size = size.max(1);
         debug_assert_eq!(px.len(), (size * size * 4) as usize, "图标字节数与尺寸不符");
-        let mut info = BITMAPINFO {
+        let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: size as i32,
@@ -86,9 +86,8 @@ impl Icon {
         };
         let mut bits: *mut c_void = std::ptr::null_mut();
         // SAFETY: info 已填满；bits 只是接收指针，不共享文件映射。
-        let color =
-            unsafe { CreateDIBSection(None, &mut info, DIB_RGB_COLORS, &mut bits, None, 0) }
-                .map_err(|e| Error::win32("CreateDIBSection", e))?;
+        let color = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+            .map_err(|e| Error::win32("CreateDIBSection", e))?;
         // SAFETY: bits 指向 size×size×4 字节的 DIB 像素区。
         unsafe { std::ptr::copy_nonoverlapping(px.as_ptr(), bits as *mut u8, px.len()) };
 

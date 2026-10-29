@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# `cargo run -p feiyu-app` 默认跑 console 版：日志和退出码都在终端里。
+default-run = "feiyu-cli"
+
+[lib]
+name = "feiyu_app"
+path = "src/lib.rs"
 
 [dependencies]
 feiyu-core = { path = "../feiyu-core" }
@@ -13,3 +19,7 @@ anyhow = { workspace = true }
 [[bin]]
 name = "feiyu"
 path = "src/main.rs"
+
+[[bin]]
+name = "feiyu-cli"
+path = "src/bin/feiyu-cli.rs"

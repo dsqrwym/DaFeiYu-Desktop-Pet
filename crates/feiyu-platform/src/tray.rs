@@ -83,10 +83,12 @@ impl TrayIcon {
 
 impl Drop for TrayIcon {
     fn drop(&mut self) {
-        let mut data = NOTIFYICONDATAW::default();
-        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        data.hWnd = self.hwnd;
-        data.uID = self.uid;
+        let data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: self.uid,
+            ..Default::default()
+        };
         // SAFETY: 只按句柄撤图标，不读其他字段。
         let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
     }
@@ -94,11 +96,13 @@ impl Drop for TrayIcon {
 
 /// 填好「句柄 + id + 提示文字」，其余字段留零。
 fn data_for(hwnd: HWND, tip: &str) -> NOTIFYICONDATAW {
-    let mut data = NOTIFYICONDATAW::default();
-    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    data.hWnd = hwnd;
-    data.uID = UID;
-    data.uCallbackMessage = TRAY_MESSAGE;
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: UID,
+        uCallbackMessage: TRAY_MESSAGE,
+        ..Default::default()
+    };
     // szTip 是定长 128 个 u16，超长部分丢掉（宁可截断，也不越界）。
     let wide: Vec<u16> = tip.encode_utf16().take(127).collect();
     data.szTip[..wide.len()].copy_from_slice(&wide);

@@ -71,7 +71,7 @@ pub fn fling_velocity(samples: &[(f32, i32, i32)]) -> (f32, f32) {
     };
     let span = last.0 - first.0;
     // 采样太少或时间跨度太短：除以它只会得到噪声。
-    if samples.len() < 2 || !(span > 0.01) {
+    if samples.len() < 2 || !span.is_finite() || span <= 0.01 {
         return (0.0, 0.0);
     }
     let vx = (last.1 - first.1) as f32 / span;

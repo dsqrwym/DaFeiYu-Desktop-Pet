@@ -10,6 +10,9 @@
 //! 链路里的每一步都刻意保持「可复现 + 零第三方依赖」：解码/缩放交给外部 ffmpeg，
 //! 抠像与打包在本程序内完成，产物只依赖 `feiyu-core` 的格式定义。
 
+// MSRV 1.80：`as_chunks` / `is_multiple_of` 还没稳定，保留手写写法。
+#![allow(clippy::chunks_exact_to_as_chunks, clippy::manual_is_multiple_of)]
+
 mod decode;
 mod mask;
 
@@ -25,19 +28,121 @@ use feiyu_core::anim::AnimReader;
 
 /// 中文素材名 → ASCII 文件名。中文只留在 `manifest.json` 里做显示，
 /// 文件名一律 ASCII：避免 git、zip、`ffmpeg` 三处的中文路径隐患。
+///
+/// 表里**只登记桌宠会用的 100 段**：余额事件 6 段（`余额-*`）是 DSH 余额接口的
+/// 专属演出，本项目不接 DSH，所以刻意不登记——目录模式下会被「跳过未登记素材」跳过。
+/// 顺序按分类排，和 `pet.rs` 的 `CATEGORIES` 一一对应，改名字时两边一起改。
 const NAME_MAP: &[(&str, &str)] = &[
+    // ---- 系统状态（不进菜单、不进随机池）----
     ("待机呼吸休闲", "idle"),
-    ("东张西望", "turn"),
+    ("原地小憩沉眠", "sleep"),
     ("被鼠标拖拽悬空反馈", "drag"),
+    // ---- 转向 / 移动 ----
+    ("东张西望", "turn"),
     ("螃蟹走路", "move_crab"),
     ("原地漂浮踏步", "move_float"),
     ("原地左转奔跑", "move_run"),
+    // ---- 点击回应 ----
     ("点击回应-开心跃动", "click_happy"),
     ("点击回应-害羞惊讶", "click_shy"),
     ("点击回应-傲娇生气", "click_pout"),
-    ("原地小憩沉眠", "sleep"),
+    ("点击回应-挠痒咯咯笑", "click_tickle"),
+    ("点击回应-元气挥手", "click_wave"),
+    // ---- 小动作 ----
+    ("悠闲哼歌", "hum"),
     ("超大伸懒腰", "stretch"),
+    ("原地敲击桌面互动", "tap_desk"),
+    ("原地重力下蹲压缩", "squat"),
+    ("哈欠连天", "yawn"),
+    ("女仆屈膝礼仪", "curtsey"),
+    ("被吓一跳", "startle"),
+    ("小幅度原地360度旋转展示", "spin360"),
+    ("偷吃零食被抓住", "snack_caught"),
+    ("用鲸鱼尾巴拍打地面", "tail_pat"),
+    ("打瞌睡被惊醒", "doze_startle"),
     ("照镜子", "mirror"),
+    ("整体换装试色", "dressup"),
+    ("轻快记录", "note"),
+    ("写代码", "code"),
+    ("摇扇纳凉", "fan"),
+    ("晨间刷牙", "brush_teeth"),
+    // ---- 玩耍 ----
+    ("原地专心玩魔方", "rubik"),
+    ("原地蹲下玩玩具汽车", "toy_car"),
+    ("鲸鱼吐泡泡特效", "bubbles"),
+    ("原地跳跃抓碎头顶物品", "jump_grab"),
+    ("玩游戏气急败坏", "game_rage"),
+    ("玩水枪", "water_gun"),
+    ("小提琴演奏", "violin"),
+    ("蓝鲸现世", "whale"),
+    ("优雅女仆舞", "maid_dance"),
+    ("轻快摇摆舞", "sway_dance"),
+    ("可爱宅舞", "otaku_dance"),
+    ("吹气球", "balloon"),
+    ("动物环绕", "animals"),
+    ("放风筝", "kite"),
+    ("拆礼物", "gift"),
+    ("变鸽子", "dove"),
+    ("扑克魔术", "poker"),
+    ("抽陀螺", "top"),
+    ("吹笛子", "flute"),
+    ("蝴蝶蜜蜂环绕头顶开花", "butterflies"),
+    ("撸猫", "pet_cat"),
+    ("凭空生花", "flowers"),
+    ("骑木马", "hobby_horse"),
+    ("三球抛接", "juggle"),
+    ("踢毽子", "shuttlecock"),
+    ("下五子棋", "gomoku"),
+    ("荡秋千", "swing"),
+    // ---- 吃什么 ----
+    ("吃白饭", "eat_rice"),
+    ("大口吃零食", "eat_snack"),
+    ("吃Token", "eat_token"),
+    ("吃早餐", "eat_breakfast"),
+    ("吃午餐", "eat_lunch"),
+    ("吃晚餐", "eat_dinner"),
+    ("吃冰淇淋融化", "eat_icecream"),
+    ("吃大闸蟹", "eat_crab"),
+    ("吃糖葫芦", "eat_tanghulu"),
+    ("吃长寿面", "eat_noodles"),
+    ("吃西瓜", "eat_watermelon"),
+    ("涮火锅", "hotpot"),
+    // ---- 时节 ----
+    ("被落叶淹没", "leaves"),
+    ("中秋赏月吃月饼", "mooncake"),
+    ("堆雪人", "snowman"),
+    ("放烟花", "fireworks"),
+    ("吃粽子", "eat_zongzi"),
+    ("吃年糕", "eat_niangao"),
+    ("吃青团", "eat_qingtuan"),
+    ("吃腊八粥", "eat_laba"),
+    ("吃重阳糕", "eat_chongyang"),
+    ("收红包", "red_packet"),
+    ("写福字", "fu_character"),
+    ("穿针乞巧", "needle"),
+    ("舞狮头", "lion_dance"),
+    ("讨糖南瓜灯", "halloween"),
+    ("插茱萸赏菊", "chrysanthemum"),
+    ("放河灯", "river_lantern"),
+    ("萌化小幽灵", "ghost"),
+    ("装点圣诞树", "christmas"),
+    ("放孔明灯", "sky_lantern"),
+    ("吃汤圆", "eat_tangyuan"),
+    ("吃饺子", "eat_dumpling"),
+    // ---- 文字 ----
+    ("是啊，吃什么", "what_to_eat"),
+    ("深度思考碎碎念", "deep_think"),
+    // ---- 碎碎念（原 DSH 事件动画，现在只由右键菜单点播）----
+    ("碎碎念-擦桌碎碎念", "whisper_wipe"),
+    ("碎碎念-发呆碎碎念", "whisper_daze"),
+    ("碎碎念-对屏碎碎念", "whisper_screen"),
+    // ---- 工作状态（原 DSH 事件动画，现在只由右键菜单点播）----
+    ("工作状态-思考冒泡", "work_think"),
+    ("工作状态-忙碌点按", "work_busy"),
+    ("工作状态-清点归档", "work_tidy"),
+    ("工作状态-原地踱步张望", "work_pace"),
+    ("工作状态-雀跃庆祝", "work_cheer"),
+    ("工作状态-垂头叹气冒汗", "work_sigh"),
 ];
 
 struct Opts {
@@ -270,6 +375,9 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
     let mut frames: Vec<Vec<u8>> = Vec::new();
     // 从 0 起累加最大值：初始值若给 height，`max` 会永远被压在底边。
     let mut baseline = 0u16;
+    // 每行“最底不透明行”出现在多少帧里。脚底线取它的**众数**：
+    // 烟花火星 / 水花 / 气球只在一小部分帧飘到画面最底，取最大值会把整段抬起来。
+    let mut bottoms = vec![0u32; h + 1];
     let mut bbox = (u32::MAX, u32::MAX, 0u32, 0u32);
     let mut opaque_min = u32::MAX;
     let mut opaque_max = 0u32;
@@ -284,7 +392,9 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
             mask::quantize(&mut buf, opts.quant);
         }
         if let Some(bottom) = mask::last_opaque_row(&alpha, w, h) {
-            baseline = baseline.max(bottom.min(h) as u16);
+            let bottom = bottom.min(h);
+            baseline = baseline.max(bottom as u16);
+            bottoms[bottom] += 1;
         }
         // 统计不透明像素与包围盒：用来发现抠像噪声（真角色不会铺满整帧）。
         let mut opaque = 0u32;
@@ -320,6 +430,18 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
             opts.thresh
         );
     }
+
+    // 脚底线 = 逐帧最底行的众数（票数相同时取更靠下的一行）。
+    // 取最大值做过一版：烟花（火星落到底）、气球、水枪（水花）会把整段抬 20 像素，
+    // 因为最大值只在那几十帧里成立，而角色自己一直站在 330 行（源 360 高）。
+    let ground = bottoms
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .max_by_key(|(row, n)| (**n, *row))
+        .map(|(row, _)| row as u16)
+        .unwrap_or(baseline);
+    let baseline = ground.min(height as u16);
 
     // 裁到全片不透明像素的并集：角色只占 16:9 画面的三成，空白纯属浪费。
     // 裁切信息记在帧头的 origin，渲染端据此还原原画布上的位置，换动画不会跳位。

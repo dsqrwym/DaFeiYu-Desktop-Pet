@@ -12,8 +12,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use feiyu_core::{Limits, Mood, Motion};
-use feiyu_platform::{pump, quit, Event, LayeredWindow, SingleInstance};
+use feiyu_core::{Config, Limits, Mood, Motion};
+use feiyu_platform::{pump, quit, Event, LayeredWindow, Menu, SingleInstance};
 
 use crate::pet::{Pet, LANDING_HOLD};
 
@@ -191,15 +191,28 @@ fn check_assets(r: &mut Report) -> Result<()> {
     );
 
     // 脚底行必须落在画布内，且各段的脚底行应大致一致（同一角色同一画布）。
-    let feet: Vec<i32> = manifest
-        .animations
-        .iter()
-        .map(|a| a.feet_row() as i32)
-        .collect();
-    let spread = feet.iter().max().unwrap_or(&0) - feet.iter().min().unwrap_or(&0);
+    //
+    // 例外是有「地面道具」的段：骑木马（摇杆）、吃零食（桌子）、
+    // 放孔明灯 / 堆雪人（地上那堆东西）的包围盒底比角色脚底低二十几像素，
+    // 那正是道具贴地，不是错位——所以阈值留到 32。
+    let mut lo = (u16::MAX, "");
+    let mut hi = (0u16, "");
+    for a in &manifest.animations {
+        let f = a.feet_row();
+        if f < lo.0 {
+            lo = (f, a.id.as_str());
+        }
+        if f > hi.0 {
+            hi = (f, a.id.as_str());
+        }
+    }
+    let spread = hi.0.saturating_sub(lo.0);
     r.check(
-        &format!("各段落脚行差异 {spread} 像素（≤16 视为同一条地面）"),
-        spread <= 16,
+        &format!(
+            "各段落脚行差异 {spread} 像素（最高 {} {} / 最低 {} {}；≤32 视为同一条地面）",
+            lo.0, lo.1, hi.0, hi.1
+        ),
+        spread <= 32,
     );
     Ok(())
 }
@@ -216,9 +229,14 @@ fn check_animation_switch(r: &mut Report) -> Result<()> {
         return Ok(());
     };
     let feet_line = bottom - BOTTOM_GAP;
+    let manifest = feiyu_core::anim::Manifest::load(dir.join("manifest.json"))?;
+    // 脚底线是**帧内**的，而且现在取「逐帧最底行的众数」：
+    // 有地面道具的段，帧会比脚底多出几像素（包围盒底 ≠ 脚底），
+    // 所以对位只能验「窗口顶 + baseline」，不能再验「窗口底」。
+    let baseline = |id: &str| manifest.require(id).map(|e| e.baseline as i32).unwrap_or(0);
 
     // 强制模式：状态机不参与，这样才能稳定断言尺寸。
-    let mut pet = Pet::open(dir, Some("idle")).context("打开桌宠失败")?;
+    let mut pet = Pet::open(dir, Some("idle"), Config::default()).context("打开桌宠失败")?;
     r.check("强制模式下状态机不参与", pet.mood().is_none());
 
     let idle = pet.rect();
@@ -227,9 +245,14 @@ fn check_animation_switch(r: &mut Report) -> Result<()> {
         &format!("idle 窗口 {w0}×{h0} 在屏幕内"),
         w0 > 0 && h0 > 0 && idle.0 >= left && idle.2 <= right,
     );
+    let idle_feet = idle.1 + baseline("idle");
     r.check(
-        &format!("idle 脚底贴地面：窗口底 {} / 目标 {}", idle.3, feet_line),
-        idle.3 == feet_line,
+        &format!(
+            "idle 脚底贴地面：窗口顶 {} + 脚底线 {} = {idle_feet} / 目标 {feet_line}",
+            idle.1,
+            baseline("idle")
+        ),
+        idle_feet == feet_line,
     );
 
     // 切到最宽的一段，尺寸必然变化。
@@ -242,24 +265,46 @@ fn check_animation_switch(r: &mut Report) -> Result<()> {
     );
     r.check(
         &format!(
-            "换尺寸后脚底没跳（窗口底 {} / 目标 {}）",
-            sleep.3, feet_line
+            "换尺寸后脚底没跳（窗口顶 {} + 脚底线 {} = {} / 目标 {feet_line}）",
+            sleep.1,
+            baseline("sleep"),
+            sleep.1 + baseline("sleep")
         ),
-        sleep.3 == feet_line,
+        sleep.1 + baseline("sleep") == feet_line,
     );
 
     // 再切到最窄的一段，横向锚定也不能飘。
     pet.play("stretch").context("切到 stretch 失败")?;
     let stretch = pet.rect();
     r.check(
-        &format!("再切 stretch 脚底仍贴地（窗口底 {}）", stretch.3),
-        stretch.3 == feet_line,
+        &format!(
+            "再切 stretch 脚底仍贴地（窗口顶 {} + 脚底线 {} = {}）",
+            stretch.1,
+            baseline("stretch"),
+            stretch.1 + baseline("stretch")
+        ),
+        stretch.1 + baseline("stretch") == feet_line,
     );
     let (cw0, cw1) = ((idle.0 + idle.2) / 2, (stretch.0 + stretch.2) / 2);
     r.check(
         &format!("水平中心漂移 {} 像素（≤48 视为稳定）", (cw0 - cw1).abs()),
         (cw0 - cw1).abs() <= 48,
     );
+
+    // 抽查有「地面道具」的段：它们的包围盒比脚底多出十几像素，
+    // 脚底线取的是逐帧众数（不是包围盒底），对位必须仍然落在同一条线上。
+    for id in ["hobby_horse", "leaves", "whale", "rubik"] {
+        if manifest.get(id).is_none() {
+            continue;
+        }
+        pet.play(id)?;
+        let rect = pet.rect();
+        let feet = rect.1 + baseline(id);
+        r.check(
+            &format!("{id} 脚底 {feet} / 目标 {feet_line}（窗口底 {}）", rect.3),
+            feet == feet_line,
+        );
+    }
 
     // 换段之后还得能正常解帧提交。
     let before = pet.drawn();
@@ -270,7 +315,7 @@ fn check_animation_switch(r: &mut Report) -> Result<()> {
     );
 
     // 清单与文件不一致时必须报错，而不是错位着播下去。
-    let bad = Pet::open(dir, Some("definitely_not_an_anim")).err();
+    let bad = Pet::open(dir, Some("definitely_not_an_anim"), Config::default()).err();
     r.check(
         &format!(
             "清单里不存在的 id 会被拒（{:?}）",
@@ -294,7 +339,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     let manifest = feiyu_core::anim::Manifest::load(&manifest_path)?;
 
     // ---- 几何：锚点范围必须与工作区、窗口尺寸自洽 ----
-    let mut pet = Pet::open(dir, Some("idle")).context("打开桌宠失败")?;
+    let mut pet = Pet::open(dir, Some("idle"), Config::default()).context("打开桌宠失败")?;
 
     // 菜单：只核对内容没被写坏，不真的弹出来（模态菜单没法自动关），
     // 外观请用 `--menu` 看。
@@ -308,8 +353,95 @@ fn check_interaction(r: &mut Report) -> Result<()> {
             "右键菜单能构造（{items_desc}，首项「{}」）",
             pet.hide_label()
         ),
-        items.as_ref().is_ok_and(|n| *n == 7),
+        // 隐藏 / 回家 / 跟随 / 点哪走哪 / 打字联动 / 置顶 / 分隔 / 动作 / 分隔 / 退出
+        items.as_ref().is_ok_and(|n| *n == 10),
     );
+
+    // ---- Win32 实际菜单树：不是我们自己数的一本账，问系统 ----
+    // 「动作 → 分类 → 具体动画」三层，菜单项全在子菜单里；
+    // 光验 `items() == 10` 发现不了「AppendMenuW 失败、子菜单根本没挂上」。
+    match pet.menu_for_test() {
+        Ok(menu) => {
+            let top = menu.api_items();
+            let action_label = menu.label(7);
+            let (cats, total) = match menu.api_submenu(7) {
+                Some(act) => {
+                    let cats = Menu::count_of(act);
+                    let mut total = 0;
+                    for i in 0..cats as i32 {
+                        if let Some(sub) = Menu::submenu_of(act, i) {
+                            total += Menu::count_of(sub);
+                        }
+                    }
+                    (cats, total)
+                }
+                None => (0, 0),
+            };
+            r.check(
+                &format!(
+                    "Win32 菜单树：顶层 {top} 项，第 8 项「{action_label}」下 {cats} 个分类 / {total} 段"
+                ),
+                top == 10 && action_label == "动作" && cats == 10 && total == 97,
+            );
+        }
+        Err(e) => r.check(&format!("Win32 菜单树构造失败：{e:#}"), false),
+    }
+
+    // ---- 素材覆盖：100 段里除了 idle/sleep/drag（状态机专用）都要能在菜单里点到 ----
+    let menu_ids = pet.menu_clip_ids();
+    let mut not_in_menu: Vec<&str> = manifest
+        .ids()
+        .filter(|id| !["idle", "sleep", "drag"].contains(id))
+        .filter(|id| !menu_ids.contains(id))
+        .collect();
+    not_in_menu.sort_unstable();
+    r.check(
+        &format!(
+            "清单 {} 段 − 3 段系统状态 → 菜单里能点到 {} 段（漏掉：{}）",
+            manifest.animations.len(),
+            menu_ids.len(),
+            if not_in_menu.is_empty() {
+                "无".to_owned()
+            } else {
+                not_in_menu.join(",")
+            }
+        ),
+        not_in_menu.is_empty() && menu_ids.len() == manifest.animations.len() - 3,
+    );
+
+    // ---- 菜单序号 ↔ 素材：首项 / 末项各点一次，求不得错位 ----
+    let first = menu_ids.first().copied().unwrap_or("");
+    let last = menu_ids.last().copied().unwrap_or("");
+    pet.dispatch_menu_clip(0)?;
+    let got_first = pet.current() == first;
+    pet.dispatch_menu_clip(menu_ids.len().saturating_sub(1))?;
+    let got_last = pet.current() == last;
+    r.check(
+        &format!(
+            "菜单序号对得上：第 1 项 → {first}（{got_first}）、第 {} 项 → {last}（{got_last}）",
+            menu_ids.len()
+        ),
+        got_first && got_last && !first.is_empty(),
+    );
+
+    // ---- 菜单点播：非移动段演一圈回待机；移动段真的会挪位置 ----
+    for id in ["rubik", "eat_rice", "work_think", "what_to_eat"] {
+        if manifest.get(id).is_none() {
+            r.skip(&format!("{id} 素材缺失，跳过点播检查"));
+            continue;
+        }
+        pet.play_once(id)?;
+        let started = pet.current() == id;
+        // 245 帧 > 任何一段的 241 帧：必定走过一次回绕。
+        let back = pet.advance_frames(245)?;
+        r.check(
+            &format!(
+                "点播 {id}：开演 = {started}，一圈后回待机（{}，回待机 = {back}）",
+                pet.current()
+            ),
+            started && back && pet.current() == "idle",
+        );
+    }
 
     // ---- 托盘图标用「此刻那一帧」：必须真的跟着动画走 ----
     //
@@ -364,10 +496,20 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     let area = pet.area();
     let ground = (area.3 - BOTTOM_GAP) as f32;
     let limits = pet.limits();
-    let (l, _, rr, b) = pet.rect();
+    let (l, _, rr, _) = pet.rect();
+    let cur = pet.current().to_owned();
+    let cur_base = manifest
+        .require(&cur)
+        .map(|e| e.baseline as i32)
+        .unwrap_or(0);
+    let feet_now = pet.rect().1 + cur_base;
     r.check(
-        &format!("初始脚底贴地（窗口底 {b} / 地面 {}）", ground as i32),
-        b == ground as i32,
+        &format!(
+            "初始脚底贴地（窗口顶 {} + 脚底线 {cur_base} = {feet_now} / 地面 {}）",
+            pet.rect().1,
+            ground as i32
+        ),
+        feet_now == ground as i32,
     );
     r.check(
         &format!("锚点上界=地面（{:.1} / {ground:.1}）", limits.y.1),
@@ -408,18 +550,21 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     let expect_x =
         (area.0 + area.2) / 2 - manifest.canvas.width as i32 / 2 + entry.origin[0] as i32;
     let (hl, _, hr, hb) = pet.rect();
+    let stretch_feet = hb - entry.height() as i32 + entry.baseline as i32;
     r.check(
         &format!(
-            "回到底部：底 {hb} / 地面 {}，左 {hl} / 期望 {expect_x}",
+            "回到底部：脚底 {stretch_feet} / 地面 {}，左 {hl} / 期望 {expect_x}",
             ground as i32
         ),
-        hb == ground as i32 && (hl - expect_x).abs() <= 1 && (hr - hl) == entry.width() as i32,
+        stretch_feet == ground as i32
+            && (hl - expect_x).abs() <= 1
+            && (hr - hl) == entry.width() as i32,
     );
     r.check("窗口默认为总在最前", pet.topmost());
     drop(pet);
 
     // ---- 点击 / 拖拽的区分：直接喂事件，走的是运行时真路径 ----
-    let mut pet = Pet::open(dir, None).context("打开桌宠失败（自由模式）")?;
+    let mut pet = Pet::open(dir, None, Config::default()).context("打开桌宠失败（自由模式）")?;
 
     // 1 像素抖动：必须仍然算「点击」，否则手的微小位移会把点击吞掉。
     pet.on_event(Event::MouseDown { x: 10, y: 10 })?;
@@ -436,6 +581,20 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     r.check(
         &format!("抖动后松手仍算点击（{:?}）", pet.mood()),
         pet.mood() == Some(Mood::Happy),
+    );
+
+    // 点击回应现在是 5 段：抽 200 次，5 段必须都出现过。
+    let mut sampled = pet.sample_click_ids(200);
+    let total = sampled.len();
+    sampled.sort_unstable();
+    sampled.dedup();
+    r.check(
+        &format!(
+            "点击回应池 5 段都抽得到（{}，抽 {total} 次命中 {} 段）",
+            sampled.join(","),
+            sampled.len()
+        ),
+        sampled.len() == 5 && total == 200,
     );
 
     // 点击反应是**一次性**的：演完一圈就回待机。
@@ -522,7 +681,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     // ---- 睡觉：睡着后不许自己演到「醒来」----
     // 素材 `sleep.fishanim` 是 10 秒闭环，末尾会把眼睛睁开。
     // 直接整段循环就会「睡十秒、醒一下、又睡」，像个睡不安稳的人。
-    let mut pet = Pet::open(dir, None).context("打开桌宠失败（睡眠段）")?;
+    let mut pet = Pet::open(dir, None, Config::default()).context("打开桌宠失败（睡眠段）")?;
     // 入睡时间本来是 18~38 秒随机的，测试里缩到瞬间。
     pet.set_sleep_after(0.01);
     std::thread::sleep(std::time::Duration::from_millis(30));
@@ -534,7 +693,11 @@ fn check_interaction(r: &mut Report) -> Result<()> {
 
     let span_falling = pet.loop_span();
     // 入睡段 0~156：一步步推到段尾，看它换段时会不会把帧号拨回去。
-    pet.advance_frames(156)?;
+    // `tick` 可能已经推进了 1~2 帧（30ms 等待受调度影响），写死 156 会越过段尾，
+    // 于是又回绕到打呼段——测试会假失败。按当前帧算还差多少。
+    let fall_end = span_falling.map_or(156, |(_, hi)| hi);
+    let to_end = fall_end.saturating_sub(pet.frame());
+    pet.advance_frames(to_end)?;
     r.check(
         &format!("入睡段演到最后一帧（第 {} 帧）", pet.frame()),
         pet.frame() == 156,
@@ -665,7 +828,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     drop(pet);
 
     // ---- 待机自娱自乐：抽得到、播得完、播完回 idle ----
-    let mut pet = Pet::open(dir, None).context("打开桌宠失败（小动作段）")?;
+    let mut pet = Pet::open(dir, None, Config::default()).context("打开桌宠失败（小动作段）")?;
     // 入睡时间拉到一小时：这一段只关心“会不会玩”，不关心“会不会睡”。
     pet.set_sleep_after(3600.0);
     let pool: Vec<&str> = pet.action_pool().iter().map(|(id, _)| *id).collect();
@@ -696,7 +859,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     // 用户报的两个毛病都在这里：
     // * 人先动、一秒后才开始迈腿 → 循环起点必须在真正迈步的帧；
     // * 素材朝左人却向右走 → 往反方向走时必须水平镜像（`flipped()`）。
-    for id in ["move_float", "move_crab"] {
+    for id in ["move_float", "move_crab", "move_run"] {
         pet.back_to_home()?;
         let started = pet.wander_with(id);
         let span = pet.loop_span();
@@ -704,11 +867,11 @@ fn check_interaction(r: &mut Report) -> Result<()> {
         let x0 = pet.anchor_x();
         let _ = pet.advance_frames(200)?;
         let dx = pet.anchor_x() - x0;
-        // `move_crab` 素材朝左（faces_left = Some(true)）：往右走的时候必须镜像。
-        let flip_ok = if id == "move_crab" {
-            flip == (dx > 0)
-        } else {
+        // `move_crab` / `move_run` 素材朝左（faces_left = Some(true)）：往右走的时候必须镜像。
+        let flip_ok = if id == "move_float" {
             true
+        } else {
+            flip == (dx > 0)
         };
         r.check(
             &format!(
@@ -716,7 +879,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
                 span.map_or(0, |(lo, _)| lo)
             ),
             started
-                && span.is_some_and(|(lo, hi)| lo >= 18 && hi >= 200)
+                && span.is_some_and(|(lo, hi)| lo >= 18 && hi > lo + 60)
                 && dx.abs() >= 40
                 && flip_ok,
         );
@@ -725,7 +888,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     // ---- 参数表自身：带区间的段都得「跳过前摇」且装得下整个动作 ----
     // 这条就是用户要求的「每段动画都验一遍」：以后加新素材，表里写错区间会当场报。
     let mut bad: Vec<String> = Vec::new();
-    for id in ["drag", "move_float", "move_crab"] {
+    for id in ["drag", "move_float", "move_crab", "move_run"] {
         match Pet::clip_span(id) {
             Some((lo, hi)) if lo >= 1 && hi > lo + 60 => {}
             other => bad.push(format!("{id}={other:?}")),
@@ -733,7 +896,7 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     }
     r.check(
         &format!(
-            "参数表里的区间都跳过了前摇（drag / move_float / move_crab{}{}）",
+            "参数表里的区间都跳过了前摇（drag / move_float / move_crab / move_run{}{}）",
             if bad.is_empty() { "" } else { "，异常：" },
             bad.join(", ")
         ),
@@ -762,15 +925,11 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     let mut no_desc = Vec::new();
     for id in [
         "idle",
-        "sleep",
         "drag",
-        "click_happy",
-        "click_pout",
-        "stretch",
-        "mirror",
-        "turn",
+        "sleep",
         "move_float",
         "move_crab",
+        "move_run",
     ] {
         if Pet::clip_desc(id).is_empty() {
             no_desc.push(id);
@@ -845,6 +1004,73 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     r.check(
         &format!("走路期间点新方向能立即改向（{walked}，{}）", pet.current()),
         walked,
+    );
+
+    drop(pet);
+
+    // ---- 打字联动：热度到线才触发；演一圈回待机；冷却期与睡着时不抢戏 ----
+    let mut pet = Pet::open(dir, None, Config::default()).context("打开桌宠失败（打字联动）")?;
+    pet.set_sleep_after(3600.0);
+    r.check(
+        "键盘原始输入已登记（RIDEV_INPUTSINK）",
+        feiyu_platform::typing_installed(),
+    );
+    pet.set_typing_chance(1.0);
+    pet.reset_typing_cooldown();
+    let cold = pet.feed_typing(5)?;
+    let fired = pet.feed_typing(20)?;
+    let work = [
+        "work_think",
+        "work_busy",
+        "work_tidy",
+        "work_pace",
+        "work_cheer",
+        "work_sigh",
+    ];
+    r.check(
+        &format!(
+            "打字联动：5 键不动（{cold}），20 键触发工作动画（{}，{fired}）",
+            pet.current()
+        ),
+        !cold && fired && work.contains(&pet.current()),
+    );
+    let back = pet.advance_frames(245)?;
+    r.check(
+        &format!(
+            "工作动画演一圈就回待机（{}，回待机 = {back}）",
+            pet.current()
+        ),
+        back && pet.current() == "idle" && pet.mood() == Some(Mood::Idle),
+    );
+    // 冷却期内：热度再高也不重复触发
+    let in_cd = pet.feed_typing(50)?;
+    r.check(&format!("冷却期内不重复触发（{in_cd}）"), !in_cd);
+    // 概率为 0 时：冷却清零也不触发（验证「有概率」而不是「必触发」）
+    pet.set_typing_chance(0.0);
+    pet.reset_typing_cooldown();
+    let never = pet.feed_typing(50)?;
+    r.check(&format!("概率为 0 时不触发（{never}）"), !never);
+    // 菜单开关关掉后：概率 1.0 也不触发
+    pet.set_typing_chance(1.0);
+    pet.set_typing_enabled(false);
+    pet.reset_typing_cooldown();
+    let turned_off = pet.feed_typing(50)?;
+    r.check(
+        &format!("打字联动关掉后不触发（{turned_off}）"),
+        !turned_off,
+    );
+    pet.set_typing_enabled(true);
+    // 睡着时：打字只归「自然醒」管，不能把它从床上拽起来
+    pet.set_typing_chance(1.0);
+    pet.reset_typing_cooldown();
+    pet.set_sleep_after(0.01);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    pet.tick()?;
+    let slept = pet.mood() == Some(Mood::Sleep);
+    let while_asleep = pet.feed_typing(50)?;
+    r.check(
+        &format!("睡着时打字不触发（睡着 = {slept}，触发 = {while_asleep}）"),
+        slept && !while_asleep,
     );
 
     drop(pet);

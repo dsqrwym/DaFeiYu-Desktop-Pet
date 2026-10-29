@@ -231,7 +231,6 @@ mod tests {
             );
         }
         // 非法值不许把播放位置带到奇怪的地方。
-        let mut c = c;
         c.start_waking(f32::NAN);
         assert_eq!(span_to_frames(c.span(), count), (170, 240));
     }
