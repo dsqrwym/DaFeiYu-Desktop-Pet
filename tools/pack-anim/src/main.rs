@@ -161,7 +161,8 @@ struct Opts {
     /// 裁到全片不透明像素的并集包围盒（默认开）。
     crop: bool,
     thresh: u8,
-    feather: u8,
+    /// 边缘过渡带宽度（像素）：核心外的这几圈按「最近核心色」反推 alpha。
+    rim: u8,
     /// 丢掉色彩通道的低 n 位（0 = 不量化）。噪点大多是低位的抖动，砍掉不影响观感但能显著降低熵。
     quant: u8,
     ffmpeg: String,
@@ -208,7 +209,7 @@ impl Default for Opts {
             dump: 0,
             crop: true,
             thresh: 12,
-            feather: 0,
+            rim: 2,
             quant: 3,
             ffmpeg: "ffmpeg".to_string(),
             ffprobe: "ffprobe".to_string(),
@@ -265,7 +266,7 @@ fn run() -> Result<()> {
     }
 
     println!(
-        "打包 {} 段素材 → {}（高 {}px / {}fps / codec {} / h264 CRF {} / zstd {} / 差分 {} / 量化 {} 位 / 阈值 {} / 羽化 {} / 裁切 {}）\n",
+        "打包 {} 段素材 → {}（高 {}px / {}fps / codec {} / h264 CRF {} / zstd {} / 差分 {} / 量化 {} 位 / 阈值 {} / 过渡带 {}px / 裁切 {}）\n",
         jobs.len(),
         opts.out.display(),
         opts.height,
@@ -276,7 +277,7 @@ fn run() -> Result<()> {
         opts.delta,
         opts.quant,
         opts.thresh,
-        opts.feather,
+        opts.rim,
         if opts.crop { "开" } else { "关" }
     );
 
@@ -310,7 +311,7 @@ fn parse_args() -> Result<Opts> {
             "--dump" => opts.dump = value()?.parse().context("--dump 需要正整数")?,
             "--no-crop" => opts.crop = false,
             "--thresh" => opts.thresh = value()?.parse().context("--thresh 需要 0~255")?,
-            "--feather" => opts.feather = value()?.parse().context("--feather 需要 0~255")?,
+            "--rim" => opts.rim = value()?.parse().context("--rim 需要 0~255")?,
             "--quant" => opts.quant = value()?.parse().context("--quant 需要 0~7")?,
             "--ffmpeg" => opts.ffmpeg = value()?,
             "--ffprobe" => opts.ffprobe = value()?,
@@ -350,7 +351,7 @@ fn print_help() {
          \x20 --dump <n>         每隔 n 帧导出一张 PNG 抽检（默认 0 = 不导出）\n\
          \x20 --no-crop          不裁切（保留原画布，用于对比体积）\n\
          \x20 --thresh <0-255>   黑底亮度阈值（默认 12）\n\
-         \x20 --feather <0-255>  边缘羽化带宽度，0 = 硬边（默认 0）\n\
+         \x20 --rim <0-255>      边缘过渡带宽度，0 = 硬边（默认 2）\n\
          \x20 --quant <0-7>      砍掉色彩通道低 n 位（0 = 不量化，默认 3）\n\
          \x20 --ffmpeg/--ffprobe 可执行文件路径\n\
          \x20 --limit <n>        只处理前 n 个（调试用）\n\
@@ -413,6 +414,9 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
     let h = height as usize;
     let mut buf = Vec::new();
     let mut frames: Vec<Vec<u8>> = Vec::new();
+    // alpha 单独留一份：`.fishanim` 还会把 alpha 写进帧里，而 H.264 的颜色帧
+    // 是直通色（alpha 位不用），掩码只能从这份 alpha 建。
+    let mut alphas: Vec<Vec<u8>> = Vec::new();
     // 从 0 起累加最大值：初始值若给 height，`max` 会永远被压在底边。
     let mut baseline = 0u16;
     // 每行“最底不透明行”出现在多少帧里。脚底线取它的**众数**：
@@ -423,13 +427,29 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
     let mut opaque_max = 0u32;
     let mut idx = 0u32;
 
+    let mix_params = mask::Params {
+        thresh: opts.thresh,
+        rim: opts.rim,
+        ..mask::Params::default()
+    };
+
     while source.next_frame(&mut buf)? {
-        let alpha = mask::build_alpha(&buf, w, h, opts.thresh, opts.feather);
-        for (i, a) in alpha.iter().enumerate() {
-            buf[i * 4 + 3] = *a;
-        }
+        let ex = mask::extract(&buf, w, h, &mix_params);
+        let alpha = ex.alpha;
+        // `.fishanim` 存**预乘**色（原值 + alpha）。H.264 只有颜色通道，
+        // 必须存**直通**色：1-bit 掩码配上预乘色就是一圈黑边。
+        let mut frame = match opts.codec {
+            PackCodec::FishAnim => {
+                let mut f = buf.clone();
+                for (i, a) in alpha.iter().enumerate() {
+                    f[i * 4 + 3] = *a;
+                }
+                f
+            }
+            PackCodec::H264 => ex.straight,
+        };
         if opts.quant > 0 {
-            mask::quantize(&mut buf, opts.quant);
+            mask::quantize(&mut frame, opts.quant);
         }
         if let Some(bottom) = mask::last_opaque_row(&alpha, w, h) {
             let bottom = bottom.min(h);
@@ -454,10 +474,23 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
         opaque_max = opaque_max.max(opaque);
 
         if opts.dump > 0 && idx % opts.dump == 0 {
-            dump_png(&opts.out, slug, idx, width, height, &buf)?;
+            let mut preview = frame.clone();
+            for (i, a) in alpha.iter().enumerate() {
+                let o = i * 4;
+                if opts.codec == PackCodec::H264 {
+                    // 抽检图按预乘压平：直通色得先乘回 alpha，否则看着偏亮。
+                    let k = *a as u32;
+                    for c in 0..3 {
+                        preview[o + c] = ((preview[o + c] as u32 * k + 127) / 255) as u8;
+                    }
+                }
+                preview[o + 3] = *a;
+            }
+            dump_png(&opts.out, slug, idx, width, height, &preview)?;
         }
         idx += 1;
-        frames.push(buf.clone());
+        alphas.push(alpha);
+        frames.push(frame);
     }
 
     if frames.is_empty() {
@@ -494,6 +527,9 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
         for f in frames.iter_mut() {
             *f = crop(f, w, x0, y0, cw, ch);
         }
+        for a in alphas.iter_mut() {
+            *a = crop_alpha(a, w, x0, y0, cw, ch);
+        }
         (x0 as u32, y0 as u32, cw as u32, ch as u32)
     } else {
         (0, 0, width, height)
@@ -519,7 +555,7 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
             format::write(&mut out, &packed)?;
             fs::metadata(&path)?.len()
         }
-        PackCodec::H264 => pack_h264(opts, slug, &frames, frame_w, frame_h)?,
+        PackCodec::H264 => pack_h264(opts, slug, &frames, &alphas, frame_w, frame_h)?,
     };
 
     Ok(Row {
@@ -540,19 +576,31 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
 }
 
 /// H.264 颜色 + 1-bit 掩码：颜色走 ffmpeg/libx264，掩码由 core 的 MaskSet 写成。
-fn pack_h264(opts: &Opts, slug: &str, frames: &[Vec<u8>], w: u32, h: u32) -> Result<u64> {
+///
+/// `frames` 必须是**直通色**：H.264 不携带 alpha，播放端按掩码给 1/0，
+/// 颜色若还是预乘值，半透明的边就会发黑。
+fn pack_h264(
+    opts: &Opts,
+    slug: &str,
+    frames: &[Vec<u8>],
+    alphas: &[Vec<u8>],
+    w: u32,
+    h: u32,
+) -> Result<u64> {
     ensure!(
         w <= u16::MAX as u32 && h <= u16::MAX as u32,
         "帧尺寸超出 u16：{w}×{h}"
     );
+    ensure!(
+        frames.len() == alphas.len(),
+        "帧数与 alpha 数不一致：{} / {}",
+        frames.len(),
+        alphas.len()
+    );
     let video_path = opts.out.join(format!("{slug}.fishvid"));
     let mask_path = opts.out.join(format!("{slug}.fishmask"));
 
-    let alpha_frames: Vec<Vec<u8>> = frames
-        .iter()
-        .map(|f| f.chunks_exact(4).map(|p| p[3]).collect())
-        .collect();
-    let masks = MaskSet::from_alpha_frames(w as u16, h as u16, &alpha_frames)?;
+    let masks = MaskSet::from_alpha_frames(w as u16, h as u16, alphas)?;
     masks.save(&mask_path)?;
 
     let raw_path =
@@ -630,6 +678,16 @@ fn crop(frame: &[u8], canvas_w: usize, x0: usize, y0: usize, w: usize, h: usize)
     for y in y0..y0 + h {
         let start = (y * canvas_w + x0) * 4;
         out.extend_from_slice(&frame[start..start + w * 4]);
+    }
+    out
+}
+
+/// 裁 alpha 平面（与 [`crop`] 同一套坐标）。
+fn crop_alpha(alpha: &[u8], canvas_w: usize, x0: usize, y0: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w * h);
+    for y in y0..y0 + h {
+        let start = y * canvas_w + x0;
+        out.extend_from_slice(&alpha[start..start + w]);
     }
     out
 }

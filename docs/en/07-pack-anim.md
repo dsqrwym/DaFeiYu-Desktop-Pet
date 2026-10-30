@@ -36,7 +36,7 @@ The source is 640×360. The packer renders at height 306 and computes width prop
 
 `decode::FrameSource` spawns ffmpeg and reads raw frames from a pipe. No video library is linked into the packer.
 
-## 3. Keying: `mask::build_alpha`
+## 3. Keying: `mask::extract`
 
 ### Why not a global threshold
 
@@ -44,9 +44,19 @@ A global luminance threshold removes dark parts of the character (hair, eyes, cl
 
 ### Border flood fill
 
-The correct approach starts from the image border and floods through dark pixels. Only background connected to the border is made transparent. Interior dark pixels remain opaque. This is implemented in `mask::build_alpha`.
+The correct approach starts from the image border and floods through dark pixels. Only background connected to the border is made transparent. Interior dark pixels remain opaque.
 
-Alpha is 0 for background and 255 for the character; an optional feather band can soften the boundary. H.264 production uses a hard 1-bit mask, so the mask file stores `alpha >= 128`.
+The source is a black-composited video with no alpha, so `C = F × a`: colors are already premultiplied. A binary 0/255 alpha is not enough. Anti-aliased edges and translucent effects (bubbles, smoke, sparks) all carry `a < 1`, and promoting them to 255 gives a dark rim around the sprite and solid black blobs where the effect should be soft. Both show up in either codec, so it is not a decoder problem.
+
+`mask::extract` now works in three steps:
+
+1. background 0, everything else 255; small connected components (bubbles, sparks) between `effect_min` and `main × effect_rel` are normalized by their own 90th-percentile luminance, so they read as translucent instead of black discs;
+2. a `--rim`-wide band (default 2) around the silhouette takes the **brightest inward neighbour** as `F` and solves `a = lum(C) / lum(F)`. Using the nearest inward colour instead of a component-wide core keeps one- or two-pixel features (braids, grass blades, dark outlines) from fading out;
+3. the background colour is dilated by one pixel from the sprite, because H.264 subsamples chroma 2×2 and a black background would bleed a dark halo into the edge.
+
+`extract` also returns straight color (`F = C × 255 / a`). `.fishanim` keeps the premultiplied pixels; the H.264 color plane must be straight, because a 1-bit mask drawn over premultiplied color is exactly the black rim.
+
+Known limitation: a large translucent effect that is attached to the sprite (fireworks smoke) cannot be separated from art that is simply painted dark. It still reads as a dark patch. No automatic fix exists for a black matte.
 
 ## 4. Quantization: `mask::quantize`
 
@@ -105,7 +115,7 @@ For each clip:
 
 The encoder writes `-framerate <fps> -r <fps>` explicitly. Without it, ffmpeg defaults rawvideo to 25fps while the manifest says 24fps, and seeking to the last frame hits EOS too early. This bug was found during the prototype.
 
-Color dimensions are padded to even width/height; the decoder crops back to the manifest size. CRF20 produces about 69.5MB of assets for 100 clips, or about 71.1MB in the packaged release.
+Color dimensions are padded to even width/height; the decoder crops back to the manifest size. CRF20 produces about 79.2MB of assets for 100 clips (69.5MB before straight color and edge dilation), or about 81MB in the packaged release.
 
 ## 7. Chinese name → file name
 
