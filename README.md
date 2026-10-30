@@ -49,10 +49,14 @@ GitHub 仓库只提交源码和文档。动画素材、打包产物、上游 clo
 
 ## 直接运行（下载 Release）
 
-不需要 Rust。下载 **v0.1.0 H.264 包**：
+不需要 Rust。下载 **v0.1.0 发布包（H.264 / legacy）**：
 
 - [feiyu-h264-v0.1.0.zip](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/download/v0.1.0/feiyu-h264-v0.1.0.zip)（70.19MB）
+- [feiyu-fishanim-v0.1.0.zip](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/download/v0.1.0/feiyu-fishanim-v0.1.0.zip)（582.50MB，legacy）
 - [Release 页面](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/tag/v0.1.0)
+
+两个包都在同一个 `v0.1.0` Release 里。默认选 H.264；只有明确在意运行内存或系统没有
+Media Foundation H.264 解码器时，才选 legacy `.fishanim`。
 
 解压后进入 `feiyu/`：
 
@@ -87,6 +91,30 @@ SHA256（GitHub Release 附件 digest 与本地构建一致）：
 ```text
 2BEDDA4CAF4111C101796693986346F1AD96417AC72D91980902EE0E4D18CD20
 ```
+
+legacy `.fishanim` 包的 SHA256：
+
+```text
+2489EFE73561072B332E8238D4737E40FC67CC6A1D72B037C3E2BF8ADF78D368
+```
+
+### 两个包怎么选
+
+| | H.264（推荐） | `.fishanim` legacy |
+|---|---:|---:|
+| zip / 解压后 | **70.19MB / 71.1MB** | **582.50MB / 583.2MB** |
+| 可见 RSS | 55.0MB | **10.5MB** |
+| 可见私有内存 | 39.8MB | **2.4MB** |
+| 线程 | 40 | **4** |
+| 可见 CPU | 7.9% 单核 | **0.3%~2.8% 单核** |
+| 解码依赖 | Windows Media Foundation H.264 | **无视频解码器** |
+| 随机访问 | Media Foundation seek | **差分链直接重算** |
+| 画面 | H.264 yuv420p + 1-bit alpha | **预乘 BGRA + zstd，alpha 完整** |
+| 适合 | 普通用户、优先省磁盘 | 内存敏感、老系统、优先低底噪 |
+
+两包都是 100 段动画，`--selftest` 都是 **94/94**。H.264 省约 8 倍磁盘，但 Media Foundation
+解码器会拉起线程池和内部缓冲，所以内存/线程/CPU 明显更高；这不是泄漏，隐藏后 CPU 为 0。
+如果你更在意运行资源，而不是 Release 体积，选 `.fishanim`。
 
 ## 想改参数
 
