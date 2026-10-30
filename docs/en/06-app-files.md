@@ -128,6 +128,13 @@ Seam dissolve does not freeze the frame index. It blends the previous frame with
 
 The menu is data-driven from `CATEGORIES` and `CLIPS`. Each menu command maps to a stable clip id; command ids are offset by a fixed base, so adding a menu item must not renumber existing entries.
 
+Menu text does not live in `menu.rs`. `core/i18n.rs` holds two tables: menu commands and `slug → English/Spanish` names; Chinese comes straight from the manifest, so nothing is maintained twice.
+
+- the language is resolved in `Pet::open`: `zh` / `en` / `es` from the config, otherwise `auto` follows the system UI language (`GetUserDefaultUILanguage`, unknown languages fall back to English);
+- the Language submenu lists each language by its native name and writes `language` back to `config.json`;
+- the four checkboxes (follow, click to walk, typing companion, always on top) are persisted too. `Config::save_toggles` only overwrites those keys, so any other field a user hand-edited stays intact;
+- a new clip must also be added to `i18n::CLIPS`, or English/Spanish menus fall back to the Chinese name. The self-test names the missing clip via `missing_translation`.
+
 `after_switch` applies per-clip entry rules: sleep starts a `SleepCycle`, idle reschedules sleep, drag skips the standing intro. These rules live in `clips.rs`, not in hard-coded id checks.
 
 ## 10. Typing integration

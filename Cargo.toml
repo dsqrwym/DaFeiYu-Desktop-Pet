@@ -18,6 +18,7 @@ serde_json = "1"
 # Win32 绑定。feature 只开实用到的模块，能少链接一大截。
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Media_MediaFoundation",
     "Win32_Security",

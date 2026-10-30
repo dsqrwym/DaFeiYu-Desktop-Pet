@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use feiyu_core::brain::{Mood, Stimulus};
+use feiyu_core::i18n::{self, Lang};
 use feiyu_platform::{CommandId, Menu};
 
 use super::{clip, Pet, CATEGORIES};
@@ -17,6 +18,10 @@ const CMD_FOLLOW: CommandId = 5;
 const CMD_CLICK_WALK: CommandId = 6;
 /// 「打字联动」开关（敲键盘时陪一段工作状态动画）。
 const CMD_TYPING: CommandId = 7;
+/// 「语言」子菜单里的三项。
+const CMD_LANG_ZH: CommandId = 8;
+const CMD_LANG_EN: CommandId = 9;
+const CMD_LANG_ES: CommandId = 10;
 
 /// 「动作」子菜单里每一段的命令 id 都从这个基址往后排。
 ///
@@ -42,6 +47,8 @@ pub enum Action {
     ClickWalk(bool),
     /// 「打字联动」切换后的新状态。
     Typing(bool),
+    /// 界面语言切成了这一种。
+    Language(Lang),
     /// 从菜单点播了一段动画。
     Played,
     /// 隐藏状态切换后的新状态（`true` = 已藏进托盘）。
@@ -75,26 +82,28 @@ impl Pet {
 
     /// 菜单首项文案：藏着时是「唤出」，显示着时是「隐藏」。
     pub fn hide_label(&self) -> &'static str {
+        let t = self.texts();
         if self.hidden {
-            "唤出桌宠"
+            t.show
         } else {
-            "隐藏到托盘"
+            t.hide
         }
     }
 
     fn build_menu(&self) -> Result<Menu> {
+        let t = self.texts();
         let topmost = self.win.is_topmost();
         let mut menu = Menu::new()?;
         menu.command(CMD_HIDE, self.hide_label())
-            .command(CMD_HOME, "回到屏幕底部")
-            .check(CMD_FOLLOW, "跟随鼠标", self.follow)
-            .check(CMD_CLICK_WALK, "点哪走哪", self.click_walk)
-            .check(CMD_TYPING, "打字联动", self.typing_enabled)
-            .check(CMD_TOPMOST, "总在最前", topmost)
+            .command(CMD_HOME, t.home)
+            .check(CMD_FOLLOW, t.follow, self.follow)
+            .check(CMD_CLICK_WALK, t.click_walk, self.click_walk)
+            .check(CMD_TYPING, t.typing, self.typing_enabled)
+            .check(CMD_TOPMOST, t.topmost, topmost)
             .separator();
         // 「动作 → 分类 → 具体动画」：全部可播的 97 段都从这里点播，
         // 缺素材的分类/单段自动不列（菜单是数据驱动的，索引与 `menu_clips` 同源）。
-        menu.submenu("动作", |m| {
+        menu.submenu(t.actions, |m| {
             let mut idx = 0usize;
             for cat in CATEGORIES {
                 let clips: Vec<&'static str> = cat
@@ -106,21 +115,37 @@ impl Pet {
                 if clips.is_empty() {
                     continue;
                 }
-                let _ = m.submenu(cat.label, |sub| {
+                let label = i18n::category(cat.label, self.lang);
+                let label = if label.is_empty() { cat.label } else { label };
+                let _ = m.submenu(label, |sub| {
                     for id in &clips {
-                        let label = self
-                            .manifest
-                            .get(id)
-                            .map(|a| a.name.clone())
-                            .unwrap_or_else(|| (*id).to_owned());
+                        let label = self.display_name(id);
                         sub.command(CMD_CLIP_BASE + idx as CommandId, &label);
                         idx += 1;
                     }
                 });
             }
         })?;
-        menu.separator().command(CMD_QUIT, "退出");
+        // 语言子菜单：每一项用**本名**，不随当前语言变。
+        menu.submenu(t.language, |m| {
+            for (lang, cmd) in [
+                (Lang::Zh, CMD_LANG_ZH),
+                (Lang::En, CMD_LANG_EN),
+                (Lang::Es, CMD_LANG_ES),
+            ] {
+                m.check(cmd, lang.native_name(), self.lang == lang);
+            }
+        })?;
+        menu.separator().command(CMD_QUIT, t.quit);
         Ok(menu)
+    }
+
+    /// 菜单里显示的段名：非中文优先用内置译名，没登记就回退清单里的中文名。
+    fn display_name(&self, id: &str) -> String {
+        i18n::clip(id, self.lang)
+            .map(str::to_owned)
+            .or_else(|| self.manifest.get(id).map(|a| a.name.clone()))
+            .unwrap_or_else(|| id.to_owned())
     }
 
     /// 菜单里可点播的段（顺序 = 菜单顺序 = 命令 id 顺序）。
@@ -186,6 +211,17 @@ impl Pet {
         Ok(())
     }
 
+    /// 自检用：走和菜单一样的派发路径切语言。
+    pub(crate) fn switch_language(&mut self, lang: Lang) -> Result<()> {
+        let cmd = match lang {
+            Lang::Zh => CMD_LANG_ZH,
+            Lang::En => CMD_LANG_EN,
+            Lang::Es => CMD_LANG_ES,
+        };
+        self.dispatch(cmd)?;
+        Ok(())
+    }
+
     fn dispatch(&mut self, cmd: CommandId) -> Result<Action> {
         match cmd {
             CMD_HIDE => {
@@ -204,16 +240,22 @@ impl Pet {
             CMD_FOLLOW => {
                 let next = !self.follow;
                 self.follow = next;
+                self.cfg.follow = next;
+                self.persist_toggles();
                 Ok(Action::Follow(next))
             }
             CMD_CLICK_WALK => {
                 let next = !self.click_walk;
                 self.click_walk = next;
+                self.cfg.click_walk = next;
+                self.persist_toggles();
                 Ok(Action::ClickWalk(next))
             }
             CMD_TYPING => {
                 let next = !self.typing_enabled;
                 self.typing_enabled = next;
+                self.cfg.typing.enabled = next;
+                self.persist_toggles();
                 Ok(Action::Typing(next))
             }
             CMD_TOPMOST => {
@@ -221,7 +263,20 @@ impl Pet {
                 // 中间可能已经改过了。
                 let next = !self.win.is_topmost();
                 self.win.set_topmost(next);
+                self.cfg.topmost = next;
+                self.persist_toggles();
                 Ok(Action::Topmost(next))
+            }
+            CMD_LANG_ZH | CMD_LANG_EN | CMD_LANG_ES => {
+                let lang = match cmd {
+                    CMD_LANG_EN => Lang::En,
+                    CMD_LANG_ES => Lang::Es,
+                    _ => Lang::Zh,
+                };
+                self.lang = lang;
+                self.cfg.language = Some(lang);
+                self.persist_toggles();
+                Ok(Action::Language(lang))
             }
             CMD_QUIT => Ok(Action::Quit),
             other if other >= CMD_CLIP_BASE => {
@@ -230,7 +285,7 @@ impl Pet {
                     eprintln!("菜单命令 {other} 没有对应的动画（菜单与素材不同步），已忽略");
                     return Ok(Action::None);
                 };
-                let name = self.name_of(id).unwrap_or(id).to_owned();
+                let name = self.display_name(id);
                 println!("点播：{name}（{id}）");
                 self.play_once(id)?;
                 Ok(Action::Played)

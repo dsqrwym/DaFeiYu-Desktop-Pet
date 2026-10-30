@@ -120,13 +120,17 @@ Both packages contain 100 animations and pass `--selftest` at **94/94**. H.264 r
 
 `feiyu/config.json` is the file users edit; no recompilation is needed. If it is missing, built-in defaults are used. A malformed file produces a warning and falls back to defaults instead of preventing startup.
 
+- `language`: `auto` (follow the system UI language), or `zh` / `en` / `es`. The menu's Language submenu writes this.
+- `follow`, `click_walk`, `topmost`: the matching menu checkboxes; toggling them in the menu saves the value here.
 - `action_gap`: delay between idle actions, in seconds, randomly chosen from a range
 - `sleep_after`: idle time before sleeping, in seconds
 - `typing`: typing-link toggle, trigger probability, heat threshold, decay, and cooldown
 - `walk`: how far the pet walks in pixels
 - `category_weights`: random-pool weight per category; `0` keeps a category in the menu but removes it from random playback
 
-Category weights apply to the whole category and are then split across its clips. A larger number only changes the relative probability. Restart `feiyu.exe` after editing. `--config other.json` can point at a temporary file.
+Category weights apply to the whole category and are then split across its clips. A larger number only changes the relative probability. Restart `feiyu.exe` after editing by hand. `--config other.json` can point at a temporary file.
+
+The menu writes back only what it can change (`language`, `follow`, `click_walk`, `topmost`, `typing.enabled`); any other field you edited by hand is left alone. The right-click menu is available in Chinese, English, and Spanish; clip names come from a built-in translation table, so the shipped asset packages do not need to be re-packed.
 
 ## Build from source
 

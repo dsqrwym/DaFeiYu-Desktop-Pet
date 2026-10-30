@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use feiyu_core::anim::{AnimEntry, Manifest};
 use feiyu_core::brain::{Brain, Mood, Stimulus};
 use feiyu_core::config::Config;
+use feiyu_core::i18n::{Lang, Texts};
 use feiyu_core::motion::{fling_velocity, Limits, Motion};
 use feiyu_core::pool::Pool;
 use feiyu_core::rng::Rng;
@@ -146,8 +147,12 @@ pub struct Pet {
     /// 素材目录（`manifest.json` 所在处）。
     dir: PathBuf,
     manifest: Manifest,
-    /// 用户配置（启动时加载一次，之后只读）。
+    /// 用户配置（启动时加载一次；菜单里改开关时会写回 `config_path`）。
     cfg: Config,
+    /// 菜单语言。`auto` 在 [`Pet::open`] 里已经解析成具体一种。
+    lang: Lang,
+    /// 配置文件路径：菜单里切开关后写回这里。`None` = 不落盘（自检用）。
+    config_path: Option<PathBuf>,
     /// 已打开的动画。按需加载，没播过的段不占内存。
     anims: HashMap<String, Box<dyn FrameSource>>,
     current: String,
@@ -289,12 +294,20 @@ impl Pet {
         // 在把 `cfg` move 进结构体之前取好初始值。
         let typing_enabled = cfg.typing.enabled;
         let typing_chance = cfg.typing.chance;
+        let follow = cfg.follow;
+        let click_walk = cfg.click_walk;
+        // `language: "auto"`（或没写）就看系统 UI 语言；认不出的一律英文。
+        let lang = cfg
+            .language
+            .unwrap_or_else(|| Lang::from_system(feiyu_platform::system_language()));
 
         let mut pet = Self {
             win,
             dir,
             manifest,
             cfg,
+            lang,
+            config_path: None,
             anims: HashMap::new(),
             current: first,
             frame: 0,
@@ -321,11 +334,11 @@ impl Pet {
             next_action_at: 0.0,
             action_playing: false,
             walk: None,
-            follow: false,
+            follow,
             was_near: false,
             // 初始就当成「很久以前」：否则刚启动的 4 秒内第一次转头会被冷却拦下。
             look_cd: Instant::now() - std::time::Duration::from_secs(60),
-            click_walk: false,
+            click_walk,
             typing_enabled,
             lb_down: false,
             flip: false,
@@ -347,6 +360,8 @@ impl Pet {
         let delay = pet.next_sleep_delay();
         pet.brain.set_sleep_after(delay);
         pet.schedule_next_action();
+        // 「总在最前」是配置里的一项；窗口创建时总是带 `WS_EX_TOPMOST`，这里按配置纠正。
+        pet.win.set_topmost(pet.cfg.topmost);
         pet.ensure_loaded(&pet.current.clone())?;
         pet.draw_frame()?;
         Ok(pet)
@@ -372,9 +387,35 @@ impl Pet {
         self.drawn
     }
 
-    /// 显示窗口（不抢焦点）。
+    /// 显示窗口（不抢焦点），并按配置决定是否置顶。
     pub fn show(&self) {
         self.win.show();
+        self.win.set_topmost(self.cfg.topmost);
+    }
+
+    /// 配置文件路径：菜单里改开关后写到这个文件。不设就不落盘（自检用）。
+    pub fn set_config_path(&mut self, path: impl Into<PathBuf>) {
+        self.config_path = Some(path.into());
+    }
+
+    /// 当前菜单语言。
+    pub fn lang(&self) -> Lang {
+        self.lang
+    }
+
+    /// 当前语言的菜单文案。
+    pub(crate) fn texts(&self) -> &'static Texts {
+        self.lang.texts()
+    }
+
+    /// 把菜单里改过的开关写回配置文件。失败只打一行，不阻断功能（本次仍然生效）。
+    fn persist_toggles(&self) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        if let Err(e) = Config::save_toggles(path, &self.cfg) {
+            eprintln!("保存设置失败（本次仍生效）：{e}");
+        }
     }
 
     /// 启动/停止周期定时器。周期记在 `tick_ms` 里，隐藏时用它原样恢复。

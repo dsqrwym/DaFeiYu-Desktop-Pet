@@ -1,4 +1,8 @@
 {
+  "language": "auto",
+  "follow": false,
+  "click_walk": false,
+  "topmost": true,
   "action_gap": [8, 15],
   "sleep_after": [18, 38],
   "typing": {

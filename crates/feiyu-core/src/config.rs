@@ -13,6 +13,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::i18n::Lang;
+
 /// 全部可调参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -26,6 +28,14 @@ pub struct Config {
     pub walk: Walk,
     /// 分类标签 → 随机池总权重。没有写的分类用代码里的默认权重。
     pub category_weights: HashMap<String, u32>,
+    /// 界面语言。`None` = 跟随系统，认不出的一律英文。
+    pub language: Option<Lang>,
+    /// 菜单开关：「跟随鼠标」。
+    pub follow: bool,
+    /// 菜单开关：「点哪走哪」。
+    pub click_walk: bool,
+    /// 菜单开关：「总在最前」。
+    pub topmost: bool,
 }
 
 /// 打字联动参数。
@@ -58,6 +68,10 @@ impl Default for Config {
             typing: Typing::default(),
             walk: Walk::default(),
             category_weights: HashMap::new(),
+            language: None,
+            follow: false,
+            click_walk: false,
+            topmost: true,
         }
     }
 }
@@ -121,6 +135,11 @@ impl Config {
                 .into_iter()
                 .map(|(k, v)| (k, v.min(100_000)))
                 .collect(),
+            // `auto` / 认不出的值都当成“跟随系统”，不因为写错一个语言就把桌宠晾在那。
+            language: raw.language.as_deref().and_then(Lang::parse),
+            follow: raw.follow.unwrap_or(d.follow),
+            click_walk: raw.click_walk.unwrap_or(d.click_walk),
+            topmost: raw.topmost.unwrap_or(d.topmost),
         })
     }
 
@@ -138,6 +157,36 @@ impl Config {
             .get(label)
             .copied()
             .unwrap_or(fallback)
+    }
+
+    /// 把菜单里能改的几项写回配置文件。
+    ///
+    /// 只覆盖 `language` / `follow` / `click_walk` / `topmost` / `typing.enabled`，
+    /// 文件里其余字段原样保留：用户可能手写了别的项，不能因为点了一下菜单就丢了。
+    /// 文件不存在时新建；内容不是合法 JSON 时也重写，不报错。
+    pub fn save_toggles(path: &Path, cfg: &Config) -> Result<(), String> {
+        let mut root: serde_json::Value = match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        };
+        if !root.is_object() {
+            root = serde_json::json!({});
+        }
+        let obj = root.as_object_mut().expect("刚确认过是对象");
+        obj.insert(
+            "language".to_owned(),
+            serde_json::json!(cfg.language.map(Lang::tag).unwrap_or("auto")),
+        );
+        obj.insert("follow".to_owned(), serde_json::json!(cfg.follow));
+        obj.insert("click_walk".to_owned(), serde_json::json!(cfg.click_walk));
+        obj.insert("topmost".to_owned(), serde_json::json!(cfg.topmost));
+        let typing = obj.entry("typing").or_insert_with(|| serde_json::json!({}));
+        if let Some(t) = typing.as_object_mut() {
+            t.insert("enabled".to_owned(), serde_json::json!(cfg.typing.enabled));
+        }
+        let mut text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+        text.push('\n');
+        std::fs::write(path, text).map_err(|e| format!("写不了 {}：{e}", path.display()))
     }
 }
 
@@ -171,6 +220,10 @@ struct RawConfig {
     typing: Option<RawTyping>,
     walk: Option<RawWalk>,
     category_weights: Option<HashMap<String, u32>>,
+    language: Option<String>,
+    follow: Option<bool>,
+    click_walk: Option<bool>,
+    topmost: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -193,6 +246,7 @@ struct RawWalk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Lang;
 
     #[test]
     fn defaults_are_the_documented_values() {
@@ -250,5 +304,60 @@ mod tests {
     #[test]
     fn syntax_error_is_reported() {
         assert!(Config::from_json("{ oops").is_err());
+    }
+
+    #[test]
+    fn toggles_and_language_parse() {
+        let c = Config::from_json(
+            r#"{ "language": "es-ES", "follow": true, "click_walk": true, "topmost": false }"#,
+        )
+        .expect("parse");
+        assert_eq!(c.language, Some(Lang::Es));
+        assert!(c.follow && c.click_walk);
+        assert!(!c.topmost);
+
+        let d = Config::from_json(r#"{ "language": "auto" }"#).expect("parse");
+        assert_eq!(d.language, None, "auto = 跟随系统");
+        assert!(!d.follow && !d.click_walk && d.topmost, "没写就用默认值");
+    }
+
+    #[test]
+    fn save_toggles_round_trips_and_keeps_other_fields() {
+        let dir = std::env::temp_dir().join(format!("feiyu-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{ "action_gap": [5, 6], "custom": 1 }"#).expect("seed");
+
+        let mut cfg = Config::load(&path).expect("load");
+        cfg.follow = true;
+        cfg.click_walk = true;
+        cfg.topmost = false;
+        cfg.typing.enabled = false;
+        cfg.language = Some(Lang::Es);
+        Config::save_toggles(&path, &cfg).expect("save");
+
+        let back = Config::load(&path).expect("reload");
+        assert!(back.follow && back.click_walk);
+        assert!(!back.topmost && !back.typing.enabled);
+        assert_eq!(back.language, Some(Lang::Es));
+        assert_eq!(back.action_gap, (5.0, 6.0), "没动的字段要保留");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"custom\""), "未知字段不能被抹掉");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_toggles_creates_missing_file() {
+        let dir = std::env::temp_dir().join(format!("feiyu-cfg-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.json");
+        let cfg = Config {
+            follow: true,
+            ..Config::default()
+        };
+        Config::save_toggles(&path, &cfg).expect("save");
+        assert!(Config::load(&path).expect("load").follow);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

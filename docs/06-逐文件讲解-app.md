@@ -514,6 +514,20 @@ const CATEGORIES: &[Category] = &[
 “点第 5 项播第 6 段”，所以自检用 `dispatch_menu_clip(0)` / `(len-1)`
 真的点首末两项，验证播出来的就是对应素材。
 
+### 2.12.1 多语言与设置持久化
+
+菜单文案不写在 `menu.rs` 里，而是 `core/i18n.rs` 的两张表：一张菜单命令，
+一张「slug → 英文/西语名」。中文直接用清单里的 `name`，不重复维护。
+
+- `lang` 在 `Pet::open` 里就定下来：配置写了 `zh/en/es` 就用它，写 `auto` 就看
+  系统 UI 语言（`GetUserDefaultUILanguage`，认不出的回退英文）；
+- 「语言」子菜单三项用**本名**（简体中文 / English / Español），选完写回
+  `config.json` 的 `language`；
+- 跟随鼠标 / 点哪走哪 / 打字联动 / 总在最前 四个勾选也会写回配置，
+  `Config::save_toggles` 只覆盖这几个键，文件里其它字段（包括用户手写的）原样保留；
+- 新加素材时要同步 `i18n::CLIPS`，否则英文/西语菜单会掉回中文名；自检的
+  `missing_translation` 会点名缺哪一段。
+
 `play_once` 处理三件事：睡着先醒、停掉正在走的路/惯性、移动类真的走一段。
 
 ## 2.13 打字联动
@@ -580,6 +594,10 @@ pub struct Config {
     pub typing: Typing,
     pub walk: Walk,
     pub category_weights: HashMap<String, u32>,
+    pub language: Option<Lang>,
+    pub follow: bool,
+    pub click_walk: bool,
+    pub topmost: bool,
 }
 ```
 
@@ -589,6 +607,9 @@ pub struct Config {
 2. **写错不拒绝整份配置**：数值不合法就夹回合理区间（概率 0~1、区间自动排序、负数夹到下限），
    只有 JSON 语法/类型错才回退整份默认值；
 3. **单位写进字段名**：`_px`、`_sec`、`_keys`，不靠注释猜。
+4. **菜单只写回自己能改的那几项**：`Config::save_toggles` 先读回原文件，
+   只覆盖 `language` / `follow` / `click_walk` / `topmost` / `typing.enabled`，
+   其余字段（包括手写的未知字段）原封不动；文件不存在就新建。
 
 **模块拆分后的可见性**：Rust 的私有项对“定义模块及其后代”可见。`clips.rs` 和 `walk.rs`
 是兄弟模块，所以 `clips` 的 `ClipSpec`/字段要 `pub(crate)` 才能被 `walk` 用；
@@ -630,7 +651,7 @@ impl Report {
   始终等于桌面地面线；再抽查 `hobby_horse` / `leaves` / `whale` / `rubik`
   （有地面道具的段）仍然对位。
 - **菜单**：不真的弹（模态没法自动关），而是构造菜单后用 `GetMenuItemCount` /
-  `GetSubMenu` 问 Win32：顶层 10 项、「动作」下 10 类 97 段。
+  `GetSubMenu` 问 Win32：顶层 11 项、「动作」下 10 类 97 段。
 - **睡眠**：睡着后推 7000 帧，断言帧号始终在 104~156、回绕只发生在 156→104、
   每次回绕都走了淡入、淡入期间帧号没有停住。
 - **打字联动**：把概率钉成 1.0/0.0，验证“到线才触发 / 冷却期不重复 / 关掉不触发 /

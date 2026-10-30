@@ -339,7 +339,12 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     let manifest = feiyu_core::anim::Manifest::load(&manifest_path)?;
 
     // ---- 几何：锚点范围必须与工作区、窗口尺寸自洽 ----
-    let mut pet = Pet::open(dir, Some("idle"), Config::default()).context("打开桌宠失败")?;
+    // 语言钉成中文：下面的断言都在核对中文菜单文案，不能受机器区域设置影响。
+    let zh_cfg = Config {
+        language: Some(feiyu_core::i18n::Lang::Zh),
+        ..Config::default()
+    };
+    let mut pet = Pet::open(dir, Some("idle"), zh_cfg).context("打开桌宠失败")?;
 
     // 菜单：只核对内容没被写坏，不真的弹出来（模态菜单没法自动关），
     // 外观请用 `--menu` 看。
@@ -353,13 +358,13 @@ fn check_interaction(r: &mut Report) -> Result<()> {
             "右键菜单能构造（{items_desc}，首项「{}」）",
             pet.hide_label()
         ),
-        // 隐藏 / 回家 / 跟随 / 点哪走哪 / 打字联动 / 置顶 / 分隔 / 动作 / 分隔 / 退出
-        items.as_ref().is_ok_and(|n| *n == 10),
+        // 隐藏 / 回家 / 跟随 / 点哪走哪 / 打字联动 / 置顶 / 分隔 / 动作 / 语言 / 分隔 / 退出
+        items.as_ref().is_ok_and(|n| *n == 11),
     );
 
     // ---- Win32 实际菜单树：不是我们自己数的一本账，问系统 ----
     // 「动作 → 分类 → 具体动画」三层，菜单项全在子菜单里；
-    // 光验 `items() == 10` 发现不了「AppendMenuW 失败、子菜单根本没挂上」。
+    // 光验 `items() == 11` 发现不了「AppendMenuW 失败、子菜单根本没挂上」。
     match pet.menu_for_test() {
         Ok(menu) => {
             let top = menu.api_items();
@@ -381,8 +386,11 @@ fn check_interaction(r: &mut Report) -> Result<()> {
                 &format!(
                     "Win32 菜单树：顶层 {top} 项，第 8 项「{action_label}」下 {cats} 个分类 / {total} 段"
                 ),
-                top == 10 && action_label == "动作" && cats == 10 && total == 97,
+                top == 11 && action_label == "动作" && cats == 10 && total == 97,
             );
+            // 语言子菜单（第 9 项）：三种语言都在，且当前语言打勾。
+            let langs = menu.api_submenu(8).map(Menu::count_of).unwrap_or(0);
+            r.check(&format!("语言子菜单：{langs} 项"), langs == 3);
         }
         Err(e) => r.check(&format!("Win32 菜单树构造失败：{e:#}"), false),
     }
@@ -487,6 +495,44 @@ fn check_interaction(r: &mut Report) -> Result<()> {
     r.check(
         &format!("唤出后首项变回「{}」", pet.hide_label()),
         pet.hide_label() == "隐藏到托盘",
+    );
+
+    // ---- 语言：英文/西语菜单文案跟着换，切回中文恢复 ----
+    use feiyu_core::i18n::Lang;
+    let zh_hide = pet.hide_label().to_owned();
+    pet.switch_language(Lang::En)?;
+    let en_hide = pet.hide_label().to_owned();
+    // 菜单里改开关要落盘：给一个临时文件，切语言后检查它真被写出来。
+    let cfg_path = std::env::temp_dir().join(format!("feiyu-selftest-{}.json", std::process::id()));
+    let _ = fs::remove_file(&cfg_path);
+    pet.set_config_path(&cfg_path);
+    pet.switch_language(Lang::Es)?;
+    let written = fs::read_to_string(&cfg_path).unwrap_or_default();
+    r.check(
+        &format!("设置写回配置（{} 字节，language = es）", written.len()),
+        written.contains("\"language\": \"es\""),
+    );
+    let _ = fs::remove_file(&cfg_path);
+    pet.switch_language(Lang::Es)?;
+    let es_hide = pet.hide_label().to_owned();
+    r.check(
+        &format!("语言切换：中文「{zh_hide}」/ English「{en_hide}」/ Español「{es_hide}」"),
+        en_hide == "Hide to tray" && es_hide == "Ocultar en la bandeja",
+    );
+    pet.switch_language(Lang::Zh)?;
+    r.check(
+        &format!("切回中文：首项「{}」", pet.hide_label()),
+        pet.hide_label() == "隐藏到托盘",
+    );
+
+    // ---- 译名覆盖：清单里每段都要有英文/西语名，否则菜单会掉回中文 ----
+    let missing: Vec<&str> = manifest
+        .ids()
+        .filter(|id| feiyu_core::i18n::missing_translation(id).is_some())
+        .collect();
+    r.check(
+        &format!("菜单译名覆盖：{} 段缺译名（{missing:?}）", missing.len()),
+        missing.is_empty(),
     );
     r.check(
         &format!("隐藏时定格在第 {frame_at_hide} 帧（非首帧才算真定格）"),

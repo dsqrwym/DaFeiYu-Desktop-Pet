@@ -442,6 +442,10 @@ pub struct Config {
     pub typing: Typing,
     pub walk: Walk,
     pub category_weights: HashMap<String, u32>,
+    pub language: Option<Lang>,   // None = 跟随系统
+    pub follow: bool,
+    pub click_walk: bool,
+    pub topmost: bool,
 }
 ```
 
@@ -461,6 +465,10 @@ pub struct Config {
 3. `category_weights` 只做上限裁剪，未知分类留着（不会影响现有分类）。
 
 只有 JSON 语法/类型错才返回 `Err`；数值不合理只收敛，不把整份配置丢掉。
+
+后四项是**菜单能改的开关**（语言、跟随鼠标、点哪走哪、总在最前）。
+`Config::save_toggles` 只覆盖这几项和 `typing.enabled`：先读回原文件（不存在就当空对象），
+改完再整体写出去，用户手写的其它字段与未知字段都原样保留。
 
 ### 9.3 加载优先级
 

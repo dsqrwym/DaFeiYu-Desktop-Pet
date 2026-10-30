@@ -11,6 +11,7 @@
 pub mod anim;
 pub mod brain;
 pub mod config;
+pub mod i18n;
 pub mod motion;
 pub mod pool;
 pub mod rng;
@@ -22,6 +23,7 @@ pub use anim::{
 };
 pub use brain::{Brain, Mood, Stimulus};
 pub use config::{Config, Typing as TypingConfig, Walk as WalkConfig};
+pub use i18n::Lang;
 pub use motion::{fling_velocity, Limits, Motion};
 pub use pool::Pool;
 pub use rng::Rng;

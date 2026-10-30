@@ -55,7 +55,7 @@ pub fn cli_main() -> ExitCode {
 fn run() -> Result<()> {
     let args = parse_args(&std::env::args().skip(1).collect::<Vec<_>>())?;
     let dir = args.dir.clone().unwrap_or_else(default_anim_dir);
-    let cfg = load_config(args.config.as_deref())?;
+    let (cfg, cfg_path) = load_config(args.config.as_deref())?;
 
     if args.selftest {
         let ok = crate::selftest::run()?;
@@ -71,7 +71,7 @@ fn run() -> Result<()> {
     if let Some((id, out_dir, step)) = &args.dump {
         return dump_frames(&dir, id, out_dir, *step);
     }
-    run_pet(args, dir, cfg)
+    run_pet(args, dir, cfg, cfg_path)
 }
 
 struct Args {
@@ -311,9 +311,10 @@ fn find_anim_dir(root: &Path) -> Option<PathBuf> {
 /// 优先级：`--config` > exe 旁边的 `config.json` > 当前目录的 `config.json` > 默认值。
 /// 显式指定但读不了 → 报错（用户明确说过要用它，不能默默忽略）；
 /// 自动找到但写错了 → 打印告警并回退默认，桌宠照常跑。
-fn load_config(explicit: Option<&Path>) -> Result<Config> {
+fn load_config(explicit: Option<&Path>) -> Result<(Config, PathBuf)> {
     if let Some(path) = explicit {
-        return Config::load(path).map_err(|e| anyhow::anyhow!(e));
+        let cfg = Config::load(path).map_err(|e| anyhow::anyhow!(e))?;
+        return Ok((cfg, path.to_path_buf()));
     }
 
     let mut candidates = Vec::new();
@@ -324,24 +325,29 @@ fn load_config(explicit: Option<&Path>) -> Result<Config> {
     }
     candidates.push(PathBuf::from("config.json"));
 
-    for path in candidates {
+    for path in &candidates {
         if !path.is_file() {
             continue;
         }
-        match Config::load(&path) {
+        match Config::load(path) {
             Ok(cfg) => {
                 if std::env::var_os("FEIYU_CONFIG_TRACE").is_some() {
                     eprintln!("配置：{}", path.display());
                 }
-                return Ok(cfg);
+                return Ok((cfg, path.clone()));
             }
             Err(e) => {
                 eprintln!("配置无效，使用默认值：{e}");
-                return Ok(Config::default());
+                return Ok((Config::default(), path.clone()));
             }
         }
     }
-    Ok(Config::default())
+    // 没有配置文件：把“第一个候选”当成以后要写的目标（菜单里改开关时新建）。
+    let target = candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from("config.json"));
+    Ok((Config::default(), target))
 }
 
 fn print_help() {
@@ -498,7 +504,7 @@ fn flatten_on_white(src: &[u8]) -> Vec<u8> {
     out
 }
 
-fn run_pet(args: Args, dir: PathBuf, cfg: Config) -> Result<()> {
+fn run_pet(args: Args, dir: PathBuf, cfg: Config, cfg_path: PathBuf) -> Result<()> {
     // 第二次双击时安静退出：用户看不到任何提示，桌宠也不会变成两只。
     let Some(_instance) =
         SingleInstance::acquire(SingleInstance::DEFAULT_NAME).context("单实例锁创建失败")?
@@ -527,6 +533,7 @@ fn run_pet(args: Args, dir: PathBuf, cfg: Config) -> Result<()> {
         .or_else(|| args.shots.as_ref().map(|_| "idle".to_owned()))
         .or_else(|| args.showcase.then(|| "idle".to_owned()));
     let mut pet = Pet::open(&dir, forced.as_deref(), cfg)?;
+    pet.set_config_path(cfg_path);
     pet.show();
     if let Some(fps) = args.fps {
         pet.set_fps(fps);
@@ -870,6 +877,11 @@ fn menu_event(ev: Event, pet: &mut Pet, verbose: bool) -> bool {
                         "已从托盘唤出"
                     }
                 );
+            }
+        }
+        Ok(Action::Language(lang)) => {
+            if verbose {
+                println!("菜单语言：{}", lang.tag());
             }
         }
         Ok(Action::None | Action::Home | Action::Played) => {}
