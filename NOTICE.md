@@ -37,9 +37,13 @@ If the upstream project changes its terms, the upstream terms take precedence fo
 
 ### 4. What is not stored in this repository
 
-The upstream `.webm` files, generated `.fishanim` / `.fishvid` / `.fishmask` files, `assets/`, `dist/`, `_upstream/`, and local development notes are not committed. GitHub Releases contain the prebuilt packages, including visual assets; the same non-commercial asset terms apply to those packages.
+The upstream `.webm` files, generated `.fishanim` / `.fishvid` / `.fishmask` files, `assets/`, `dist/`, and `_upstream/` are not committed. GitHub Releases contain the prebuilt packages, including visual assets; the same non-commercial asset terms apply to those packages.
 
-### 5. No warranty
+### 5. AI assistance and no liability
+
+This is a personal Rust learning project produced with substantial AI assistance. It is not production software and has not been audited for safety, security, or fitness for any purpose. To the maximum extent permitted by applicable law, the author accepts no responsibility or liability for any bugs, crashes, data loss, system damage, or other damages resulting from use of this project. You are responsible for evaluating and testing it before use.
+
+### 6. No warranty
 
 The software and assets are provided “as is”, without warranty of any kind. See `LICENSE` for the MIT warranty disclaimer.
 
@@ -76,8 +80,12 @@ MIT 只覆盖本仓库编写的 Rust 代码、配置示例、构建脚本和文�
 
 ### 4. 仓库里不存的素材
 
-上游 `.webm`、生成的 `.fishanim` / `.fishvid` / `.fishmask`、`assets/`、`dist/`、`_upstream/` 和本地开发笔记都不入库。GitHub Releases 里的预编译包包含视觉素材，同样受“禁止商用”的素材条款约束。
+上游 `.webm`、生成的 `.fishanim` / `.fishvid` / `.fishmask`、`assets/`、`dist/`、`_upstream/` 都不入库。GitHub Releases 里的预编译包包含视觉素材，同样受“禁止商用”的素材条款约束。
 
-### 5. 无担保
+### 5. AI 辅助与免责声明
+
+本项目是本人借助 AI 大量辅助完成的个人 Rust 学习项目，不是生产级软件，也没有经过安全、稳定性或适用性审计。对于使用本项目导致的任何 bug、崩溃、数据丢失、系统损坏或其他损失，本人在法律允许范围内不承担责任；使用前请自行评估和测试。
+
+### 6. 无担保
 
 软件与素材按“现状”提供，不附带任何明示或默示担保。MIT 的免责声明见 `LICENSE`。

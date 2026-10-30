@@ -36,5 +36,4 @@ An 8,000-line project does not benefit from comments such as “this line is a l
 
 - [README](../../README.md) — downloads, build commands, package comparison, and measured resource usage.
 - [NOTICE](../../NOTICE.md) — code license, asset license, credits, and the unofficial-project disclaimer.
-- `_notes/PROGRESS.md` and `_notes/LESSONS.md` are local development notes and are not committed.
 - Every module starts with a `//!` comment explaining why the file exists; those comments are often more useful than the code itself.

@@ -50,7 +50,7 @@ cargo run -p feiyu-app --release
 
 ```
 FeiYu/
-├── Cargo.toml            workspace: four crates
+├── Cargo.toml            workspace: five crates (runtime, packer, probe)
 ├── rust-toolchain.toml   stable + MSVC target
 ├── crates/
 │   ├── feiyu-core/       pure logic, no Windows APIs, unit-testable
@@ -58,6 +58,7 @@ FeiYu/
 │   └── feiyu-app/        Pet, CLI, two entry points, self-test
 ├── tools/
 │   ├── pack-anim/        webm → .fishanim or .fishvid + .fishmask
+│   ├── mf-probe/         H.264 decode probe (not part of the runtime)
 │   └── fetch-assets.ps1  shallow-clone the upstream
 ├── assets/               generated; not committed
 ├── docs/                 this documentation

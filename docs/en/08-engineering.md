@@ -35,11 +35,7 @@ A unit test cannot prove that a window is visible. A self-test cannot prove that
 - Bad input and boundary values are part of the contract.
 - A test that cannot fail is not a test.
 
-## 3. Notes
-
-Development notes live in `_notes/`, not `target/`. `cargo clean` removes `target/`, and losing the decision log is worse than losing build artifacts. Notes are intentionally not committed; they are working memory for the next session.
-
-## 4. Git habits
+## 3. Git habits
 
 - one commit = one coherent change;
 - commit messages explain why, not just what;
@@ -48,7 +44,7 @@ Development notes live in `_notes/`, not `target/`. `cargo clean` removes `targe
 - check `git status` and `git diff --check` before committing;
 - do not push secrets or credentials.
 
-## 5. Performance measurement
+## 4. Performance measurement
 
 ### Diagnostic
 
@@ -68,7 +64,7 @@ Make one change at a time. Record the before/after numbers and the environment.
 
 Keep the script and raw output. “It feels faster” is not a measurement. Separate H.264 and `.fishanim` numbers; do not average them.
 
-## 6. Debugging: message vs behavior
+## 5. Debugging: message vs behavior
 
 When the pet “does nothing”, first split the problem:
 
@@ -79,7 +75,7 @@ When the pet “does nothing”, first split the problem:
 
 This prevents hours of debugging the wrong layer. A black screenshot can mean the desktop is not composited, not that the renderer is broken.
 
-## 7. Review checklist
+## 6. Review checklist
 
 - Is the change in the correct crate?
 - Does it add or update a test?
@@ -91,7 +87,7 @@ This prevents hours of debugging the wrong layer. A black screenshot can mean th
 - Did the docs and measurements get updated?
 - Is there a rollback path?
 
-## 8. Ten rules
+## 7. Ten rules
 
 1. Make the smallest change that proves the point.
 2. Put pure logic in `core`.
@@ -104,7 +100,7 @@ This prevents hours of debugging the wrong layer. A black screenshot can mean th
 9. Do not commit generated assets.
 10. Write down why, not just how.
 
-## 9. Acceptance
+## 8. Acceptance
 
 - Explain the three evidence levels.
 - Turn a bug report into a regression test.

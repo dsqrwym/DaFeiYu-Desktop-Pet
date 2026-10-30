@@ -53,7 +53,7 @@ Propose the split first: renderer, event handling, animation cache, or geometry.
 | H.264 runtime cost | 55MB RSS / 40 threads / 7.9% of one core visible | Reduce decoder/cache count or use legacy `.fishanim` |
 | Full visual showcase | 100/100 automated run completed | Human review of each category |
 | Click-response length | about 10 seconds | Exercise 6 |
-| `pet/mod.rs` size | about 1,600 lines | Exercise 9 |
+| `pet/mod.rs` size | about 1,160 lines | Exercise 9 |
 
 Both release packages contain 100 animations and pass self-test 94/94. The legacy package is the lower-runtime-resource choice; H.264 is the smaller-download choice.
 

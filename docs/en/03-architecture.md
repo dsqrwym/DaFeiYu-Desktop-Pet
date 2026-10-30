@@ -4,6 +4,8 @@ English | [简体中文](../03-架构与一次点击的旅程.md)
 
 ## 1. Four layers, dependencies only point downward
 
+These are four **functional layers**; `tools/mf-probe` is a standalone H.264 prototype tool and is not part of the runtime layering.
+
 ```
 feiyu-app ──► feiyu-core
     │
@@ -130,7 +132,51 @@ This complexity exists because the source is one 10-second closed loop. Playing 
 
 The rule: **put pure logic in `core`**. `Brain`, `Motion`, `Pool`, and `SleepCycle` are unit-tested; `Pet` translates their decisions into window operations.
 
-## 8. Acceptance
+## 8. Where frames come from: the two FrameSource implementations
+
+The player only needs two things: **the frame count** and **frame N as premultiplied BGRA**. `pet/frame_source.rs` hides the codec behind a trait:
+
+```rust
+trait FrameSource {
+    fn frame_count(&self) -> u32;
+    fn frame(&mut self, idx: u32) -> Result<&[u8]>;
+}
+```
+
+`ensure_loaded(id)` chooses an implementation from the manifest's `codec` and stores it in `Pet.anims`:
+
+| Implementation | What it does on open | What `frame(idx)` does |
+|---|---|---|
+| `FishAnimSource` | Opens `.fishanim` and checks header width/height/frames against the manifest | Reconstructs the delta-chain frame and returns premultiplied BGRA |
+| `VideoSource` | Loads `.fishmask`, validates its geometry/frame count, opens `VideoReader`, crops to the manifest size | Decodes H.264 color, then copies or clears pixels using the 1-bit mask |
+
+The core loop in `VideoSource` is:
+
+```rust
+let color = video.frame(idx)?;      // BGRA, alpha currently 255
+let bits = mask.frame_bits(idx)?;   // 1 bit per pixel
+for i in 0..pixels {
+    let o = i * 4;
+    if bits[i / 8] & (1 << (i % 8)) != 0 {
+        out[o..o + 4].copy_from_slice(&color[o..o + 4]);
+        out[o + 3] = 255;
+    } else {
+        out[o..o + 4].fill(0);
+    }
+}
+```
+
+Three invariants must hold:
+
+1. the output length is always `manifest.size.0 × manifest.size.1 × 4`;
+2. the output is always **premultiplied BGRA**, so `UpdateLayeredWindow` does no conversion;
+3. transparent pixels are four zero bytes, not just alpha zero; otherwise blending can darken the edge.
+
+Mirroring, seam blending, tray icon capture, and hit testing therefore do not know whether the frame came from `.fishanim` or H.264. Load failures include the animation id and codec; per-frame failures include the frame index.
+
+The cache is bounded: `ANIM_CACHE = 6`; when it overflows, only the current clip, the pending clip, `idle`, and `drag` are retained. Each H.264 source also owns a Media Foundation reader and a 1-bit mask, so it cannot be cached like a tiny object.
+
+## 9. Acceptance
 
 - Draw the “wndproc → queue → pump → Pet::on_event → tick → draw” flow.
 - Explain `origin` versus `baseline`.

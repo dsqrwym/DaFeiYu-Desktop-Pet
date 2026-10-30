@@ -117,6 +117,8 @@ The time-base trap: ffmpeg's rawvideo input defaults to 25fps while the manifest
 
 Only RGB32 output is implemented. If a system cannot provide RGB32, the decoder returns a clear error; NV12 conversion is a future compatibility task.
 
+There is also a runtime cost that cannot be ignored: Media Foundation creates a thread pool and internal buffers for H.264. The measured H.264 package uses about 55MB RSS / 40 threads / 7.9% of one core when visible; hidden it drops to about 39.7MB / 19 threads / 0% CPU. This is not a leak; it is the decoder's baseline cost. The legacy `.fishanim` package was about 10.5MB / 4 threads, so `Pet` caches only a small number of `VideoReader` instances rather than treating them as tiny objects.
+
 ## 11. Acceptance
 
 - Explain `WS_EX_NOACTIVATE` and its menu/keyboard/focus consequences.

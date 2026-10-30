@@ -15,7 +15,7 @@
 //! 16  4  frame_count
 //! 20  4  fps          f32 的位模式
 //! 24  2  baseline     脚底线（帧内 y），用于贴底对齐
-//! 26  2  reserved0
+//! 26  2  key_every   差分关键帧间隔（0/1 = 不差分）
 //! 28  4  table_off    帧表偏移（恒为 48）
 //! 32  4  data_off     负载起始偏移
 //! 36  4  payload_len  负载总字节
