@@ -1,5 +1,7 @@
 # 06 逐文件讲解：feiyu-app（组装层）
 
+> [English](en/06-app-files.md) | 简体中文
+
 这一层把 core 的纯逻辑和 platform 的窗口操作组装成一只真的桌宠。
 
 ```

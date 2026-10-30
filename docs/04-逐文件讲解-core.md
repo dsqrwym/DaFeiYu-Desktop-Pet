@@ -1,5 +1,7 @@
 # 04 逐文件讲解：feiyu-core（纯逻辑层）
 
+> [English](en/04-core-files.md) | 简体中文
+
 `feiyu-core` 没有任何 `windows::` 依赖，所以它的每一条逻辑都能在 `cargo test` 里钉死。
 这一章按文件讲，重点在“为什么这么写”，而不是逐字翻译语法。
 

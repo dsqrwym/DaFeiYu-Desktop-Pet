@@ -1,5 +1,7 @@
 # 05 逐文件讲解：feiyu-platform（Win32 层）
 
+> [English](en/05-platform-files.md) | 简体中文
+
 这一层是整个项目**唯一**允许 `unsafe` 与 `windows::*` 的地方。它的目标不是“封装所有
 Win32”，而是只封装项目用得到的那几件事，并且把每个 `unsafe` 的成立条件写清楚。
 

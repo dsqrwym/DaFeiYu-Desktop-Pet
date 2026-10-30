@@ -1,5 +1,7 @@
 # 07 工具链：`pack-anim`（webm → .fishanim / .fishvid）
 
+> [English](en/07-pack-anim.md) | 简体中文
+
 `tools/pack-anim` 是一个独立的小程序：把上游 640×360 的透明 webm 变成运行时
 零转换成本的 `.fishanim`，或 H.264 颜色 + 1-bit 掩码。它只依赖 `feiyu-core` 的格式定义，解码交给外部 ffmpeg。
 
