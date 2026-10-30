@@ -70,7 +70,7 @@ The crates are split so the compiler can prevent the pure-logic layer from silen
 ## 3. Tests and the real-Windows self-test
 
 ```powershell
-cargo test --workspace --release          # 113 unit tests
+cargo test --workspace --release          # 115 unit tests
 .\target\release\feiyu-cli.exe --selftest # 94 real-window checks
 ```
 

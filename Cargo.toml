@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/feiyu-core", "crates/feiyu-platform", "crates/feiyu-app", "tools/pack-anim", "tools/mf-probe"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"

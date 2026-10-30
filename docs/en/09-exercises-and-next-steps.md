@@ -48,7 +48,7 @@ Propose the split first: renderer, event handling, animation cache, or geometry.
 
 | Gap | Status | Next step |
 |---|---|---|
-| H.264 edge quality | CRF20 still shows blocks at 4× zoom; alpha is exact via 1-bit mask | Accept the 71MB tier or try VP9 alpha |
+| H.264 edge quality | CRF20 still shows blocks at 4× zoom; alpha is exact via 1-bit mask | Accept the 80MB tier or try VP9 alpha |
 | H.264 compatibility | `VideoReader` currently outputs RGB32 only | Add NV12 fallback if a target system lacks RGB32 |
 | H.264 runtime cost | 55MB RSS / 40 threads / 7.9% of one core visible | Reduce decoder/cache count or use legacy `.fishanim` |
 | Full visual showcase | 100/100 automated run completed | Human review of each category |

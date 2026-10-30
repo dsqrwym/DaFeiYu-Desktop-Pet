@@ -59,12 +59,19 @@ try {
     Write-Host ('[4/4] done: {0} ({1:N1} MB)' -f (Resolve-Path $Out), ($size / 1MB))
 
     if ($Zip) {
-        $zip = "$Out.zip"
-        if (Test-Path $zip) { Remove-Item -Force $zip }
-        Write-Host "zip -> $zip (this can take a few minutes)"
-        Compress-Archive -Path (Join-Path $Out '*') -DestinationPath $zip -CompressionLevel Fastest
-        $zipSize = (Get-Item $zip).Length
-        Write-Host ('zip done: {0} ({1:N1} MB)' -f $zip, ($zipSize / 1MB))
+        # Do not name this $zip: PowerShell variables are case-insensitive and it
+        # would collide with the [switch]$Zip parameter.
+        $zipPath = [System.IO.Path]::GetFullPath("${Out}.zip")
+        if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+        Write-Host "zip -> $zipPath (this can take a few minutes)"
+        # Compress-Archive on 600MB is slow; the .NET API is faster and avoids
+        # the cmdlet's parameter binding entirely.
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $level = [System.IO.Compression.CompressionLevel]::Fastest
+        [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            [System.IO.Path]::GetFullPath($Out), $zipPath, $level, $false)
+        $zipSize = (Get-Item $zipPath).Length
+        Write-Host ('zip done: {0} ({1:N1} MB)' -f $zipPath, ($zipSize / 1MB))
     }
 } finally {
     Pop-Location

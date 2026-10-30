@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "feiyu-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "feiyu-core",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "feiyu-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "feiyu-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror",
  "windows",
@@ -172,7 +172,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mf-probe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "feiyu-core",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "pack-anim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "feiyu-core",
