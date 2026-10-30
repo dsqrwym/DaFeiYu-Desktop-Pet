@@ -6,5 +6,6 @@
 *.fishanim binary
 *.bmp binary
 *.png binary
+*.gif binary
 *.webm binary
 *.exe binary

@@ -10,6 +10,12 @@ A Windows desktop pet featuring the community fan character **DaFeiYu** (大肥�
 
 > **AI-assisted learning project.** This is a personal Rust learning project produced with substantial AI assistance, not production software. To the maximum extent permitted by applicable law, the author accepts no responsibility or liability for any bugs, crashes, data loss, or other damages resulting from use of this project. Use it at your own risk.
 
+## Demo
+
+<p align="center"><img src="docs/images/demo.gif" width="320" alt="DaFeiYu on the desktop: idle, click response, eating, animal companions, work animation, sleep"></p>
+
+Six clips from a release build of this repository, recorded on a real Windows desktop and cut together: idle, click response, eating, animal companions, the work animation (normally triggered while you type), and sleep. The plain background is a full-screen window placed behind the pet while recording, so no desktop content ends up in the frame.
+
 ## Upstream projects
 
 This is an independent rewrite, not a fork:
