@@ -185,6 +185,14 @@ pub struct Pet {
     loop_span: Option<(u32, u32)>,
     /// 正在淡化循环接缝。`Some` 时帧号停住，画面上是两帧的混合。
     dissolve: Option<Dissolve>,
+    /// 下一帧提交时要一并生效的窗口左上角。
+    ///
+    /// 换段时窗口位置和尺寸都变。若先用 `SetWindowPos` 搬位置、再
+    /// `UpdateLayeredWindow` 换内容，中间会被 DWM 合成一帧「上一段画面摆在新位置上」
+    /// ——实测切换 `click_happy` → `click_pout` 时那一帧整只鱼右移 76px、下移 32px，
+    /// 用户看到的就是「闪一下」。把坐标交给 `UpdateLayeredWindow` 的 `pptDst`，
+    /// 位置/尺寸/内容一次提交，中间没有空档。
+    pending_dst: Option<(i32, i32)>,
     /// 固定入睡等待（秒）。`None` = 每次回待机都随机抽。
     /// 只有 `--sleep-after` 会设它：观察入睡/自然醒这种「要等十几秒才会发生」的行为时
     /// 不能每次都靠运气。
@@ -306,6 +314,7 @@ impl Pet {
             landed_at: None,
             loop_span: None,
             dissolve: None,
+            pending_dst: None,
             sleep_cycle: None,
             rng: Rng::from_time(),
             pool,
@@ -595,9 +604,15 @@ impl Pet {
         self.walk = None;
         self.flip = false;
         self.sleep_cycle = None;
-        // 先摆位置再画：`UpdateLayeredWindow` 带尺寸时**保留左上角**，
-        // 所以新尺寸的帧若是宽高变大的，必须先落位，否则会从旧左上角长出去。
-        self.place_window(&entry);
+        // 位置**不在这里搬**：`SetWindowPos` 搬到新位置之后、新画面提交之前，
+        // DWM 会合成一帧「旧画面在新位置」，看上去就是闪一下。
+        // 把坐标交给 `draw_frame`，跟尺寸、内容一起写进一次 `UpdateLayeredWindow`。
+        self.pending_dst = Some(window_pos(
+            self.manifest.canvas.width,
+            &entry,
+            self.anchor_x,
+            self.feet_y,
+        ));
         self.draw_frame()
     }
 
@@ -909,8 +924,11 @@ impl Pet {
             dissolve,
             flip,
             flip_buf,
+            pending_dst,
             ..
         } = self;
+        // 只活一帧：这一帧就算解帧失败也不该把坐标留到下一拍。
+        let dst = pending_dst.take();
         let anim = anims
             .get_mut(current)
             .with_context(|| format!("动画 {current} 尚未加载"))?;
@@ -924,19 +942,23 @@ impl Pet {
         } else {
             raw
         };
-        match dissolve {
-            // 接缝淡入：把接缝前那一帧和**当前正在推进的新帧**按进度混合。
-            //
-            // 旧帧只在这里出现（作为残影），画面上每一步都在动：
-            // 停住帧号做过一版，用户看到的就是「卡一下」。
+        // 接缝淡入：把接缝前那一帧和**当前正在推进的新帧**按进度混合。
+        //
+        // 旧帧只在这里出现（作为残影），画面上每一步都在动：
+        // 停住帧号做过一版，用户看到的就是「卡一下」。
+        let blended: &[u8] = match dissolve {
             Some(d) => {
                 let (num, den) = d.t();
                 blend_frame(&d.from, pixels, num, den, &mut d.out);
-                win.draw(entry.width() as u32, entry.height() as u32, &d.out)?;
+                &d.out
             }
-            _ => {
-                win.draw(entry.width() as u32, entry.height() as u32, pixels)?;
-            }
+            _ => pixels,
+        };
+        // 换段时这一帧自带目标坐标：位置、尺寸、内容一次提交，中间不留空档。
+        let (w, h) = (entry.width() as u32, entry.height() as u32);
+        match dst {
+            Some((x, y)) => win.draw_at(w, h, blended, x, y)?,
+            None => win.draw(w, h, blended)?,
         }
         *drawn += 1;
         Ok(())

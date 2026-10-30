@@ -74,28 +74,30 @@ let hwnd = unsafe {
 `WS_EX_NOACTIVATE` 是后面**很多坑的来源**（菜单弹不出来、收不到键盘消息），
 但它是正确的选择：桌宠不该抢焦点。
 
-### 1.4 `draw`
+### 1.4 `draw` / `draw_at`
 
 ```rust
 pub fn draw(&mut self, width: u32, height: u32, bgra: &[u8]) -> Result<()> {
-    if (w, h) != (self.dib.width, self.dib.height) {
-        // 尺寸变了：换 DIB（不同动画裁切尺寸不同）
-    }
-    unsafe { copy_nonoverlapping(bgra.as_ptr(), self.dib.bits, n) };
-    // 同步 alpha 给命中测试
-    with_state(|s| {
-        s.alpha.clear();
-        s.alpha.extend(bgra.chunks_exact(4).map(|p| p[3]));
-    });
-    self.present()
+    self.draw_at_inner(width, height, bgra, None)   // 位置不动
+}
+
+pub fn draw_at(&mut self, width: u32, height: u32, bgra: &[u8], x: i32, y: i32) -> Result<()> {
+    self.draw_at_inner(width, height, bgra, Some(POINT { x, y }))  // 位置也跟着变
 }
 ```
 
-两个细节：
+`draw_at_inner` 里就三件事：尺寸变了换 DIB、拷像素、同步 alpha，最后 `present(dst)`。
+
+三个细节：
 
 1. **尺寸变化是正常路径**，不是异常：不同动画裁切尺寸不同，换段就要换 DIB；
 2. **alpha 单独存一份**给 `WM_NCHITTEST` 用。`STATE` 是全局 `Mutex<Option<WndState>>`，
-   因为 `WM_NCHITTEST` 可能在别的线程被系统调用，而 `draw` 在主线程。
+   因为 `WM_NCHITTEST` 可能在别的线程被系统调用，而 `draw` 在主线程；
+3. **换位置也必须走同一次调用**。`SetWindowPos` 搬窗口和 `UpdateLayeredWindow` 换内容
+   分两步时，中间 DWM 会合成一帧“上一段画面摆在新位置上”：实测切 `click_happy`
+   （左上角 anchor−178, feet−267）→ `click_pout`（anchor−102, feet−235）那一帧整只鱼
+   右移 76px、下移 32px，看上去就是闪一下。`draw_at` 把坐标交给 `pptDst`，
+   位置/尺寸/内容一次写完，中间没有可被合成的空档。
 
 ### 1.5 `present`
 
@@ -106,10 +108,14 @@ let blend = BLENDFUNCTION {
     SourceConstantAlpha: 255,
     AlphaFormat: AC_SRC_ALPHA as u8,
 };
-UpdateLayeredWindow(hwnd, Some(screen_dc), None, Some(&size),
+let dst_ptr: Option<*const POINT> = dst.as_ref().map(|p| p as *const POINT);
+UpdateLayeredWindow(hwnd, Some(screen_dc), dst_ptr, Some(&size),
                     Some(self.mem_dc), Some(&src), COLORREF(0),
                     Some(&blend), ULW_ALPHA)
 ```
+
+`pptDst` 就是新位置，`psize` 是新尺寸：两者和位图一起提交，窗口不会先“空跑”到新位置
+再等画面。`None` 就表示位置不动。
 
 `AC_SRC_ALPHA` 要求像素是**预乘**的：颜色已经乘过 alpha。打包器在最后一步把 RGBA
 转成预乘 BGRA，运行时就不用再算。

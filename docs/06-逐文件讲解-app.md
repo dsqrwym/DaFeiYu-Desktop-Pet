@@ -349,7 +349,9 @@ pub fn play(&mut self, id: &str) -> Result<()> {
     self.loop_span = None; self.dissolve = None;
     self.walk = None; self.flip = false;
     self.sleep_cycle = None;
-    self.place_window(&entry);  // ③ 先摆位置再画
+    // ③ 位置交给这一帧一起提交，不单独 SetWindowPos
+    self.pending_dst = Some(window_pos(
+        self.manifest.canvas.width, &entry, self.anchor_x, self.feet_y));
     self.draw_frame()
 }
 ```
@@ -367,8 +369,15 @@ fn resume_idle_at(&mut self, frame: u32) -> Result<()> {
 }
 ```
 
-③ 先摆位置再画：`UpdateLayeredWindow` 带尺寸时保留左上角，新尺寸如果变大，
-必须先落位，否则会从旧左上角长出去。
+③ 位置和画面必须**一次**提交。旧写法是先 `place_window`（`SetWindowPos`）再
+`draw_frame`（`UpdateLayeredWindow`），两步之间 DWM 会合成一帧“上一段画面摆在新位置
+上”——实测切 `click_happy` → `click_pout` 时那一帧整只鱼右移 76px、下移 32px，
+用户看到的就是“闪一下”。现在把坐标塞进 `pending_dst`，`draw_frame` 走
+`win.draw_at(...)`，把新位置（`pptDst`）、新尺寸（`psize`）和位图一起交给
+`UpdateLayeredWindow`，中间没有空档。
+
+`pending_dst` 只活一帧：`draw_frame` 里 `take()` 掉，下一拍回到普通的 `draw`。
+走路/拖拽那种连续小步移动仍走 `place_window`：内容没变，位置差一帧看不出来。
 
 ## 2.8 `after_switch`：进场收尾
 
@@ -640,6 +649,7 @@ impl Report {
 
 - [ ] 能说出 `tick` 里十个步骤为什么是这个顺序；
 - [ ] 能解释 `play` 早退为什么会造成“无限循环”，以及 `resume_idle_at` 怎么修；
+- [ ] 能说出换段时为什么要把坐标交给 `draw_frame`，而不是先 `SetWindowPos`；
 - [ ] 能逐行讲 `advance_frame` 的七个分支；
 - [ ] 能解释淡入为什么不冻帧号；
 - [ ] 能说出 `Walk.x` 为什么必须是浮点；

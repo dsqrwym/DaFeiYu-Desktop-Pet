@@ -25,14 +25,16 @@ crates/feiyu-platform/src/
 
 `UpdateLayeredWindow` gives per-pixel transparency. The window stores a 32bpp DIB, a compatible memory DC, and the old bitmap selected into the DC.
 
-`draw(width, height, bgra)`:
+`draw(width, height, bgra)` / `draw_at(width, height, bgra, x, y)`:
 
 - if the size changed, replace the DIB (different clips have different cropped sizes);
 - copy premultiplied BGRA into the DIB;
 - copy alpha into a global hit-test buffer;
-- call `present()`.
+- call `present(dst)`.
 
 `present()` uses `AC_SRC_ALPHA` and `ULW_ALPHA`. Pixels must be premultiplied; the packer does this conversion once, not every frame.
+
+`draw_at` passes the destination as `pptDst`, so the move, the resize, and the bitmap land in one call. Moving first with `SetWindowPos` lets DWM composite one frame of the previous clip at the new position: switching `click_happy` → `click_pout` shifted the sprite 76px right and 32px down for a single frame, which reads as a flash.
 
 `WM_NCHITTEST` returns `HTTRANSPARENT` for alpha 0 and `HTCLIENT` for visible pixels. The alpha buffer is shared with the UI thread through a `Mutex<Option<WndState>>` because Windows may call hit testing from another thread.
 

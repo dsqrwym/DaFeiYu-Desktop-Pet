@@ -392,7 +392,7 @@ impl LayeredWindow {
             });
 
         // 先把全透明位图提交一次，避免窗口刚显示时是块黑方块。
-        window.present()?;
+        window.present(None)?;
         Ok(window)
     }
 
@@ -551,8 +551,32 @@ impl LayeredWindow {
 
     /// 提交一整帧预乘 BGRA 像素（尺寸变化时自动重建 DIB）。
     ///
+    /// 窗口位置不动。换段时位置也要变，用 [`Self::draw_at`]。
+    ///
     /// `bgra.len()` 必须等于 `width × height × 4`。
     pub fn draw(&mut self, width: u32, height: u32, bgra: &[u8]) -> Result<()> {
+        self.draw_at_inner(width, height, bgra, None)
+    }
+
+    /// 同 [`Self::draw`]，但**同时**把窗口搬到 `(x, y)`。
+    ///
+    /// 为什么必须一次提交：`SetWindowPos` 搬位置和 `UpdateLayeredWindow` 换内容
+    /// 分两步走，中间 DWM 会合成一帧「上一段画面摆在新位置上」。实测切换
+    /// `click_happy`（左上角 anchor-178, feet-267）→ `click_pout`（anchor-102,
+    /// feet-235）时，那一帧整只鱼右移 76px、下移 32px，看上去就是闪一下。
+    /// `UpdateLayeredWindow` 本来就能同时接 `pptDst`（新位置）和 `psize`（新尺寸），
+    /// 一次调用提交，中间没有可被合成的空档。
+    pub fn draw_at(&mut self, width: u32, height: u32, bgra: &[u8], x: i32, y: i32) -> Result<()> {
+        self.draw_at_inner(width, height, bgra, Some(POINT { x, y }))
+    }
+
+    fn draw_at_inner(
+        &mut self,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+        dst: Option<POINT>,
+    ) -> Result<()> {
         let (w, h) = (width as i32, height as i32);
         if (w, h) != (self.dib.width, self.dib.height) {
             // 尺寸变了：换 DIB。不同动画的裁切尺寸本来就不同，属正常路径。
@@ -560,10 +584,11 @@ impl LayeredWindow {
             // SAFETY: 换掉旧位图对象并恢复 DC 的选择状态。
             unsafe {
                 let old = SelectObject(self.mem_dc, HGDIOBJ(dib.bitmap.0));
-                if !old.is_invalid() {
-                    let _ = DeleteObject(HGDIOBJ(old.0));
+                // 只释放确实刚被换下来、而且就是旧 DIB 的那张：SelectObject
+                // 失败时返回的不是位图，删它有把 DC 默认位图删掉的风险。
+                if !old.is_invalid() && old.0 == self.dib.bitmap.0 {
+                    let _ = DeleteObject(old);
                 }
-                let _ = DeleteObject(HGDIOBJ(self.dib.bitmap.0));
             }
             self.dib = dib;
             let _ = with_state(|s| {
@@ -581,11 +606,11 @@ impl LayeredWindow {
             s.alpha.clear();
             s.alpha.extend(bgra.chunks_exact(4).map(|p| p[3]));
         });
-        self.present()
+        self.present(dst)
     }
 
-    /// 把当前 DIB 提交给 DWM。
-    fn present(&mut self) -> Result<()> {
+    /// 把当前 DIB 提交给 DWM。`dst` 非空时顺带把窗口搬到那个位置。
+    fn present(&mut self, dst: Option<POINT>) -> Result<()> {
         let size = SIZE {
             cx: self.dib.width,
             cy: self.dib.height,
@@ -597,13 +622,15 @@ impl LayeredWindow {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
+        // 非空时表示「这一帧顺便把窗口搬过去」。指针只在本次调用里有效。
+        let dst_ptr: Option<*const POINT> = dst.as_ref().map(|p| p as *const POINT);
         // SAFETY: 屏幕 DC 只作目标表面；DIB 仍是当前选中的位图。
         unsafe {
             let screen_dc = GetDC(None);
             let r = UpdateLayeredWindow(
                 self.hwnd,
                 Some(screen_dc),
-                None,
+                dst_ptr,
                 Some(&size),
                 Some(self.mem_dc),
                 Some(&src),

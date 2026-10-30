@@ -83,7 +83,7 @@ This is `window_pos()` in `pet/mod.rs`. Every code path that places the window m
 2. `tick` computes `dt = now - last` and advances the brain, typing, and physics.
 3. `acc += dt * fps`; when it exceeds one frame, `step_frames(1)` runs.
 4. `advance_frame` advances the frame index and handles loop/return.
-5. `draw_frame` gets the frame from its `FrameSource`, mirrors if needed, blends a seam if needed, and calls `win.draw()`.
+5. `draw_frame` gets the frame from its `FrameSource`, mirrors if needed, blends a seam if needed, and calls `win.draw()` — or `win.draw_at()` on the frame right after a clip switch, which commits the new position, the new size, and the pixels through a single `UpdateLayeredWindow`.
 6. `win.draw()` submits premultiplied BGRA through `UpdateLayeredWindow`; DWM composites it.
 
 ### 4.5 Finishing a clip
@@ -180,5 +180,6 @@ The cache is bounded: `ANIM_CACHE = 6`; when it overflows, only the current clip
 
 - Draw the “wndproc → queue → pump → Pet::on_event → tick → draw” flow.
 - Explain `origin` versus `baseline`.
+- Explain why a clip switch must fold position, size, and pixels into one `UpdateLayeredWindow`.
 - Explain why `wndproc` must not block.
 - Name the functions a click passes through before returning to idle.

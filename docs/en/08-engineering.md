@@ -75,6 +75,18 @@ When the pet “does nothing”, first split the problem:
 
 This prevents hours of debugging the wrong layer. A black screenshot can mean the desktop is not composited, not that the renderer is broken.
 
+### 5.1 “The screen flashes once”: measure the area, then the frame
+
+A report of “it occasionally flashes for a moment” arrived for both asset packages. Order of work:
+
+1. **Measure the area**: put a plain full-screen window behind the pet, record the pet region at 60fps, and diff the four corners (background) frame by frame. A constant zero means the whole screen is not repainting; only the pet region changes.
+2. **Measure the frame**: compute per-frame `mad` and the sprite bounding box. Normal frames stay at 1–3; the switch jumped to **37.47** and the box went from x=191..370 to x=266..419 (75px right, 32px down, clipped) — for exactly one frame.
+3. **Then read the code**: `play()` moved the window with `SetWindowPos`, then replaced the content with `UpdateLayeredWindow`. DWM composites the frame in between: the previous clip sitting at the new position. The jump equals the difference between the two clips' top-left corners, so clips that happen to line up show nothing — hence “occasionally”, and hence both codecs behave the same.
+
+Fix: commit position, size, and pixels in one `UpdateLayeredWindow` (`pptDst` + `psize`).
+
+**Lesson**: “it flashes” may be a 16ms, one-frame offset that nobody can describe in words. Screen recording plus a bounding box turns it into two numbers (`mad`, Δx/Δy), and the same numbers verify the fix.
+
 ## 6. Review checklist
 
 - Is the change in the correct crate?
@@ -85,6 +97,7 @@ This prevents hours of debugging the wrong layer. A black screenshot can mean th
 - Does it change a public contract or a generated asset?
 - Are both codecs still supported?
 - Did the docs and measurements get updated?
+- Does any visible state change (position + size + content) land in a single commit call?
 - Is there a rollback path?
 
 ## 7. Ten rules
@@ -104,5 +117,6 @@ This prevents hours of debugging the wrong layer. A black screenshot can mean th
 
 - Explain the three evidence levels.
 - Turn a bug report into a regression test.
+- Explain why moving a window before replacing its layered content can flash.
 - Measure RSS/CPU without mixing package formats.
 - Review a change for architecture, tests, errors, and documentation.

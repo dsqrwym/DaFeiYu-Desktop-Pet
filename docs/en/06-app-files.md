@@ -106,7 +106,7 @@ Mouse-follow turning, click-to-walk, typing integration, sleep, and physics are 
 
 `on_event` handles mouse down/move/up, right-click, tray events, typing, and timer ticks. A press records the grab offset and preloads `drag`; movement beyond a small threshold starts the drag pose; release either clicks or flings the pet.
 
-`clicked()` wakes a sleeping pet or stimulates `Brain`. `stimulate` picks a click-response clip for the current mood. `play` resets the frame, loop span, dissolve, walk, and sleep cycle, then places the window before drawing.
+`clicked()` wakes a sleeping pet or stimulates `Brain`. `stimulate` picks a click-response clip for the current mood. `play` resets the frame, loop span, dissolve, walk, and sleep cycle, then hands the next window position to `draw_frame` through `pending_dst`, so position, size, and pixels are committed by one `UpdateLayeredWindow` instead of moving first and painting afterwards.
 
 ## 7. `advance_frame`: the easiest place to introduce bugs
 
@@ -154,4 +154,5 @@ The screen-pixel check can fail on a non-composited desktop (for example, a remo
 - Explain why `anims` is bounded.
 - Explain how `ensure_loaded` selects a codec.
 - Explain why `play` resets loop span, dissolve, walk, and sleep state.
+- Explain why a clip switch stages the window position instead of calling `SetWindowPos` first.
 - Explain why the self-test needs a real desktop.
