@@ -32,7 +32,7 @@ The upstream source is 106 VP9 webm clips. Playing them directly would require l
 - **Production:** H.264 color in `.fishvid` plus a 1-bit alpha `.fishmask`; about 98MB for 100 clips.
 - **Legacy:** `.fishanim` with premultiplied BGRA + zstd; about 654MB for 100 clips, kept for compatibility and comparison.
 
-Both are packed from 100 clips composited on black. Edges and translucent effects need an alpha channel the source does not have, so `pack-anim --preview` also reads the preview GIFs the upstream ships (straight colour on 1-bit transparency) and solves `a = |C| / |F|` per pixel. That is why the numbers above are larger than the first release: brighter translucent pixels cost bitrate. The v0.1.1 packages predate this pass.
+Both are packed from 100 clips composited on black. Edges and translucent effects need an alpha channel the source does not have, so `pack-anim --preview` also reads the preview GIFs the upstream ships (straight colour on 1-bit transparency) and solves `a = |C| / |F|` per pixel. That is why the numbers above are larger than the first release: brighter translucent pixels cost bitrate. v0.1.1 is the first release built this way.
 
 H.264 color is decoded by Windows Media Foundation. Alpha is not encoded into the video; it is stored separately at 1 bit per pixel, so transparent edges are not blurred by lossy compression. There is still no third-party decoder dependency.
 
@@ -56,13 +56,13 @@ A fresh clone therefore cannot be launched by double-clicking an executable. Dow
 
 Rust is not required. Download a **v0.1.1 package**:
 
-- [feiyu-h264-v0.1.1.zip](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/download/v0.1.1/feiyu-h264-v0.1.1.zip) — 79.95MB, recommended
-- [feiyu-fishanim-v0.1.1.zip](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/download/v0.1.1/feiyu-fishanim-v0.1.1.zip) — 625.70MB, legacy
+- [feiyu-h264-v0.1.1.zip](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/download/v0.1.1/feiyu-h264-v0.1.1.zip) — 98.45MB, recommended
+- [feiyu-fishanim-v0.1.1.zip](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/download/v0.1.1/feiyu-fishanim-v0.1.1.zip) — 655.36MB, legacy
 - [Release page](https://github.com/dsqrwym/DaFeiYu-Desktop-Pet/releases/tag/v0.1.1)
 
 Both packages are attachments of the same `v0.1.1` Release. Prefer H.264 unless you specifically need lower runtime memory or the machine lacks the Media Foundation H.264 decoder.
 
-v0.1.1 repacks the same 100 clips with a new matte pass. The source webm is composited on black, and the old keying gave every non-background pixel full opacity, which left a dark rim around the sprite and solid dark blobs where a translucent effect (bubbles, smoke, sparks) should be soft. Edge bands now get a fractional alpha solved from the inward neighbor, and the H.264 color plane stores straight instead of premultiplied color. See `docs/07` for the algorithm and its known limit.
+v0.1.1 repacks the same 100 clips with a two-source matte: the webm is composited on black, the upstream preview GIFs carry straight colour, and `a = |C| / |F|` is solved per pixel. The dark rim around the sprite and the solid dark blobs where translucent effects (bubbles, smoke, sparks) should be soft are gone. This release also adds the trilingual menu (Chinese / English / Spanish) and remembers the menu toggles in `config.json`.
 
 After extracting the zip, enter `feiyu/`:
 
@@ -93,30 +93,30 @@ Get-FileHash .\feiyu-h264-v0.1.1.zip -Algorithm SHA256
 SHA256 (the GitHub Release asset digest matches the locally built file):
 
 ```text
-429F62E262DCDEF684DB05D3E7E98FE37B7133BB7C01310411930B76A95B3304
+DECEF1349067B85920B256D2FDD53E45A58D95647217CCCB31BDD1B9AE34DFB7
 ```
 
 Legacy `.fishanim` package SHA256:
 
 ```text
-764BEF44E5E0DE2619EB849E505003C3867C2C882810AD630E708E546F358BB3
+89BA19223F6B3F0167B05F3B598F7C5DD7C28A48B95B0BCFDDCB1D895B7DF6B5
 ```
 
 ### Which package should I choose?
 
 | | H.264 (recommended) | `.fishanim` legacy |
 |---|---:|---:|
-| zip / extracted | **79.95MB / 80.8MB** | **625.70MB / 626.4MB** |
-| Visible RSS | 77.2MB | **10.5MB** |
-| Visible private memory | 65.2MB | **2.4MB** |
-| Threads | 53 | **4** |
-| Visible CPU | about 5%–7.5% of one core | **0.3%–2.8% of one core** |
+| zip / extracted | **98.45MB / 99.4MB** | **655.36MB / 656.1MB** |
+| Visible RSS | 82.7MB | **10.5MB** |
+| Visible private memory | 72.2MB | **2.4MB** |
+| Threads | 52 | **4** |
+| Visible CPU | about 8%–12% of one core | **0.3%–2.8% of one core** |
 | Decoder dependency | Windows Media Foundation H.264 | **No video decoder** |
 | Random access | Media Foundation seek | **Direct diff-chain recomputation** |
 | Image path | H.264 yuv420p + 1-bit alpha | **Premultiplied BGRA + zstd, full alpha** |
 | Best for | Most users; smaller download | Memory-sensitive machines, older systems, lower runtime overhead |
 
-Both packages contain 100 animations and pass `--selftest` at **94/94**. H.264 reduces the download by roughly 8×, but Media Foundation creates its own thread pool and internal buffers, so memory, thread count, and CPU are higher. This is not a leak: hidden-state CPU is 0%. If runtime resources matter more than download size, choose `.fishanim`.
+Both packages contain 100 animations and pass `--selftest` at **99/99**. H.264 reduces the download by roughly 7×, but Media Foundation creates its own thread pool and internal buffers, so memory, thread count, and CPU are higher. This is not a leak: hidden-state CPU is 0%. If runtime resources matter more than download size, choose `.fishanim`.
 
 ## Configuration
 
@@ -168,22 +168,22 @@ powershell -ExecutionPolicy Bypass -File tools/package.ps1 -AnimDir assets/h264
 |---|---|---|
 | Runtime | DSH plugin: browser overlay or Electron transparent window | Native Win32 layered window |
 | Dependencies | DSH + Node; about 104MB Electron download for desktop mode | No third-party runtime; H.264 uses Windows Media Foundation |
-| Disk | webm 51.8MB + about 104MB Electron download | **80.8MB** (H.264 + mask + two executables); legacy `.fishanim` package 626.4MB |
-| Memory | Not measured on this machine | H.264: 77.2MB RSS / 65.2MB private / 53 threads; legacy: 10.5MB / 2.4MB / 4 threads |
-| CPU | Not measured | H.264: about 5%–7.5% of one core (0.4%–0.6% of a 12-core machine); legacy: 0.3%–2.8% of one core |
+| Disk | webm 51.8MB + about 104MB Electron download | **99.4MB** (H.264 + mask + two executables); legacy `.fishanim` package 656.1MB |
+| Memory | Not measured on this machine | H.264: 82.7MB RSS / 72.2MB private / 52 threads; legacy: 10.5MB / 2.4MB / 4 threads |
+| CPU | Not measured | H.264: about 8%–12% of one core (0.7%–1.0% of a 12-core machine); legacy: 0.3%–2.8% of one core |
 | Frame cost | — | H.264: about 0.24ms (decode + mask); legacy `.fishanim`: 0.265ms |
 
-Disk usage is now in the same range as the original (81MB vs 51.8MB of webm plus about 104MB of Electron). The 626MB legacy package is kept for comparison; its advantage is that it does not depend on Media Foundation and has direct frame access.
+Disk usage is now in the same range as the original (99MB vs 51.8MB of webm plus about 104MB of Electron). The 656MB legacy package is kept for comparison; its advantage is that it does not depend on Media Foundation and has direct frame access.
 
 ### H.264 package measurements (kept separate from the legacy numbers)
 
-Measured with the packaged `feiyu.exe --run 45`, a 5-second warm-up, and a 30-second sampling window (v0.1.1 package):
+Measured with the packaged `feiyu.exe --run 45`, a 5-second warm-up, and a 30-second sampling window (v0.1.1 package, three runs):
 
-- Visible: RSS **77.2MB**, private **65.2MB**, **53 threads**, CPU **4.9%–7.5% of one core** (0.4%–0.6% of a 12-core machine) across three runs.
-- Hidden: RSS **39.6MB**, private **21.9MB**, 19 threads, CPU **0%**.
+- Visible: RSS **76.9–86.2MB** (median 82.7), private **65.2–76.1MB**, **52–53 threads**, CPU **8.0%–12.1% of one core** (0.7%–1.0% of a 12-core machine).
+- Hidden: RSS **39.6MB**, private **22.4MB**, 19 threads, CPU **0%**.
 - Full `--showcase`: **100/100 clips**, exit code 0, **16.7 minutes** wall-clock.
 
-The H.264 package uses about 7× the memory and many more threads than the legacy package. That is the cost of the Media Foundation decoder and its thread pool. CPU drops to 0.4%–0.6% of the whole 12-core machine, but the single-core reading is genuinely higher. The legacy figures (10.5MB / 4 threads / 0.3%–2.8%) are a separate measurement and must not be averaged with these numbers.
+The H.264 package uses about 8× the memory and many more threads than the legacy package. That is the cost of the Media Foundation decoder and its thread pool. CPU drops to 0.7%–1.0% of the whole 12-core machine, but the single-core reading is genuinely higher. The legacy figures (10.5MB / 4 threads / 0.3%–2.8%) are a separate measurement and must not be averaged with these numbers.
 
 CPU varies because DWM can skip composition when the window is occluded. Historical 60-second samples for the legacy package were 1.4%–1.7% of one core.
 
@@ -198,12 +198,12 @@ CPU varies because DWM can skip composition when the window is occluded. Histori
 
 ```powershell
 # Extracted release package
-.\feiyu-cli.exe --selftest # 94 checks
+.\feiyu-cli.exe --selftest # 99 checks
 .\feiyu-cli.exe --showcase # 100/100, about 16.7 minutes
 
 # Source build
-cargo test --workspace --release          # 115 tests
-.\target\release\feiyu-cli.exe --selftest # 94 checks
+cargo test --workspace --release          # 126 tests
+.\target\release\feiyu-cli.exe --selftest # 99 checks
 ```
 
 `selftest` opens a real window, submits real bitmaps, and captures the screen; it covers transparency, hit testing, menu structure, the tray, baseline alignment, sleep spans, and typing integration. `cargo test` covers pure logic only.
