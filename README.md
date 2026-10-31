@@ -29,8 +29,10 @@ dsh-pet is a DSH plugin whose balance, whisper, and work-state animations depend
 
 The upstream source is 106 VP9 webm clips. Playing them directly would require libvpx, slow startup, and a larger release. This project has its own packer and supports two output formats:
 
-- **Production:** H.264 color in `.fishvid` plus a 1-bit alpha `.fishmask`; about 79MB for 100 clips.
-- **Legacy:** `.fishanim` with premultiplied BGRA + zstd; about 625MB for 100 clips, kept for compatibility and comparison.
+- **Production:** H.264 color in `.fishvid` plus a 1-bit alpha `.fishmask`; about 98MB for 100 clips.
+- **Legacy:** `.fishanim` with premultiplied BGRA + zstd; about 654MB for 100 clips, kept for compatibility and comparison.
+
+Both are packed from 100 clips composited on black. Edges and translucent effects need an alpha channel the source does not have, so `pack-anim --preview` also reads the preview GIFs the upstream ships (straight colour on 1-bit transparency) and solves `a = |C| / |F|` per pixel. That is why the numbers above are larger than the first release: brighter translucent pixels cost bitrate. The v0.1.1 packages predate this pass.
 
 H.264 color is decoded by Windows Media Foundation. Alpha is not encoded into the video; it is stored separately at 1 bit per pixel, so transparent edges are not blurred by lossy compression. There is still no third-party decoder dependency.
 
@@ -142,10 +144,10 @@ cd DaFeiYu-Desktop-Pet
 powershell -ExecutionPolicy Bypass -File tools/fetch-assets.ps1
 
 # Production format: H.264 + 1-bit mask
-cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20 --preview _upstream/dsh-pet/dsh-pet/assets/preview
 
 # Legacy format (optional, for compatibility/comparison)
-cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim --preview _upstream/dsh-pet/dsh-pet/assets/preview
 
 cargo run -p feiyu-app --release
 ```

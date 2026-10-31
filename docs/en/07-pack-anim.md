@@ -56,7 +56,34 @@ The source is a black-composited video with no alpha, so `C = F × a`: colors ar
 
 `extract` also returns straight color (`F = C × 255 / a`). `.fishanim` keeps the premultiplied pixels; the H.264 color plane must be straight, because a 1-bit mask drawn over premultiplied color is exactly the black rim.
 
-Known limitation: a large translucent effect that is attached to the sprite (fireworks smoke) cannot be separated from art that is simply painted dark. It still reads as a dark patch. No automatic fix exists for a black matte.
+Known limitation: a large translucent effect that is attached to the sprite (fireworks smoke) cannot be separated from art that is simply painted dark. A single frame of a black matte cannot tell them apart — **step 3.5 solves that with a second matte.**
+
+### 3.5 Two-source unmixing: straight colour from the preview GIFs
+
+The upstream repo also ships `assets/preview/*.gif` (106 files, 220×124, 12fps). They show the same character over the same timeline, **with 1-bit transparency and straight colour**. Two mattes close the equation:
+
+```text
+a = |C| / |F|     C from the webm (premultiplied on black), F from the GIF (straight)
+```
+
+With `--preview <dir>` (`preview.rs`):
+
+1. **Pairing**: the GIF names are pinyin (`fang-yanhua.gif`) and do not match our slugs, so the packer matches first frames: shrink the webm frame to 220×124 and compare it against every GIF first frame (composited on black) by MSE. Correct pairs score 2–3 thousand, wrong ones usually exceed ten thousand; anything above 9000 counts as “no preview” and falls back to 3.4.
+2. **Sampling**: 12fps GIF versus 24fps webm, so frame index is halved; past the end the last frame is reused. The GIF is upscaled with `premultiply` first, so transparent white never bleeds into the edge.
+3. **Solving**: `a = max(C) / max(F)`; only pixels below 0.88 become candidates, and candidates are then filtered by connected area (≥ 40 px) to drop palette noise. The silhouette band (`edge`) skips that filter — that band is anti-aliasing, and thin arcs or smoke wisps would otherwise be erased down to black dots.
+4. **Pixels the GIF dropped**: the preview only has 1-bit alpha, so translucent smoke is simply transparent there. Those pixels borrow the nearest opaque preview colour as `F` (BFS fill); otherwise they could only ever be black.
+
+Output: `.fishanim` only changes alpha (colours stay premultiplied); the H.264 colour plane is recomputed with straight colour only where the mask keeps the pixel (`a ≥ 128`) — brightening masked-out pixels just burns bitrate.
+
+Alpha is quantised to 5 bits (32 levels): the solved alpha is a smooth ramp, per-pixel differences are invisible, and they shatter zstd matches (worth 4.5% on `.fishanim`).
+
+Each clip also prints a metric line:
+
+```text
+preview fang-yanhua.gif   solved  8.1%  dark  4.0% →  1.1%
+```
+
+`solved` is the share of pixels the second matte changed; `dark` is the share of “opaque and very dark” pixels (before → after), i.e. the direct measure of rims and blobs.
 
 ## 4. Quantization: `mask::quantize`
 
@@ -104,7 +131,7 @@ The manifest records:
 ```powershell
 cargo run -p pack-anim --release -- `
   --src _upstream/dsh-pet/dsh-pet/assets/webm `
-  --out assets/h264 --codec h264 --crf 20
+  --out assets/h264 --codec h264 --crf 20 --preview _upstream/dsh-pet/dsh-pet/assets/preview
 ```
 
 For each clip:
@@ -115,7 +142,13 @@ For each clip:
 
 The encoder writes `-framerate <fps> -r <fps>` explicitly. Without it, ffmpeg defaults rawvideo to 25fps while the manifest says 24fps, and seeking to the last frame hits EOS too early. This bug was found during the prototype.
 
-Color dimensions are padded to even width/height; the decoder crops back to the manifest size. CRF20 produces about 79.2MB of assets for 100 clips (69.5MB before straight color and edge dilation), or about 81MB in the packaged release.
+Color dimensions are padded to even width/height; the decoder crops back to the manifest size. CRF20 over 100 clips measures:
+
+- old keying 69.5MB;
+- edge band + straight colour 79.2MB;
+- **two-source unmixing (`--preview`) 97.7MB** — translucent areas get brighter, which costs bitrate; CRF22 or a 4-bit mask could win it back later.
+
+`.fishanim` goes 581.6 / 624.7 / **654.3MB** for the same three steps (after alpha quantisation).
 
 ## 7. Chinese name → file name
 
@@ -135,16 +168,19 @@ Color dimensions are padded to even width/height; the decoder crops back to the 
 
 ```powershell
 # Legacy format
-cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim --preview _upstream/dsh-pet/dsh-pet/assets/preview
 
 # Production H.264 format
-cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20 --preview _upstream/dsh-pet/dsh-pet/assets/preview
 
 # Legacy verification: decode forward and reverse, check the delta chain
 cargo run -p pack-anim --release -- --verify assets/anim
 ```
 
 `--dump <n>` exports a PNG every n frames on a checkerboard background for visual inspection.
+
+To judge transparency, `feiyu-cli --dump <id> <dir> <step> --dump-bg RRGGBB` writes the same frame
+on white, mid-grey and black; the black one should match the original webm almost exactly.
 
 ## 9. Adding an animation
 

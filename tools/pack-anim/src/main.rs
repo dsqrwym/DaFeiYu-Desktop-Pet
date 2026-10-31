@@ -15,6 +15,7 @@
 
 mod decode;
 mod mask;
+mod preview;
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -168,6 +169,8 @@ struct Opts {
     ffmpeg: String,
     ffprobe: String,
     limit: Option<usize>,
+    /// 预览 GIF 目录（可选）：给黑底素材补一份直通色，解出真正的半透明。
+    preview: Option<PathBuf>,
     /// 只对目录内的 `.fishanim` 做自检，不打包。
     verify: Option<PathBuf>,
 }
@@ -214,6 +217,7 @@ impl Default for Opts {
             ffmpeg: "ffmpeg".to_string(),
             ffprobe: "ffprobe".to_string(),
             limit: None,
+            preview: None,
             verify: None,
         }
     }
@@ -238,6 +242,14 @@ struct Row {
     origin: (u32, u32),
     /// 原画布尺寸（未裁切）。
     canvas: (u32, u32),
+    /// 配对的预览 GIF（没配到就是空）。
+    preview: String,
+    /// 被双源解混改成半透明的像素占比（%）。
+    solved_pct: f32,
+    /// 「不透明且很暗」的像素占比（%）：黑块/黑边的量化指标。
+    /// `dark_pct` 是解混后的，`dark_before_pct` 是解混前的（两者对比就是收益）。
+    dark_pct: f32,
+    dark_before_pct: f32,
 }
 fn main() -> ExitCode {
     match run() {
@@ -282,8 +294,19 @@ fn run() -> Result<()> {
     );
 
     let mut rows = Vec::with_capacity(jobs.len());
+    // 预览库只用扫一次（106 个 GIF，每个解一帧）；没给 --preview 就是空表，
+    // 后面自动退回单帧抠像，不会报错。
+    let previews = match &opts.preview {
+        Some(dir) => {
+            let list = preview::scan(&opts.ffmpeg, dir)
+                .with_context(|| format!("扫预览目录失败：{}", dir.display()))?;
+            println!("预览库：{} 个 GIF（{}）\n", list.len(), dir.display());
+            list
+        }
+        None => Vec::new(),
+    };
     for (path, slug, name) in jobs {
-        let row = pack_one(&opts, &path, &slug, &name)?;
+        let row = pack_one(&opts, &previews, &path, &slug, &name)?;
         print_row(&row);
         rows.push(row);
     }
@@ -316,6 +339,7 @@ fn parse_args() -> Result<Opts> {
             "--ffmpeg" => opts.ffmpeg = value()?,
             "--ffprobe" => opts.ffprobe = value()?,
             "--limit" => opts.limit = Some(value()?.parse().context("--limit 需要正整数")?),
+            "--preview" => opts.preview = Some(PathBuf::from(value()?)),
             "--verify" => opts.verify = Some(PathBuf::from(value()?)),
             "-h" | "--help" => {
                 print_help();
@@ -354,6 +378,7 @@ fn print_help() {
          \x20 --rim <0-255>      边缘过渡带宽度，0 = 硬边（默认 2）\n\
          \x20 --quant <0-7>      砍掉色彩通道低 n 位（0 = 不量化，默认 3）\n\
          \x20 --ffmpeg/--ffprobe 可执行文件路径\n\
+         \x20 --preview <目录>  预览 GIF 目录：补一份直通色，解出半透明（可选）\n\
          \x20 --limit <n>        只处理前 n 个（调试用）\n\
          \x20 --verify <目录>    只做自检：逐个解帧、校验差分链一致性"
     );
@@ -403,7 +428,13 @@ fn collect(opts: &Opts) -> Result<Vec<(PathBuf, String, String)>> {
     Ok(jobs)
 }
 
-fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
+fn pack_one(
+    opts: &Opts,
+    previews: &[preview::Candidate],
+    src: &Path,
+    slug: &str,
+    name: &str,
+) -> Result<Row> {
     let started = Instant::now();
     let (src_w, src_h) = decode::probe_size(&opts.ffprobe, src)?;
     let height = opts.height;
@@ -426,6 +457,15 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
     let mut opaque_min = u32::MAX;
     let mut opaque_max = 0u32;
     let mut idx = 0u32;
+    // 双源解混：首帧匹配一个预览 GIF，之后逐帧拿直通色。
+    let mut preview_stream: Option<preview::Stream> = None;
+    let mut preview_label = String::new();
+    let mut preview_buf: Vec<u8> = Vec::new();
+    let mut solved_px: u64 = 0;
+    let mut dark_sum: u64 = 0;
+    let mut dark_before_sum: u64 = 0;
+    let mut opaque_sum: u64 = 0;
+    let solve_opts = preview::Solve::default();
 
     let mix_params = mask::Params {
         thresh: opts.thresh,
@@ -434,8 +474,65 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
     };
 
     while source.next_frame(&mut buf)? {
-        let ex = mask::extract(&buf, w, h, &mix_params);
+        let mut ex = mask::extract(&buf, w, h, &mix_params);
+        dark_before_sum += count_dark(&ex.alpha, &buf, w, h);
+
+        // 首帧配对预览：把 webm 首帧缩到 220×124，与每个 GIF 首帧比 MSE。
+        // 阈值 9000 是按实测定的：正确配对在 2~3 千，错配普遍过万。
+        if idx == 0 && !previews.is_empty() {
+            let small = preview::shrink(&buf, w, h);
+            match preview::best_match(previews, &small) {
+                Some((i, mse)) if mse < 9000.0 => {
+                    let file = previews[i].file.clone();
+                    preview_label = file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    preview_stream = Some(preview::Stream::spawn(&opts.ffmpeg, &file, w, h)?);
+                    if std::env::var_os("FEIYU_PACK_TRACE").is_some() {
+                        eprintln!("{slug}: 预览 → {preview_label}（mse {mse:.0}）");
+                    }
+                }
+                Some((_, mse)) => {
+                    preview_label = format!("无匹配（mse {mse:.0}）");
+                    eprintln!("{slug}: 预览匹配不可信（mse {mse:.0}），只用单帧抠像");
+                }
+                None => {}
+            }
+        }
+        // 24fps 的 webm ↔ 12fps 的 GIF：帧号除 2；尾部不够时沿用最后一帧。
+        if let Some(stream) = preview_stream.as_mut() {
+            stream.frame_at((idx / 2) as usize, &mut preview_buf)?;
+            solved_px += preview::solve(
+                &preview_buf,
+                &buf,
+                &mut ex.alpha,
+                &mut ex.straight,
+                &ex.edge,
+                w,
+                h,
+                &solve_opts,
+            ) as u64;
+        }
         let alpha = ex.alpha;
+        dark_sum += count_dark(&alpha, &buf, w, h);
+        // alpha 量化到 5 位（32 级）：双源解混出来的 alpha 是平滑渐变，
+        // 逐像素的不同数值对肉眼无意义，却把 zstd 的匹配长度打碎了。
+        // 0 与 255 保持原值（背景/实心）。
+        let alpha = if opts.quant > 0 {
+            alpha
+                .into_iter()
+                .map(|a| {
+                    if a == 0 || a == 255 {
+                        a
+                    } else {
+                        (((u32::from(a) + 4) / 8) * 8).min(252) as u8
+                    }
+                })
+                .collect::<Vec<u8>>()
+        } else {
+            alpha
+        };
         // `.fishanim` 存**预乘**色（原值 + alpha）。H.264 只有颜色通道，
         // 必须存**直通**色：1-bit 掩码配上预乘色就是一圈黑边。
         let mut frame = match opts.codec {
@@ -472,6 +569,7 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
         }
         opaque_min = opaque_min.min(opaque);
         opaque_max = opaque_max.max(opaque);
+        opaque_sum += u64::from(opaque);
 
         if opts.dump > 0 && idx % opts.dump == 0 {
             let mut preview = frame.clone();
@@ -572,7 +670,35 @@ fn pack_one(opts: &Opts, src: &Path, slug: &str, name: &str) -> Result<Row> {
         opaque: (opaque_min, opaque_max),
         origin: (origin_x, origin_y),
         canvas: (width, height),
+        preview: preview_label,
+        solved_pct: pct(solved_px, opaque_sum),
+        dark_pct: pct(dark_sum, opaque_sum),
+        dark_before_pct: pct(dark_before_sum, opaque_sum),
     })
+}
+
+/// 「不透明且很暗」的像素数：黑边/黑块的量化指标。
+fn count_dark(alpha: &[u8], color: &[u8], w: usize, h: usize) -> u64 {
+    let mut dark = 0u64;
+    for (i, a) in alpha.iter().enumerate().take(w * h) {
+        if *a < 230 {
+            continue;
+        }
+        let o = i * 4;
+        if color[o].max(color[o + 1]).max(color[o + 2]) <= 40 {
+            dark += 1;
+        }
+    }
+    dark
+}
+
+/// 占比（%）；分母为 0 时返回 0。
+fn pct(part: u64, whole: u64) -> f32 {
+    if whole == 0 {
+        0.0
+    } else {
+        (part as f32) * 100.0 / (whole as f32)
+    }
 }
 
 /// H.264 颜色 + 1-bit 掩码：颜色走 ffmpeg/libx264，掩码由 core 的 MaskSet 写成。
@@ -745,6 +871,15 @@ fn print_row(row: &Row) {
         row.bbox.3,
         row.opaque.0,
         row.opaque.1
+    );
+    let preview = if row.preview.is_empty() {
+        "—"
+    } else {
+        row.preview.as_str()
+    };
+    println!(
+        "  {:<12} 预览 {:<28} 解混 {:>4.1}%  暗块 {:>4.1}% → {:>4.1}%",
+        "", preview, row.solved_pct, row.dark_before_pct, row.dark_pct
     );
 }
 

@@ -69,7 +69,7 @@ fn run() -> Result<()> {
         return list_anims(&dir, &cfg);
     }
     if let Some((id, out_dir, step)) = &args.dump {
-        return dump_frames(&dir, id, out_dir, *step);
+        return dump_frames(&dir, id, out_dir, *step, args.dump_bg);
     }
     run_pet(args, dir, cfg, cfg_path)
 }
@@ -122,6 +122,8 @@ struct Args {
     fling: Option<(f32, f32)>,
     /// 把某段动画按步长导出成 BMP（判读素材内容用）。
     dump: Option<(String, PathBuf, u32)>,
+    /// `--dump-bg RRGGBB`：导帧时垫的底色（默认白）。黑/白/中灰三底对比用。
+    dump_bg: [u8; 3],
     list: bool,
     selftest: bool,
     /// 打印动画切换日志。
@@ -153,6 +155,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         sleep_after: None,
         fling: None,
         dump: None,
+        dump_bg: [255, 255, 255],
         list: false,
         selftest: false,
         verbose: false,
@@ -249,6 +252,10 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                     .parse()
                     .context("--dump 步长需要整数")?;
                 out.dump = Some((id, out_dir, step));
+            }
+            "--dump-bg" => {
+                let text = it.next().context("--dump-bg 缺少 RRGGBB")?;
+                out.dump_bg = parse_rgb(text).context("--dump-bg 需要 RRGGBB")?;
             }
             "--sleep-after" => {
                 out.sleep_after = Some(
@@ -356,7 +363,8 @@ fn print_help() {
          \x20 --dir <目录>      素材目录（含 manifest.json，默认优先 assets/h264，回退 assets/anim）\n\
          \x20 --config <路径>   配置文件（默认找 exe 旁边或 CWD 的 config.json）\n\
          \x20 --anim <id>       强制只播这一段，忽略状态机\n\
-         \x20 --dump <id> <目录> <步长>  把该段动画每步长帧导一张白底 BMP（判读素材内容用）\n\
+         \x20 --dump <id> <目录> <步长>  把该段动画每步长帧导一张背景 BMP（判读素材内容用）\n\
+         \x20 --dump-bg <RRGGBB>  导帧时垫的底色（默认 FFFFFF）\n\
          \x20 --shot <文件>     跑 0.5 秒后截屏存 BMP 并退出\n\
          \x20 --shots <目录>    每段动画各截一张 BMP 后退出\n\
          \x20 --menu           弹一次右键菜单后退出（验证菜单用）\n\
@@ -454,7 +462,7 @@ fn list_anims(dir: &Path, cfg: &Config) -> Result<()> {
 /// 存在的理由很具体：**素材里到底有什么，只能看帧才知道**。
 /// 判断「睡觉动画哪一段是 Z」「拖拽开头是不是静止」，靠读代码或读时长
 /// 都只能猜；导成图以后一眼就能定。
-fn dump_frames(dir: &Path, id: &str, out_dir: &Path, step: u32) -> Result<()> {
+fn dump_frames(dir: &Path, id: &str, out_dir: &Path, step: u32, bg: [u8; 3]) -> Result<()> {
     let manifest = Manifest::load(dir.join("manifest.json"))
         .with_context(|| format!("读不了素材清单 {}", dir.join("manifest.json").display()))?;
     let entry = manifest.require(id)?.clone();
@@ -470,7 +478,7 @@ fn dump_frames(dir: &Path, id: &str, out_dir: &Path, step: u32) -> Result<()> {
     let mut idx = 0u32;
     while idx < count {
         let pixels = anim.frame(idx)?;
-        let flat = flatten_on_white(pixels);
+        let flat = flatten_on(pixels, bg);
         // 文件名用**连续序号**而不是帧号：ffmpeg 的 `%04d` 序列号模式靠连续编号找图，
         // 而步长导出出来的帧号是 0/6/12…，不连续就拼不了图。
         let path = out_dir.join(format!("{id}_{written:04}.bmp"));
@@ -488,20 +496,34 @@ fn dump_frames(dir: &Path, id: &str, out_dir: &Path, step: u32) -> Result<()> {
     Ok(())
 }
 
-/// 预乘 BGRA → 不透明 BGRA（合成到白底）。
+/// 预乘 BGRA → 不透明 BGRA（合成到指定底色）。
 ///
 /// 直接写预乘像素的话，透明处的值是 0，看图软件又忽略 alpha，
 /// 得到的就是「一张全黑、只有轮廓略亮」的图——正好把要看的东西藏了。
-fn flatten_on_white(src: &[u8]) -> Vec<u8> {
+fn flatten_on(src: &[u8], bg: [u8; 3]) -> Vec<u8> {
     let mut out = src.to_vec();
     for px in out.chunks_exact_mut(4) {
         let a = u32::from(px[3]);
-        for c in &mut px[..3] {
-            *c = (*c as u32 + 255 - a).min(255) as u8;
+        for (c, b) in px[..3].iter_mut().zip(bg) {
+            *c = (*c as u32 + u32::from(b) * (255 - a) / 255).min(255) as u8;
         }
         px[3] = 255;
     }
     out
+}
+
+/// `RRGGBB` → `[r, g, b]`。
+fn parse_rgb(text: &str) -> Result<[u8; 3]> {
+    let text = text.trim_start_matches('#');
+    if text.len() != 6 {
+        bail!("需要 6 位十六进制，收到「{text}」");
+    }
+    let mut out = [0u8; 3];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+            .with_context(|| format!("「{text}」不是十六进制"))?;
+    }
+    Ok(out)
 }
 
 fn run_pet(args: Args, dir: PathBuf, cfg: Config, cfg_path: PathBuf) -> Result<()> {

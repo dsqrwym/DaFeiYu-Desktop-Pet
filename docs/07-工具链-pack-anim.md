@@ -126,8 +126,45 @@ while let Some(idx) = stack.pop() {
 H.264 的颜色通道必须存直通色——1-bit 掩码配上预乘色就是黑边。
 
 已知局限：贴在角色身上、面积很大的半透明烟雾（例如烟花）仍会和“本来画得就深
-的衣服”混在一起，在鱼身上表现为一块暗色区域。黑底合成区分不了这两者，
-没有自动修法。
+的衣服”混在一起，在鱼身上表现为一块暗色区域。单帧黑底区分不了这两者——
+**这一条现在交给 3.5 的双源解混。**
+
+### 3.5 双源解混：用预览 GIF 补一份直通色
+
+上游还带 `assets/preview/*.gif`（106 个，220×124、12fps），画的是同一个角色、
+同一段时间，**带 1-bit 透明且颜色是直通色**。两个底子放在一起，方程就闭合了：
+
+```text
+a = |C| / |F|     C 来自 webm（黑底预乘），F 来自 GIF（直通色）
+```
+
+做法（`preview.rs`，参数 `--preview <目录>`；不给就退回 3.4）：
+
+1. **配对**：文件名是拼音（`fang-yanhua.gif`），和我们的 slug 对不上，所以用首帧
+   图像匹配——webm 首帧缩到 220×124，跟每个 GIF 首帧（合成到黑底）比 MSE。
+   实测正确配对在 2~3 千，错配普遍过万；超过 9000 就当没配到。
+2. **取色**：GIF 12fps、webm 24fps，帧号除 2；尾部不够就沿用最后一帧。
+   放大 GIF 前先 `premultiply`，避免透明像素的白混进边缘。
+3. **解 alpha**：`a = max(C) / max(F)`，低于 0.88 才算候选，再用**面积 ≥ 40 像素**
+   的连通块滤掉调色板噪声；轮廓带（`edge`）不参与面积过滤——那里本来就是
+   抗锯齿，弧线/烟雾边缘又很细，滤一下只剩一圈黑点。
+4. **GIF 抠掉的像素**：预览只有 1-bit alpha，半透明烟雾在 GIF 里干脆是透明的。
+   这些像素用「最近的预览不透明色」当 F（BFS 铺满），否则它们只能是一块黑。
+
+产出：`.fishanim` 只换 alpha（颜色仍是预乘值）；H.264 的直通色只给掩码里
+还看得见的像素（`a ≥ 128`）重算——把被遮住的像素也提亮等于白花码率。
+
+alpha 会量化到 5 位（32 级）：解出来的 alpha 是平滑渐变，逐像素的差别对肉眼
+无意义，却把 zstd 的匹配长度打碎（实测 `.fishanim` 因此小回 4.5%）。
+
+每段多一行量化指标：
+
+```text
+预览 fang-yanhua.gif   解混  8.1%  暗块  4.0% →  1.1%
+```
+
+`解混` 是被双源改掉的像素占比；`暗块` 是「不透明且很暗」的像素占比（前 → 后），
+也就是黑边/黑块的直接度量。
 
 ---
 
@@ -205,7 +242,7 @@ let ground = bottoms.iter().enumerate()
 ```powershell
 cargo run -p pack-anim --release -- `
   --src _upstream/dsh-pet/dsh-pet/assets/webm `
-  --out assets/h264 --codec h264 --crf 20
+  --out assets/h264 --codec h264 --crf 20 --preview _upstream/dsh-pet/dsh-pet/assets/preview
 ```
 
 对每段写出：
@@ -217,8 +254,14 @@ cargo run -p pack-anim --release -- `
 编码命令显式写 `-framerate <fps> -r <fps>`。不写的话 ffmpeg 对 rawvideo 默认 25fps，
 而 manifest 是 24fps，seek 第 240 帧会提前 EOS——原型踩过一次。
 
-颜色尺寸补到偶数宽高；解码端裁回清单里的 `size`。CRF20 全量 100 段实测约 79.2MB
-素材（直通色 + 边缘补色之前是 69.5MB），打包后约 81MB。
+颜色尺寸补到偶数宽高；解码端裁回清单里的 `size`。CRF20 全量 100 段实测：
+
+- 旧抠像 69.5MB；
+- 边缘过渡 + 直通色 79.2MB；
+- **双源解混（`--preview`）97.7MB**——半透明区域的颜色变亮了，码率会涨；
+  后续可以用 CRF22 或 4-bit 掩码换回来。
+
+`.fishanim` 对应三档是 581.6 / 624.7 / **654.3MB**（alpha 量化后）。
 
 ---
 
@@ -243,16 +286,19 @@ cargo run -p pack-anim --release -- `
 
 ```powershell
 # 全量打包（约 3 分钟）
-cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim --preview _upstream/dsh-pet/dsh-pet/assets/preview
 
 # 生产格式：H.264 颜色 + 1-bit 掩码（全量约 2~3 分钟）
-cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20 --preview _upstream/dsh-pet/dsh-pet/assets/preview
 
 # 只自检（fishanim）：逐个解帧、倒序重取一遍，确认差分链从任意位置重算都一致
 cargo run -p pack-anim --release -- --verify assets/anim
 ```
 
 `--dump <n>` 每隔 n 帧导一张 PNG（棋盘底），用来肉眼抽检。
+
+要看出「透明对不对」，用 `feiyu-cli --dump <id> <目录> <步长> --dump-bg RRGGBB`
+把同一帧分别导到白底 / 中灰 / 黑底上对比；黑底应当与原始 webm 几乎一致。
 
 ---
 

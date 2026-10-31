@@ -29,8 +29,10 @@ dsh-pet 是 DSH 的插件，余额、碎碎念、工作状态原本都靠 DSH �
 
 上游给的是 106 段 VP9 的 webm。直接播要带 libvpx，启动慢、发版也大，所以我自己写打包器。现在有两种产物：
 
-- **生产格式**：H.264 颜色 `.fishvid` + 1-bit alpha `.fishmask`，100 段约 79MB；
-- **旧格式**：`.fishanim`，预乘 BGRA + zstd，100 段约 625MB，保留兼容和对照。
+- **生产格式**：H.264 颜色 `.fishvid` + 1-bit alpha `.fishmask`，100 段约 98MB；
+- **旧格式**：`.fishanim`，预乘 BGRA + zstd，100 段约 654MB，保留兼容和对照。
+
+两包都从“角色合在纯黑上”的源视频打包。边缘和半透明特效需要 alpha，而源视频没有，所以 `pack-anim --preview` 会再读上游带的预览 GIF（直通色 + 1-bit 透明），逐像素解 `a = |C| / |F|`。上面两行比首个版本大，原因就在这里：半透明区域变亮是要花码率的。v0.1.1 的发布包早于这遍处理。
 
 H.264 颜色由 Media Foundation 解码，alpha 不交给视频编码，单独存 1 bit/像素，所以透明边缘没有被有损压缩糊掉。运行时仍然没有第三方解码器依赖。
 
@@ -141,9 +143,9 @@ git clone https://github.com/dsqrwym/DaFeiYu-Desktop-Pet.git
 cd DaFeiYu-Desktop-Pet
 powershell -ExecutionPolicy Bypass -File tools/fetch-assets.ps1
 # 生产格式：H.264 + 1-bit 掩码
-cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/h264 --codec h264 --crf 20 --preview _upstream/dsh-pet/dsh-pet/assets/preview
 # 旧格式（可选，保留兼容/对照）
-cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim
+cargo run -p pack-anim --release -- --src _upstream/dsh-pet/dsh-pet/assets/webm --out assets/anim --preview _upstream/dsh-pet/dsh-pet/assets/preview
 cargo run -p feiyu-app --release
 ```
 

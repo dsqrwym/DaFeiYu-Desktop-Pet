@@ -67,6 +67,11 @@ pub struct Extraction {
     /// 逐像素**直通**颜色（`width × height × 4`，RGBA）。H.264 编码用它：
     /// 半透明像素的颜色已经按 `a` 反预乘回来了，配上 1-bit 掩码就不会发黑。
     pub straight: Vec<u8>,
+    /// 逐像素标记：是否落在轮廓的 `rim` 过渡带里。
+    ///
+    /// 双源解混只接管「内部」的 alpha；轮廓这几像素还是全分辨率算得准，
+    /// 预览 GIF 只有 220×124，拿来管边缘会发糊。
+    pub edge: Vec<bool>,
 }
 
 struct Comp {
@@ -97,8 +102,13 @@ pub fn extract(rgba: &[u8], width: usize, height: usize, p: &Params) -> Extracti
 
     let mut alpha = vec![0u8; n];
     let mut straight = vec![0u8; n * 4];
+    let mut edge = vec![false; n];
     if n == 0 {
-        return Extraction { alpha, straight };
+        return Extraction {
+            alpha,
+            straight,
+            edge,
+        };
     }
 
     let bg = background_mask(rgba, width, height, p.thresh);
@@ -151,6 +161,7 @@ pub fn extract(rgba: &[u8], width: usize, height: usize, p: &Params) -> Extracti
             if !touches_bg {
                 continue;
             }
+            edge[i] = true;
             // 里侧最亮的邻居：它的直通色就是这一像素本该有的颜色。
             let mut best: Option<usize> = None;
             let mut best_lum = 0u8;
@@ -206,7 +217,11 @@ pub fn extract(rgba: &[u8], width: usize, height: usize, p: &Params) -> Extracti
         }
     }
 
-    Extraction { alpha, straight }
+    Extraction {
+        alpha,
+        straight,
+        edge,
+    }
 }
 
 /// 从四条边泛洪：只有连通到边框的暗区才是背景。
