@@ -12,9 +12,9 @@ A Windows desktop pet featuring the community fan character **DaFeiYu** (大肥�
 
 ## Demo
 
-<p align="center"><img src="docs/images/demo.gif" width="320" alt="DaFeiYu on the desktop: idle, click response, eating, animal companions, work animation, sleep"></p>
+<p align="center"><img src="docs/images/demo.gif" width="320" alt="DaFeiYu on the desktop: idle, click response, eating watermelon, animal companions, fireworks, bubbles, work animation, sleep"></p>
 
-Six clips from a release build of this repository, recorded on a real Windows desktop and cut together: idle, click response, eating, animal companions, the work animation (normally triggered while you type), and sleep. The plain background is a full-screen window placed behind the pet while recording, so no desktop content ends up in the frame.
+Eight clips from a release build of this repository, recorded on a real Windows desktop and cut together: idle, click response, eating watermelon, animal companions, fireworks, bubbles, the work animation (normally triggered while you type), and sleep. The plain background is a full-screen window placed behind the pet while recording, so no desktop content ends up in the frame.
 
 ## Upstream projects
 
