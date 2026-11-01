@@ -109,8 +109,19 @@ impl FrameSource for VideoSource {
             width,
             height,
         } = self;
-        let color = video.frame(idx)?;
-        let bits = mask.frame_bits(idx)?;
+        // 先解码，再按**实际**拿到的帧号取掩码：seek 只能拿到「目标或之后最近
+        // 的一帧」，用请求号配掩码就会得到「掩码是新的、颜色还停在角色移开前」
+        // 的错位帧——掩码标不透明的地方颜色是黑底，屏幕上就是一团黑阴影。
+        video.frame(idx)?;
+        let got = video
+            .current()
+            .unwrap_or(idx)
+            .min(mask.frame_count().saturating_sub(1));
+        if got != idx && std::env::var_os("FEIYU_VIDEO_TRACE").is_some() {
+            eprintln!("视频错位：请求第 {idx} 帧，实际第 {got} 帧");
+        }
+        let color = video.frame(got)?;
+        let bits = mask.frame_bits(got)?;
         let pixels = *width as usize * *height as usize;
         ensure!(color.len() >= pixels * 4, "视频帧长度不足");
         for i in 0..pixels {

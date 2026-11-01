@@ -155,7 +155,7 @@ fn main() -> Result<()> {
             compare(&bgra, &reference, &mut stats, args.color_w, args.color_h)?;
         }
 
-        if idx == 0 || idx == 60 || idx == 120 || idx == 180 || idx == 240 {
+        if idx % args.every == 0 {
             write_samples(
                 &bgra,
                 &reference,
@@ -942,6 +942,8 @@ struct Args {
     mask_out: Option<PathBuf>,
     enc_out: Option<PathBuf>,
     dilate: u32,
+    /// 每多少帧写一组样张（默认 60：第 0/60/120/180/240 帧）。
+    every: u32,
 }
 
 impl Args {
@@ -964,6 +966,7 @@ impl Args {
             mask_out: None,
             enc_out: None,
             dilate: 0,
+            every: 60,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -988,6 +991,7 @@ impl Args {
                 "--mask-out" => out.mask_out = Some(PathBuf::from(it.next().ok_or_else(value)?)),
                 "--enc-out" => out.enc_out = Some(PathBuf::from(it.next().ok_or_else(value)?)),
                 "--dilate" => out.dilate = it.next().ok_or_else(value)?.parse()?,
+                "--every" => out.every = it.next().ok_or_else(value)?.parse()?,
                 other => bail!("未知参数 {other}"),
             }
         }
@@ -1004,6 +1008,7 @@ impl Args {
         }
         ensure!(!out.video.as_os_str().is_empty(), "缺 --video");
         ensure!(!out.reference.as_os_str().is_empty(), "缺 --ref");
+        ensure!(out.every > 0, "--every 需要 >= 1");
         Ok(out)
     }
 }

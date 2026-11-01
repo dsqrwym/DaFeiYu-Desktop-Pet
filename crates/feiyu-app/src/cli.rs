@@ -462,14 +462,16 @@ fn list_anims(dir: &Path, cfg: &Config) -> Result<()> {
 /// 存在的理由很具体：**素材里到底有什么，只能看帧才知道**。
 /// 判断「睡觉动画哪一段是 Z」「拖拽开头是不是静止」，靠读代码或读时长
 /// 都只能猜；导成图以后一眼就能定。
+///
+/// 走的是**播放时同一个帧源**（`frame_source::open`）：`.fishanim` 与
+/// `.fishvid + .fishmask` 都能导，导出来的就是屏幕上那一帧。
 fn dump_frames(dir: &Path, id: &str, out_dir: &Path, step: u32, bg: [u8; 3]) -> Result<()> {
     let manifest = Manifest::load(dir.join("manifest.json"))
         .with_context(|| format!("读不了素材清单 {}", dir.join("manifest.json").display()))?;
     let entry = manifest.require(id)?.clone();
     let (w, h) = (entry.width() as u32, entry.height() as u32);
-    let src = dir.join(&entry.file);
-    let mut anim = feiyu_core::anim::AnimReader::open(&src)
-        .with_context(|| format!("打不开 {}", src.display()))?;
+    let mut anim = crate::pet::frame_source::open(dir, &entry, manifest.fps)
+        .with_context(|| format!("打不开 {}", dir.join(&entry.file).display()))?;
     let count = anim.frame_count();
     std::fs::create_dir_all(out_dir)?;
     let step = step.max(1);

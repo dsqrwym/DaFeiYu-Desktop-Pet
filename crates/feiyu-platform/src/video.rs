@@ -200,9 +200,21 @@ impl VideoReader {
         (self.width, self.height)
     }
 
+    /// 最近一次 [`Self::frame`] **实际**给出的帧号。
+    ///
+    /// 它可能不等于请求的号：seek 只能拿到「目标或之后最近的一帧」，解码器
+    /// 开头还有两帧流水线延迟。颜色与掩码必须按同一个号配对——掩码说「这里
+    /// 是不透明的角色」而颜色还停在角色移开前的黑底上，画出来就是一团纯黑。
+    pub fn current(&self) -> Option<u32> {
+        self.cached_idx
+    }
+
     /// 取第 `idx` 帧，返回直通 BGRA（alpha=255）。
     ///
     /// 顺序播放时只解一帧；跳帧时从目标前两秒的 keyframe 开始，解到目标时间。
+    /// **返回的不一定是第 `idx` 帧**：解码器可能已经解过头（首帧就有两张的
+    /// 流水线延迟），也可能落在目标之后一帧。实际帧号用 [`Self::current`] 问，
+    /// 颜色与掩码必须按那个号配对。
     pub fn frame(&mut self, idx: u32) -> Result<&[u8]> {
         if idx >= self.frame_count {
             return Err(Error::Video(format!(
@@ -213,6 +225,13 @@ impl VideoReader {
         if self.cached_idx == Some(idx) {
             return Ok(&self.out);
         }
+        if let Some(cached) = self.cached_idx {
+            if cached > idx {
+                // 已经解过头了：回跳要重解整条差分链，代价远大于「这一帧多看
+                // 一遍」。沿用当前帧，播放只是慢一帧，画面不会错位。
+                return Ok(&self.out);
+            }
+        }
         if self.next_idx == idx {
             self.decode_next()?;
         } else {
@@ -222,9 +241,19 @@ impl VideoReader {
     }
 
     fn decode_next(&mut self) -> Result<()> {
-        self.decode_sample()?;
-        self.cached_idx = Some(self.next_idx);
-        self.next_idx = self.next_idx.saturating_add(1);
+        let ts = self.decode_sample()?;
+        // 帧号以**样本时间戳**为准，不按「第几次 ReadSample」计数：RGB32 输出的
+        // 第一张样本实测就是第 2 帧（解码器有两帧流水线延迟），按次数计数会把
+        // 它标成第 0 帧，往后每张都差两帧——掩码按第 N 帧取，颜色却是第 N+2 帧。
+        let got = self.idx_from_ts(ts).unwrap_or(self.next_idx);
+        if std::env::var_os("FEIYU_VIDEO_TRACE").is_some() && got != self.next_idx {
+            eprintln!(
+                "顺序解码错位：按次数应是第 {} 帧，时间戳给出第 {got} 帧（ts={ts}）",
+                self.next_idx
+            );
+        }
+        self.cached_idx = Some(got);
+        self.next_idx = got.saturating_add(1);
         Ok(())
     }
 
@@ -243,6 +272,9 @@ impl VideoReader {
             if found >= idx {
                 // 时间戳有时会落在目标后一帧（编码器时基/取整）；seek 接受
                 // “目标或之后最近的一帧”，顺序播放仍按帧号精确推进。
+                if std::env::var_os("FEIYU_VIDEO_TRACE").is_some() && found != idx {
+                    eprintln!("seek 落点偏移：请求第 {idx} 帧，实际第 {found} 帧");
+                }
                 self.cached_idx = Some(found);
                 self.next_idx = found.saturating_add(1);
                 return Ok(());

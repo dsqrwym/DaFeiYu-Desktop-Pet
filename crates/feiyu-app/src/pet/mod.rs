@@ -29,7 +29,7 @@ use feiyu_platform::{Event, Icon, LayeredWindow, TrayIcon};
 
 mod clips;
 mod follow;
-mod frame_source;
+pub(crate) mod frame_source;
 mod menu;
 mod pixels;
 mod sleep;
